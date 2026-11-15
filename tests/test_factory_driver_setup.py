@@ -305,3 +305,149 @@ try {
         self.assertEqual(value['calls'][0]['arguments'][0],'/x')
         self.assertEqual(value['calls'][1]['arguments'],['install',"/name:工位 O'Brien",
                         '/model:Bar Code Printer T-4502 PRO','/port:USB003'])
+
+
+    @staticmethod
+    def receipt_script(ending):
+        source=(ROOT/'drivers/setup_devices.ps1').read_text(encoding='utf-8-sig').split("if ($Mode -eq 'Inspect')")[0]
+        return source.replace('[IO.Path]::GetFullPath($PSScriptRoot)', "'"+str(ROOT/'drivers').replace("'","''")+"'")+ending
+
+    @unittest.skipUnless(os.name=='nt', 'Windows PowerShell 5.1 receipt I/O')
+    def test_receipt_rewrites_use_real_windows_powershell_and_keep_unicode_paths(self):
+        ending=r"""
+foreach ($stage in @('first','second','third')) { Add-Stage $stage '安装进度' @{queue="工位 O'Brien"} }
+$script:result.final=$true
+$script:result.ok=$true
+Write-Receipt
+Write-Receipt
+@{ok=$true;ps=$PSVersionTable.PSVersion.Major} | ConvertTo-Json -Compress
+"""
+        with tempfile.TemporaryDirectory(prefix='pmt-receipt-check-') as scratch:
+            folder=Path(scratch)/"带 空格 O'Brien";folder.mkdir()
+            script=Path(scratch)/'receipt.ps1';script.write_text(self.receipt_script(ending),encoding='utf-8-sig')
+            receipt=folder/'result.json'
+            result=subprocess.run(['powershell.exe','-NoLogo','-NoProfile','-NonInteractive',
+                '-ExecutionPolicy','Bypass','-File',str(script),'-ResultPath',str(receipt)],capture_output=True,
+                text=True,encoding='utf-8-sig',errors='replace',timeout=15)
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertEqual(json.loads(result.stdout)['ps'],5)
+            document=json.loads(receipt.read_bytes())
+            self.assertTrue(document['final'] and document['ok'])
+            self.assertEqual([e['stage'] for e in document['events']],['first','second','third'])
+            self.assertEqual(document['events'][1]['details']['queue'],"工位 O'Brien")
+            self.assertEqual([p.name for p in folder.iterdir()],['result.json'])
+
+    @unittest.skipUnless(os.name=='nt', 'Windows PowerShell 5.1 receipt I/O')
+    def test_locked_receipt_failure_keeps_previous_document_and_cleans_temporary_file(self):
+        ending=r"""
+Add-Stage 'first' 'initial receipt'
+$old=[IO.File]::ReadAllText($ResultPath)
+$stream=[IO.File]::Open($ResultPath,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::None)
+$blocked=$false
+try { Add-Stage 'blocked' 'file is locked' } catch { $blocked=$true } finally { $stream.Dispose() }
+$preserved=([IO.File]::ReadAllText($ResultPath) -eq $old)
+$leftovers=@(Get-ChildItem -LiteralPath ([IO.Path]::GetDirectoryName($ResultPath)) -Filter '*.tmp' -Force).Count
+Add-Stage 'recovered' 'lock released'
+@{blocked=$blocked;preserved=$preserved;leftovers=$leftovers} | ConvertTo-Json -Compress
+"""
+        with tempfile.TemporaryDirectory(prefix='pmt-receipt-lock-') as scratch:
+            script=Path(scratch)/'locked.ps1';script.write_text(self.receipt_script(ending),encoding='utf-8-sig')
+            result=subprocess.run(['powershell.exe','-NoLogo','-NoProfile','-NonInteractive',
+                '-ExecutionPolicy','Bypass','-File',str(script),'-ResultPath',str(Path(scratch)/'result.json')],
+                capture_output=True,text=True,encoding='utf-8-sig',errors='replace',timeout=15)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(json.loads(result.stdout),dict(blocked=True,preserved=True,leftovers=0))
+
+    @unittest.skipUnless(os.name=='nt', 'Windows PowerShell complete install entry')
+    def test_install_entry_persists_success_and_failure_without_live_device_operations(self):
+        source=(ROOT/'drivers/setup_devices.ps1').read_text(encoding='utf-8-sig')
+        source=source.replace('[IO.Path]::GetFullPath($PSScriptRoot)', "'"+str(ROOT/'drivers').replace("'","''")+"'")
+        mocks=r"""
+$script:mockInstalled=$false
+function Test-Elevated { return $true }
+function Get-Inventory {
+ $task=@{kind='printer';name='Test Queue';model='Bar Code Printer T-4502 PRO';port='USB003'}
+ $plan=@();$queues=@()
+ if ($script:mockInstalled) { $queues=@(@{name=$task.name;driver=$task.model;port=$task.port;offline=$false}) }
+ else { $plan=@($task) }
+ return @{schema_version=1;devices=@();queues=$queues;printer_drivers=@();plan=$plan;issues=@();preferred_printer=''}
+}
+function Install-Printer($task) {
+ Add-Stage 'mock.install' 'mocked device operation' $task
+ if ($env:PMT_DRIVER_TEST_FAIL -eq 'true') { throw 'test.install.failure' }
+ $script:mockInstalled=$true
+}
+function Invoke-Native { throw 'Live driver installation is forbidden' }
+function Start-Process { throw 'Live elevation is forbidden' }
+function Get-PnpDevice { throw 'Live device enumeration is forbidden' }
+function Get-CimInstance { throw 'Live CIM enumeration is forbidden' }
+function Add-Printer { throw 'Live printer queue creation is forbidden' }
+"""
+        source=source.replace("if ($Mode -eq 'Inspect')",mocks+"\nif ($Mode -eq 'Inspect')",1)
+        for fail in (False,True):
+            with self.subTest(fail=fail),tempfile.TemporaryDirectory(prefix='pmt-driver-entry-') as scratch:
+                script=Path(scratch)/'mock-entry.ps1';script.write_text(source,encoding='utf-8-sig')
+                receipt=Path(scratch)/"带 空格 O'Brien"/'result.json'
+                result=subprocess.run(['powershell.exe','-NoLogo','-NoProfile','-NonInteractive',
+                    '-ExecutionPolicy','Bypass','-File',str(script),'-Mode','Install','-ResultPath',str(receipt)],
+                    env=dict(os.environ,PMT_DRIVER_TEST_FAIL='true' if fail else 'false'),capture_output=True,
+                    text=True,encoding='utf-8-sig',errors='replace',timeout=20)
+                self.assertEqual(result.returncode,1 if fail else 0,result.stderr)
+                document=json.loads(receipt.read_bytes())
+                self.assertTrue(document['final'])
+                self.assertEqual(document['ok'],not fail)
+                self.assertEqual(document['events'][-1]['stage'],'failed' if fail else 'complete')
+                self.assertEqual([x.name for x in receipt.parent.iterdir()],['result.json'])
+                if fail:
+                    self.assertEqual(document['error'],'test.install.failure')
+                    details=document['events'][-1]['details']
+                    self.assertIn('mock-entry.ps1',details['position'])
+                    self.assertIn('Install-Printer',details['stack'])
+                else:
+                    self.assertEqual(document['after']['queues'][0]['port'],'USB003')
+
+
+    @unittest.skipUnless(os.name=='nt', 'Windows PowerShell concurrent receipt access')
+    def test_short_parent_read_lock_does_not_abort_receipt_update(self):
+        import ctypes
+        from ctypes import wintypes
+        ending=r"""
+Add-Stage 'first' 'initial receipt'
+[Console]::WriteLine('READY')
+[Console]::Out.Flush()
+$null=[Console]::ReadLine()
+Add-Stage 'second' 'parent read completed'
+@{ok=$true} | ConvertTo-Json -Compress
+"""
+        kernel=ctypes.WinDLL('kernel32',use_last_error=True)
+        kernel.CreateFileW.argtypes=(wintypes.LPCWSTR,wintypes.DWORD,wintypes.DWORD,ctypes.c_void_p,
+                                    wintypes.DWORD,wintypes.DWORD,wintypes.HANDLE)
+        kernel.CreateFileW.restype=wintypes.HANDLE
+        kernel.CloseHandle.argtypes=(wintypes.HANDLE,)
+        kernel.CloseHandle.restype=wintypes.BOOL
+        with tempfile.TemporaryDirectory(prefix='pmt-receipt-concurrent-') as scratch:
+            script=Path(scratch)/'reader.ps1';script.write_text(self.receipt_script(ending),encoding='utf-8-sig')
+            receipt=Path(scratch)/'result.json'
+            process=subprocess.Popen(['powershell.exe','-NoLogo','-NoProfile','-NonInteractive',
+                '-ExecutionPolicy','Bypass','-File',str(script),'-ResultPath',str(receipt)],stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,encoding='utf-8-sig',errors='replace')
+            handle=None;timer=None;closed=threading.Event();close_lock=threading.Lock()
+            def release():
+                with close_lock:
+                    if handle is not None and not closed.is_set():
+                        kernel.CloseHandle(handle);closed.set()
+            try:
+                self.assertEqual(process.stdout.readline().strip(),'READY')
+                handle=kernel.CreateFileW(str(receipt),0x80000000,0,None,3,0x80,None)
+                self.assertNotEqual(handle,ctypes.c_void_p(-1).value)
+                timer=threading.Timer(.15,release);timer.start()
+                output,errors=process.communicate('\n',timeout=15)
+                self.assertEqual(process.returncode,0,errors)
+                self.assertTrue(json.loads(output)['ok'])
+                self.assertEqual([e['stage'] for e in json.loads(receipt.read_bytes())['events']],['first','second'])
+            finally:
+                if timer is not None: timer.cancel()
+                release()
+                if timer is not None: timer.join()
+                if process.poll() is None:
+                    process.kill();process.communicate()

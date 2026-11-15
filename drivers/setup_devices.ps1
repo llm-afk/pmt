@@ -20,9 +20,30 @@ function Write-Receipt {
     $parent=[IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($ResultPath))
     [IO.Directory]::CreateDirectory($parent) | Out-Null
     $temporary=Join-Path $parent ('.driver-result-'+[guid]::NewGuid().ToString('N')+'.tmp')
-    [IO.File]::WriteAllText($temporary,($script:result | ConvertTo-Json -Depth 14 -Compress),[Text.UTF8Encoding]::new($false))
-    if ([IO.File]::Exists($ResultPath)) { [IO.File]::Replace($temporary,$ResultPath,$null) }
-    else { [IO.File]::Move($temporary,$ResultPath) }
+    try {
+        [IO.File]::WriteAllText($temporary,($script:result | ConvertTo-Json -Depth 14 -Compress),[Text.UTF8Encoding]::new($false))
+        for ($attempt=0; ; $attempt++) {
+            try {
+                # PS 5.1 converts $null to an empty string for .NET string parameters.
+                # NullString preserves a genuine null backup path; no backup file is needed.
+                if ([IO.File]::Exists($ResultPath)) {
+                    [IO.File]::Replace($temporary,$ResultPath,[System.Management.Automation.Language.NullString]::Value)
+                } else { [IO.File]::Move($temporary,$ResultPath) }
+                return
+            } catch {
+                $cause=$_.Exception
+                while ($cause.InnerException) { $cause=$cause.InnerException }
+                $code=$cause.HResult -band 0xFFFF
+                # The parent can briefly hold the receipt open while reading progress.
+                if ($code -notin @(32,33) -or $attempt -ge 8) { throw }
+                Start-Sleep -Milliseconds 50
+            }
+        }
+    } finally {
+        if ([IO.File]::Exists($temporary)) {
+            try { [IO.File]::Delete($temporary) } catch { [Console]::Error.WriteLine('Receipt temporary-file cleanup failed: '+$_.Exception.Message) }
+        }
+    }
 }
 function Add-Stage([string]$stage,[string]$message,$details=@{}) {
     $script:events.Add([ordered]@{at=[DateTimeOffset]::Now.ToString('o');stage=$stage;message=$message;details=$details})
@@ -168,6 +189,11 @@ function Install-Printer($task) {
     Invoke-Native $wizard @('install',('/name:'+ $task.name),('/model:'+ $task.model),('/port:'+ $task.port))
 }
 function Quote-PS([string]$value) { return "'"+$value.Replace("'","''")+"'" }
+function Test-Elevated {
+    $principal=[Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
 
 
 if ($Mode -eq 'Inspect') {
@@ -185,8 +211,7 @@ try {
     $script:result.before=$before
     Write-Receipt
     if ($before.plan.Count) {
-        $principal=[Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
-        if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        if (-not (Test-Elevated)) {
             Add-Stage 'elevation' '需要管理员安装设备驱动，请允许 Windows 管理员授权。' @{plan=$before.plan}
             $command='& '+(Quote-PS $PSCommandPath)+' -Mode Install -DataRoot '+(Quote-PS $DataRoot)+' -ResultPath '+(Quote-PS $ResultPath)+' -QueueName '+(Quote-PS $QueueName)+' -UseLocalPrinter '+(Quote-PS $UseLocalPrinter)
             $encoded=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
@@ -237,7 +262,7 @@ try {
 } catch {
     $script:result.error=$_.Exception.Message
     $script:result.native_error=if ($_.Exception.PSObject.Properties['NativeErrorCode']) { $_.Exception.NativeErrorCode } else { $null }
-    Add-Stage 'failed' '驱动准备未完成，请联系工程人员查看日志或运行根目录 install_drivers.cmd。' @{error=$_.Exception.Message;type=$_.Exception.GetType().FullName;native_error=$script:result.native_error}
+    Add-Stage 'failed' '驱动准备未完成，请联系工程人员查看日志或运行根目录 install_drivers.cmd。' @{error=$_.Exception.Message;type=$_.Exception.GetType().FullName;native_error=$script:result.native_error;position=$_.InvocationInfo.PositionMessage;stack=$_.ScriptStackTrace}
 } finally {
     if ($script:extractRoot) {
         $full=[IO.Path]::GetFullPath($script:extractRoot)
