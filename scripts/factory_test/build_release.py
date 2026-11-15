@@ -46,8 +46,7 @@ def managed_files():
     paths = set(source_files())
     for folder in (ROOT/'drivers', PRINTER_SERVICE):
         paths.update(path for path in folder.rglob('*')
-                     if path.is_file() and '__pycache__' not in path.parts
-                     and path != ROOT/'drivers/tsc_printer/Generic_12.4.0.exe')
+                     if path.is_file() and '__pycache__' not in path.parts)
     return sorted(paths)
 
 
@@ -89,8 +88,8 @@ def build_in(work):
     for name in ('node.exe', 'node_modules', 'LICENSE-node.txt'):
         if not (PRINTER_SERVICE/name).exists():
             raise FileNotFoundError('缺少打印运行环境：'+str(PRINTER_SERVICE/name))
-    from .driver_setup import optional_printer_package
-    driver_package = optional_printer_package(ROOT)
+    from .driver_setup import printer_package
+    driver_package = printer_package(ROOT)
     initial_firmware = firmware_record(ROOT)
     initial = {p.relative_to(ROOT).as_posix(): digest(p) for p in source_files()}
     initial_files = {p.relative_to(ROOT).as_posix(): digest(p) for p in managed_files()}

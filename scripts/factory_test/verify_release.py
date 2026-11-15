@@ -22,9 +22,9 @@ REQUIRED_CHECKS = (
 def verify(release):
     from .build_release import ROOT, digest, source_files, firmware_record
 
-    from .driver_setup import optional_printer_package
+    from .driver_setup import printer_package
     release = Path(release).resolve()
-    driver_package = optional_printer_package(release)
+    driver_package = printer_package(release)
     manifest = json.loads((release/'release-manifest.json').read_bytes())
     assert manifest['version'] == VERSION and manifest['channel'] == 'production'
     check = manifest['isolated_self_check']

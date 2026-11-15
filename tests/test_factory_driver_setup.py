@@ -10,7 +10,7 @@ from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
 from scripts.factory_test.driver_setup import (DriverManager, decode_inventory, plan_key,
-                                               optional_printer_package)
+                                               printer_package)
 from scripts.factory_test.station_config import StationConfig
 from tests.test_factory_modes import window, wait_for
 
@@ -36,15 +36,16 @@ class DriverWorkerTests(unittest.TestCase):
         remote=manager.command(StationConfig(printer_url='http://192.0.2.1:9876'), 'Inspect')
         self.assertEqual(remote[-1], 'false')
 
-    def test_optional_package_missing_is_supported_and_tampering_is_rejected(self):
+    def test_delivery_package_is_required_and_tampering_is_rejected(self):
         with tempfile.TemporaryDirectory() as scratch:
             root=Path(scratch)
             (root/'drivers/tsc_printer').mkdir(parents=True)
             (root/'drivers/packages.json').write_bytes((ROOT/'drivers/packages.json').read_bytes())
-            self.assertFalse(optional_printer_package(root)['bundled'])
+            with self.assertRaisesRegex(FileNotFoundError,'驱动包'):
+                printer_package(root)
             (root/'drivers/tsc_printer/Generic_12.4.0.exe').write_bytes(b'bad')
             with self.assertRaisesRegex(ValueError,'SHA256'):
-                optional_printer_package(root)
+                printer_package(root)
 
     def test_working_drivers_never_request_elevation(self):
         events=[]

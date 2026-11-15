@@ -18,11 +18,13 @@ def spawn_driver_process(*args, **kwargs):
     return subprocess.Popen(*args, **kwargs)
 
 
-def optional_printer_package(root):
+def printer_package(root):
     root = Path(root)
     package = json.loads((root/'drivers/packages.json').read_bytes())['printer']
     path = root/'drivers'/package['bundled']
-    if path.exists() and hashlib.sha256(path.read_bytes()).hexdigest() != package['sha256']:
+    if not path.is_file():
+        raise FileNotFoundError('交付目录缺少打印机驱动包：'+str(path))
+    if hashlib.sha256(path.read_bytes()).hexdigest() != package['sha256']:
         raise ValueError('打印机驱动包 SHA256 不匹配：'+str(path))
     return dict(bundled=path.is_file(), model=package['model'], version=package['version'],
                 source=package['source'], sha256=package['sha256'])
