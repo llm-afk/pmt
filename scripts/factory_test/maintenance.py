@@ -4,7 +4,7 @@ import time
 
 from motor_platform import Bench, Canable, CanFrame, SdoError
 from motor_platform.components.motor.client import SdoReplyTimeout
-from .diagnostics import current_log, log_event
+from .diagnostics import current_log, log_event, idle_poll, idle_evidence
 
 
 class MotorAbsent(TimeoutError):
@@ -27,10 +27,10 @@ class Maintenance:
         self.diagnostic_poll = diagnostic_poll
 
     def event(self, name, **details):
-        target = current_log()
-        if self.diagnostic_poll and target is not None:
-            target.sample(name, interval=30, **details)
-        else:
+        evidence = idle_evidence()
+        if self.diagnostic_poll and evidence is not None:
+            evidence[name] = details
+        elif not self.diagnostic_poll:
             log_event(name, **details)
 
     def check_stop(self):
@@ -58,7 +58,7 @@ class Maintenance:
                 finally:
                     self.event('transport.releasing', node_id=node)
         except BaseException as exc:
-            if not (self.diagnostic_poll and isinstance(exc, TimeoutError)):
+            if idle_evidence() is None and not (self.diagnostic_poll and isinstance(exc, TimeoutError)):
                 log_event('transport.failed', level='ERROR', error=exc, node_id=node,
                           adapter_sn=self.config.adapter_sn, elapsed_s=round(time.perf_counter()-started, 4))
             raise
@@ -71,6 +71,9 @@ class Maintenance:
         request = CanFrame(0x600+node, b'\x40'+index.to_bytes(2, 'little')+b'\0'*5)
         details = dict(node_id=node, index=f'0x{index:04X}', subindex=0, size=size,
                        can_id=f'0x{request.can_id:03X}', payload=request.data.hex(), timeout_s=timeout)
+        evidence = idle_evidence()
+        if evidence is not None:
+            evidence['sdo'] = details
         if not diagnostic_probe:
             log_event('sdo.read.request', **details)
         try:
@@ -98,10 +101,12 @@ class Maintenance:
                         dict(node_id=node,index=f'0x{index:04X}',size=size,value=value,reply=reply.data.hex()),target=target)
                 return value
         except BaseException as exc:
-            if not diagnostic_probe or not isinstance(exc, TimeoutError):
-                log_event('sdo.read.failed', level='ERROR', error=exc, **details,
-                          reply=reply.data.hex() if reply else None,
-                          elapsed_s=round(time.perf_counter()-started, 4), uncertain=bus._sdo_uncertain)
+            failure = dict(details,reply=reply.data.hex() if reply else None,
+                           elapsed_s=round(time.perf_counter()-started,4),uncertain=bus._sdo_uncertain)
+            if evidence is not None:
+                evidence['sdo'] = failure
+            elif not diagnostic_probe or not isinstance(exc, TimeoutError):
+                log_event('sdo.read.failed',level='ERROR',error=exc,**failure)
             raise
 
     @staticmethod
@@ -140,6 +145,12 @@ class Maintenance:
             return sn
 
     def discover(self, *, exhaustive=False, fallback=True, recent_ids=()):
+        if self.diagnostic_poll:
+            with idle_poll('motor',dict(adapter_sn=self.config.adapter_sn,target_id=self.config.target_id)):
+                return self._discover(exhaustive=exhaustive,fallback=fallback,recent_ids=recent_ids)
+        return self._discover(exhaustive=exhaustive,fallback=fallback,recent_ids=recent_ids)
+
+    def _discover(self, *, exhaustive=False, fallback=True, recent_ids=()):
         """优先来料 ID=1 与工位 ID；无响应再只读扫描其余 1..127。"""
         preferred = [1]
         if self.config.target_id not in (None, 1):

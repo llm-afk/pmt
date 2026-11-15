@@ -995,9 +995,8 @@ class FactoryWindow:
                         else:
                             motor_state = 'error'
                         if detail != last_message:
-                            self.diagnostics.current.event('discovery.failed', '电机探测未收到有效结果',
-                                                           level='WARNING', error=exc, outcome=motor_state)
-                            self.events.put(('log','电机探测：'+detail))
+                            # The idle poll already owns the complete diagnostic evidence.
+                            self.events.put(('logged_line','电机探测：'+detail))
                             last_message = detail
                 if self.station_cancelled():
                     raise InterruptedError('产测已暂停，正在交接连接')

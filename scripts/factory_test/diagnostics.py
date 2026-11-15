@@ -1,5 +1,5 @@
 """Connection-scoped diagnostics. Retention owns logs only, never production data."""
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack, nullcontext
 from contextvars import ContextVar
 from collections import Counter
 from dataclasses import asdict, is_dataclass
@@ -26,9 +26,12 @@ from .station_config import READINESS_LABELS
 
 
 RETENTION_DAYS = 30
+STATION_LOG_BYTES = 10*1024*1024
+POLL_SUMMARY_SECONDS = 30
 LOCAL_TIME = timezone(timedelta(hours=8))
-OWNED_LOG = re.compile(r'(?:motor-\d{8}-\d{6}-[0-9a-f]{32}|station-\d{8})\.log')
+OWNED_LOG = re.compile(r'(?:motor-\d{8}-\d{6}-[0-9a-f]{32}|station-\d{8}(?:-\d{4,})?)\.log')
 _target = ContextVar('factory_diagnostic_target', default=None)
+_idle = ContextVar('factory_idle_probe', default=None)
 _secret_key = re.compile(r'(?i)^(?:x[-_]?api[-_]?key|(?:(?:mes|sn|report)[-_])?api[-_]?key|(?:oss[-_]?)?access[-_]?key(?:[-_]?(?:id|secret))?|protected_credentials|secret|password|authorization|proxy[-_]authorization|cookie|set[-_]cookie|token|signature|security[-_]?token|x[-_]oss[-_]security[-_]token)$')
 BODY_PREVIEW_CHARS = 16384
 
@@ -123,6 +126,34 @@ def log_event(event, message='', *, level='INFO', error=None, **details):
         target.event(event, message, level=level, error=error, **details)
 
 
+def idle_evidence():
+    return _idle.get()
+
+
+@contextmanager
+def idle_poll(device, route):
+    """Aggregate only read-only idle discovery. Production events remain verbatim."""
+    target = current_log()
+    evidence = {}
+    token = _idle.set(evidence)
+    started = time.monotonic()
+    try:
+        yield
+    except (InterruptedError, KeyboardInterrupt):
+        raise
+    except Exception as exc:
+        if target is not None:
+            target.owner.poll_result(target, device, route, evidence, error=exc,
+                                     elapsed=time.monotonic()-started)
+        raise
+    else:
+        if target is not None:
+            target.owner.poll_result(target, device, route, evidence,
+                                     elapsed=time.monotonic()-started)
+    finally:
+        _idle.reset(token)
+
+
 class LogTarget:
     def __init__(self, owner, path, context=None, *, create=True):
         self.owner, self.path = owner, Path(path)
@@ -166,6 +197,9 @@ class DiagnosticLogs:
         self.last_error = None
         self.samples, self.snapshots = {}, {}
         self.probes = {}
+        self.idle_polls = {}
+        self.rotation_next = {}
+        self.rotation_retry = {}
         self.pending_probes = set()
         self.station_probe_file = None
         self.secrets = set()
@@ -276,6 +310,7 @@ class DiagnosticLogs:
                     line += self.redact(''.join(traceback.format_exception(type(error), error, error.__traceback__)))
                     if not line.endswith('\n'):
                         line += '\n'
+                self.rotate_station(target.path, len(line.encode('utf-8')))
                 with target.path.open('a', encoding='utf-8') as stream:
                     if target.path not in self.boot_files:
                         self.boot_files[target.path] = stream.tell()
@@ -292,6 +327,104 @@ class DiagnosticLogs:
                         self.failure(message)
                     except Exception:
                         pass  # Diagnostics must not prevent motor cleanup.
+
+    def rotate_station(self, path, incoming):
+        """Rotate daily station logs; motor connection files keep their stable path."""
+        if not re.fullmatch(r'station-\d{8}\.log', path.name) or not path.exists():
+            return
+        size = path.stat().st_size
+        if not size or size+incoming <= STATION_LOG_BYTES or self.monotonic()<self.rotation_retry.get(path,0):
+            return
+        if path not in self.rotation_next:
+            parts = [int(match[1]) for part in path.parent.glob(path.stem+'-*.log')
+                     if (match := re.fullmatch(re.escape(path.stem)+r'-(\d{4,})\.log',part.name))]
+            self.rotation_next[path] = max(parts,default=0)+1
+        while True:
+            number = self.rotation_next[path]
+            self.rotation_next[path] += 1
+            archive = path.with_name(f'{path.stem}-{number:04d}.log')
+            if archive.exists() or archive.is_symlink():
+                continue
+            if not self._owned(archive):
+                raise OSError('日志分卷路径不属于工位目录')
+            try:
+                path.rename(archive)
+            except FileExistsError:
+                continue
+            except OSError:
+                # An export/viewer can temporarily hold a Windows read handle.
+                # Keep writing evidence and retry rotation after the handle is released.
+                self.rotation_retry[path] = self.monotonic()+5
+                return
+            if path in self.boot_files:
+                self.boot_files[archive] = self.boot_files.pop(path)
+            self.rotation_retry.pop(path,None)
+            return
+
+    def poll_result(self, target, device, route, evidence, *, error=None, elapsed=0):
+        diagnostic = self.redact(error_details(error)) if error is not None else None
+        absent = error is not None and type(error).__name__=='MotorAbsent'
+        state = 'ABSENT' if absent else 'ERROR' if error is not None else 'READY'
+        code = 'MOTOR_ABSENT' if absent else diagnostic['code'] if diagnostic else 'READY'
+        request = evidence.get('sdo',{})
+        stable_request = {key:request.get(key) for key in ('node_id','index','subindex','size','can_id','payload')}
+        identity = evidence.get('discovery.identity',{})
+        identity = {key:identity.get(key) for key in ('node_id','sn','raw')}
+        signature = json.dumps(self.redact(dict(state=state,diagnostic=diagnostic,
+            request=stable_request,identity=identity)),sort_keys=True,default=str)
+        route = self.redact(route)
+        key = (target.reference,device,json.dumps(route,sort_keys=True,default=str))
+        now = self.monotonic()
+        stamp = datetime.fromtimestamp(self.clock(),LOCAL_TIME).isoformat(timespec='milliseconds')
+        with self.lock:
+            previous = self.idle_polls.get(key)
+            changed = previous is None or previous['signature'] != signature
+            if changed:
+                if previous is not None:
+                    self.poll_summary(key,previous,final=True)
+                stats = dict(signature=signature,route=route,context=target.context,state=state,code=code,count=0,
+                    reported_count=0,started=now,reported_at=now,first_at=stamp,last_at=stamp,max_elapsed_ms=0)
+                self.idle_polls[key] = stats
+            else:
+                stats = previous
+            stats['count'] += 1
+            stats['last_at'] = stamp
+            stats['last_seen'] = now
+            stats['max_elapsed_ms'] = max(stats['max_elapsed_ms'],round(elapsed*1000,1))
+            if changed:
+                recovered = state=='READY' and previous is not None and previous['state']!='READY'
+                event = 'devices.poll.recovered' if recovered else 'devices.poll.changed'
+                target.event(event,'空闲电机探测恢复' if recovered else '空闲电机探测状态变化',
+                    level='ERROR' if state=='ERROR' else 'INFO',error=error if state=='ERROR' else None,
+                    device=device,route=route,state=state,code=code,
+                    previous_state=previous['state'] if previous else None,
+                    evidence=evidence,elapsed_ms=round(elapsed*1000,1),count=1)
+                stats['first_sequence'] = self.sequence
+                stats['reported_count'] = 1
+            elif now-stats['reported_at'] >= POLL_SUMMARY_SECONDS:
+                self.poll_summary(key,stats)
+
+    def poll_summary(self, key, stats, *, final=False, export_snapshot=False):
+        if stats['count']<=stats['reported_count'] and not export_snapshot:
+            return
+        target = LogTarget(self,self.root/key[0],context=stats['context'],create=False)
+        target.event('devices.poll.summary','空闲探测累计',
+            level='WARNING' if stats['state']=='ERROR' else 'INFO',device=key[1],route=stats['route'],
+            state=stats['state'],code=stats['code'],count=stats['count'],
+            since_previous=stats['count']-stats['reported_count'],suppressed=max(0,stats['count']-1),
+            first_at=stats['first_at'],last_at=stats['last_at'],max_elapsed_ms=stats['max_elapsed_ms'],
+            duration_s=round(stats.get('last_seen',stats['started'])-stats['started'],3),
+            first_sequence=stats.get('first_sequence'),final=final,export_snapshot=export_snapshot)
+        stats['reported_at'] = self.monotonic()
+        stats['reported_count'] = stats['count']
+
+    def flush_idle(self, target=None, *, final=False, export_snapshot=False):
+        with self.lock:
+            for key,stats in tuple(self.idle_polls.items()):
+                if target is None or key[0]==target.reference:
+                    self.poll_summary(key,stats,final=final,export_snapshot=export_snapshot)
+                    if final:
+                        self.idle_polls.pop(key,None)
 
     def observe(self, present, *, identity=None, config=None, absence_seconds=2.0):
         with self.lock:
@@ -336,6 +469,7 @@ class DiagnosticLogs:
             if self.active is not None:
                 target = self.active
                 self.flush_probes(target)
+                self.flush_idle(target,final=True)
                 target.event('connection.close', '结束连接周期记录', reason=reason,
                              duration_s=round(self.monotonic()-self.connected_at, 3), identity=self.identity)
                 self.station.event('connection.closed', '电机连接周期结束', connection_log=target.reference, reason=reason)
@@ -412,38 +546,45 @@ class DiagnosticLogs:
                 self.pending_probes.add(key)
 
     def export_boot(self, destination):
-        """Export a consistent cut of this boot; compress outside the writer lock."""
+        """Export this boot and all its parts; pin mutable station files during compression."""
         destination = Path(destination)
         if destination.suffix.lower() != '.zip':
             raise ValueError('请选择 ZIP 文件名')
-        with self.lock:
-            for (ref,device),stats in self.probes.items():
-                LogTarget(self,self.root/ref,create=False).event('devices.probe.summary', device=device,
-                    export_snapshot=True, **self.probe_totals(stats))
-            files = [(path,offset,path.stat().st_size if self._owned(path) and path.is_file() else None)
-                     for path,offset in self.boot_files.items()]
-            cutoff = datetime.fromtimestamp(self.clock(),LOCAL_TIME).isoformat(timespec='seconds')
-        summary = [f'上位机 v{VERSION}',f'启动编号 {self.boot_id}',f'导出截止 {cutoff}']
-        fd, name = tempfile.mkstemp(prefix='.station-logs-',suffix='.tmp',dir=destination.parent)
-        os.close(fd)
-        try:
-            with zipfile.ZipFile(name,'w',zipfile.ZIP_DEFLATED,compresslevel=1) as archive:
-                for path,offset,end in files:
-                    reference = path.relative_to(self.root).as_posix()
-                    summary.extend(('',reference))
-                    if end is None or end <= offset:
-                        summary.append('原日志已清理或截断')
-                        continue
-                    try:
-                        with path.open('rb') as source, archive.open(reference,'w') as out:
-                            source.seek(offset)
-                            self._copy_boot_records(source,out,end-offset,summary)
-                    except FileNotFoundError:
-                        summary.append('原日志已清理')
-                archive.writestr('诊断摘要.txt', ('\n'.join(summary)+'\n').encode('utf-8-sig'))
-            os.replace(name,destination)
-        finally:
-            Path(name).unlink(missing_ok=True)
+        with ExitStack() as readers:
+            with self.lock:
+                for (ref,device),stats in self.probes.items():
+                    LogTarget(self,self.root/ref,create=False).event('devices.probe.summary', device=device,
+                        export_snapshot=True, **self.probe_totals(stats))
+                self.flush_idle(export_snapshot=True)
+                files = []
+                for path,offset in self.boot_files.items():
+                    end = path.stat().st_size if self._owned(path) and path.is_file() else None
+                    pinned = None
+                    if end is not None and re.fullmatch(r'station-\d{8}\.log',path.name):
+                        pinned = readers.enter_context(path.open('rb'))
+                    files.append((path,offset,end,pinned))
+                cutoff = datetime.fromtimestamp(self.clock(),LOCAL_TIME).isoformat(timespec='seconds')
+            summary = [f'上位机 v{VERSION}',f'启动编号 {self.boot_id}',f'导出截止 {cutoff}']
+            fd, name = tempfile.mkstemp(prefix='.station-logs-',suffix='.tmp',dir=destination.parent)
+            os.close(fd)
+            try:
+                with zipfile.ZipFile(name,'w',zipfile.ZIP_DEFLATED,compresslevel=1) as archive:
+                    for path,offset,end,pinned in files:
+                        reference = path.relative_to(self.root).as_posix()
+                        summary.extend(('',reference))
+                        if end is None or end <= offset:
+                            summary.append('原日志已清理或截断')
+                            continue
+                        try:
+                            with (nullcontext(pinned) if pinned else path.open('rb')) as source, archive.open(reference,'w') as out:
+                                source.seek(offset)
+                                self._copy_boot_records(source,out,end-offset,summary)
+                        except FileNotFoundError:
+                            summary.append('原日志已清理')
+                    archive.writestr('诊断摘要.txt', ('\n'.join(summary)+'\n').encode('utf-8-sig'))
+                os.replace(name,destination)
+            finally:
+                Path(name).unlink(missing_ok=True)
 
     def _copy_boot_records(self, source, out, remaining, summary):
         header = re.compile(rb'^\d{4}-\d\d-\d\dT\S+\s+(\w+)\s+\[([^\]]+)\]')
@@ -452,6 +593,8 @@ class DiagnosticLogs:
         errors = Counter()
         malformed = 0
         states = {}
+        polls = {}
+        poll_failures = Counter()
         blockers = product = None
         firmware = []
         while remaining:
@@ -474,6 +617,10 @@ class DiagnosticLogs:
                         errors[data.get('diagnostic',{}).get('code') or event] += 1
                     if event.startswith('devices.probe.'):
                         states[data['device']] = data
+                    elif event.startswith('devices.poll.'):
+                        polls[data['device']] = data
+                        if data['state']=='ERROR':
+                            poll_failures[data['code']] += data.get('since_previous',1)
                     elif event == 'devices.readiness':
                         blockers = data['details'].get('blockers',[])
                     elif event == 'connection.product_profile':
@@ -494,6 +641,10 @@ class DiagnosticLogs:
                 out.write(line)
         for device,data in states.items():
             summary.append(f"{device}  {data['code']}  各结果次数 {dict(data['counts'])}  最慢 {data['max_elapsed_ms']} ms")
+        for device,data in polls.items():
+            summary.append(f"{device} 空闲探测 {data['state']} / {data['code']}，本段累计 {data.get('count',1)} 次，最长 {data.get('max_elapsed_ms',data.get('elapsed_ms',0))} ms")
+        if poll_failures:
+            summary.append('空闲探测异常次数  '+str(dict(poll_failures)))
         if blockers is not None:
             summary.append('最近一次开测等待项  '+('、'.join(READINESS_LABELS.get(k,k) for k in blockers) or '无'))
         if product and product.get('differences'):
@@ -570,5 +721,6 @@ class DiagnosticLogs:
                 return
             self.finish_connection('application_closed_before_disconnect')
             self.flush_probes(self.station)
+            self.flush_idle(final=True)
             self.station.event('application.stop', '上位机退出')
             self.closed = True
