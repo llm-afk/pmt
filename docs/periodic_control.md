@@ -82,6 +82,7 @@ with Bench(transport=Canable(CANABLE_SERIAL), motor_ids=[1]) as bench:
 `stats()` 包括 `target_hz`、`actual_tx_hz`、`tx_count`、`rx_count`、`enabled`、`skipped_periods`、
 `max_lateness_s`、`feedback_limited_periods`、`feedback_credit_reconciliations`、`periodic_active`、`fault`。
 `feedback_credit_reconciliations` 统计额外释放额度的次数。定位故障时结合 `inflight`、`rx_count` 和最后反馈时间查看。
+在 1 kHz 工位可结合 `tx_gaps_over_2ms`、`rx_gaps_over_2ms` 查看主机两次发送或接收间隔超过 2 ms 的次数。它们仅用于诊断。 `usb_read_wait_mode` 标明本次采用事件与计时器等待（event_timer）还是兼容轮询（poll）。
 实际频率由首末周期 USB 写完成时间估算，不是 CAN 分析仪的线上位级测量。
 `rx_count` 统计运行时常规接收路径的状态；SDO 等待期间分发的状态不计入该计数。
 `periodic_active` 仅指主机发送状态，不代表电机功率级状态。
@@ -93,6 +94,6 @@ with Bench(transport=Canable(CANABLE_SERIAL), motor_ids=[1]) as bench:
 多电机实机、长期带载稳定性和硬实时保证尚未验证。
 
 调度与反馈龄期统一使用 `time.perf_counter()`。USB IN 使用挂起的异步读取，
-应用侧超时保留挂起请求；关闭时取消并等待完成后释放缓冲。
+Windows 支持高精度计时器时，工作线程同时等待 USB 完成和调度截止前的唤醒，读完成即可处理回包。应用侧超时保留挂起请求；关闭时取消并等待完成后释放缓冲。
 
 1 kHz 是目标发送频率，Windows/Python 下仍可能出现毫秒级迟到，不能承诺每条指令严格间隔 1 ms。

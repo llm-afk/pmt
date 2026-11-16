@@ -65,6 +65,82 @@ class RuntimeTests(unittest.TestCase):
                 self.assertIsNone(usb._read_async(timeout))
                 self.assertEqual([call.args[0] for call in sleep.call_args_list], expected_sleeps)
 
+    def timer_usb(self):
+        from unittest.mock import Mock
+        from ctypes import wintypes as W
+        usb = _Usb.__new__(_Usb)
+        usb.usb, usb.handle, usb.input = 2, 3, 0x81
+        usb._event, usb._read_timer = 1, 4
+        usb._read_wait_handles = (W.HANDLE * 2)(1, 4)
+        usb.read_size = 128
+        usb._pending = False
+        usb._read_buffer = C.create_string_buffer(b'\0A\0B', usb.read_size)
+        usb.k = SimpleNamespace(ResetEvent=Mock(return_value=True),
+            WaitForSingleObject=Mock(return_value=258),
+            SetWaitableTimer=Mock(return_value=True),
+            WaitForMultipleObjects=Mock(return_value=0),
+            CloseHandle=Mock(), CancelIoEx=Mock())
+        def complete(handle, overlapped, count, wait):
+            count._obj.value = 4
+            return True
+        usb.w = SimpleNamespace(WinUsb_ReadPipe=Mock(return_value=True),
+                                WinUsb_GetOverlappedResult=Mock(side_effect=complete))
+        return usb
+
+    def test_usb_timer_wait_wakes_on_completion_and_preserves_binary_data(self):
+        usb = self.timer_usb()
+        with patch('motor_platform.transports.canable.time.perf_counter', side_effect=[0, .0001]), \
+             patch('motor_platform.transports.canable.time.sleep') as sleep:
+            self.assertEqual(usb._read_async(.01), b'\0A\0B')
+        usb.k.WaitForMultipleObjects.assert_called_once_with(2, usb._read_wait_handles, False, 10)
+        self.assertLess(usb.k.SetWaitableTimer.call_args.args[1]._obj.value, 0)
+        usb.w.WinUsb_GetOverlappedResult.assert_called_once()
+        self.assertFalse(usb.w.WinUsb_GetOverlappedResult.call_args.args[3])
+        self.assertEqual(usb.w.WinUsb_ReadPipe.call_count, 2)
+        self.assertTrue(usb._pending)
+        usb.k.CancelIoEx.assert_not_called()
+        sleep.assert_not_called()
+
+    def test_usb_timer_deadline_preserves_pending_read_for_next_completion(self):
+        usb = self.timer_usb()
+        usb.k.WaitForMultipleObjects.return_value = 1
+        with patch('motor_platform.transports.canable.time.perf_counter', side_effect=[0, .0001, .011]):
+            self.assertIsNone(usb._read_async(.01))
+        self.assertTrue(usb._pending)
+        self.assertEqual(usb.w.WinUsb_ReadPipe.call_count, 1)
+        usb.w.WinUsb_GetOverlappedResult.assert_not_called()
+        usb.k.CancelIoEx.assert_not_called()
+        usb.k.WaitForSingleObject.return_value = 0
+        with patch('motor_platform.transports.canable.time.perf_counter', return_value=.02):
+            self.assertEqual(usb._read_async(.01), b'\0A\0B')
+        self.assertTrue(usb._pending)
+        self.assertEqual(usb.w.WinUsb_ReadPipe.call_count, 2)
+        usb.w.WinUsb_GetOverlappedResult.assert_called_once()
+        self.assertEqual(usb.k.SetWaitableTimer.call_count, 1)
+
+    def test_usb_timer_setup_failure_uses_permanent_fallback_without_cancelling_read(self):
+        usb = self.timer_usb()
+        usb.k.SetWaitableTimer.return_value = False
+        usb.k.WaitForSingleObject.side_effect = [258, 0]
+        with patch('motor_platform.transports.canable.time.perf_counter', side_effect=[0, .0001]), \
+             patch('motor_platform.transports.canable.time.sleep') as sleep:
+            self.assertEqual(usb._read_async(.01), b'\0A\0B')
+        self.assertIsNone(usb._read_timer)
+        usb.k.CloseHandle.assert_called_once_with(4)
+        usb.k.WaitForMultipleObjects.assert_not_called()
+        sleep.assert_called_once()
+        usb.k.WaitForSingleObject.side_effect = None
+        usb.k.WaitForSingleObject.return_value = 258
+        with patch('motor_platform.transports.canable.time.perf_counter', side_effect=[1, 1.0001, 1.011]), \
+             patch('motor_platform.transports.canable.time.sleep') as fallback_sleep:
+            self.assertIsNone(usb._read_async(.01))
+        fallback_sleep.assert_called_once()
+        self.assertEqual(usb.k.SetWaitableTimer.call_count, 1)
+        usb.k.CloseHandle.assert_called_once_with(4)
+        usb.k.CancelIoEx.assert_not_called()
+        self.assertTrue(usb._pending)
+        self.assertEqual(usb.w.WinUsb_ReadPipe.call_count, 2)
+
     def test_usb_write_timeout_cached_and_short_write_still_rejected(self):
         usb = _Usb.__new__(_Usb)
         usb.usb = 2
@@ -81,9 +157,17 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(usb.transfer(2, b'abc'), b'abc')
         usb.transfer(2, b'abc', timeout=.2)
         self.assertEqual(policies, [(2, 100), (2, 200)])
-        usb.w.WinUsb_WritePipe = lambda *args: True
+        from unittest.mock import Mock
+        usb.w.WinUsb_WritePipe = Mock(return_value=True)
         with self.assertRaisesRegex(OSError, 'short USB write'):
             usb.transfer(2, b'abc', timeout=.2)
+        usb.w.WinUsb_WritePipe.assert_called_once()
+        usb.w.WinUsb_WritePipe = Mock(return_value=False)
+        with patch('motor_platform.transports.canable.C.get_last_error', return_value=121):
+            with self.assertRaises(OSError) as caught:
+                usb.transfer(2, b'abc', timeout=.2)
+        self.assertEqual(caught.exception.winerror, 121)
+        usb.w.WinUsb_WritePipe.assert_called_once()
 
     def test_usb_poll_timeout_preserves_pending_read(self):
         usb=_Usb.__new__(_Usb)
@@ -796,29 +880,39 @@ class OneSecondFeedbackTests(unittest.TestCase):
         self.assertEqual(peer.sent,[])
         bus.close()
 
-    def replay(self, events, *, until=None, inflight=4, next_due=10):
+    def replay(self, events, *, until=None, inflight=4, next_due=10, supervised=False, stop_ack=None):
         from collections import deque
         from motor_platform.transports.canable import Canable,DLC_LENGTHS
         clock=[10.0]
-        pending=deque()
-        for offset,frame,echo in events:
+        def packet(frame,echo=0xffffffff):
             can_id=frame.can_id | (0x20000000 if frame.is_error else 0)
             flags=(2 if frame.is_fd else 0) | (4 if frame.brs else 0)
-            packet=(struct.pack('<IIBBBB',echo,can_id,DLC_LENGTHS.index(len(frame.data)),0,flags,0)
+            return (struct.pack('<IIBBBB',echo,can_id,DLC_LENGTHS.index(len(frame.data)),0,flags,0)
                     +frame.data.ljust(64 if frame.is_fd else 8,b'\0'))
-            pending.append((10+offset,packet))
-        pending=deque(sorted(pending))
+        pending=deque(sorted((10+offset,packet(frame,echo)) for offset,frame,echo in events))
         sent=[]
         class Receiver(Canable):
-            def send(self,frame):sent.append(frame)
+            disable_requests=0
+            def send(self,frame):
+                sent.append(frame)
+                if (frame.can_id==0x601 and frame.data[1:3]==b'\x02\x20'
+                        and frame.data[4]==2):
+                    self.disable_requests+=1
+                    if stop_ack:
+                        self._rx.extend(packet(CanFrame(0x581,b'\x60'+frame.data[1:4]+bytes(4))))
             def close(self):self._started=False
         peer=Receiver('in-memory-clock');peer._started=True
+        peer.set_feedback_supervision(supervised)
         bus=MotorBus(peer)
         runtime=ControlRuntime(bus,{node:bus.motor(node) for node in (1,2)})
         channel=runtime.motor(1)
         channel._monitoring=True;channel._next=next_due;channel._last_rx=10;channel._inflight=inflight
+        if stop_ack is not None:
+            runtime._touched.add(1)
+            channel._motor.enabled=True
         def read(pipe,*,timeout):
-            deadline=min(clock[0]+timeout,10+until if until is not None else 12)
+            end=10+until if until is not None and not runtime._stop.is_set() else 12
+            deadline=min(clock[0]+timeout,end)
             if pending and pending[0][0]<=deadline:
                 clock[0],packet=pending.popleft()
                 return packet
@@ -882,6 +976,91 @@ class OneSecondFeedbackTests(unittest.TestCase):
         self.assertGreaterEqual(channel._stats.tx_count,26)
         self.assertTrue(sent)
         self.assertLess(at-channel._last_rx,.02)
+
+
+class SupervisedCounterRangeReplayTests(unittest.TestCase):
+    replay=OneSecondFeedbackTests.replay
+    feedback=staticmethod(OneSecondFeedbackTests.feedback)
+
+    @staticmethod
+    def report(kind,tx_errors,rx_errors):
+        details=bytearray(6)
+        if kind in ('form','stuff'):
+            details[2]=2 if kind=='form' else 4
+        return CanFrame(0x200 if kind=='crc' else 8,bytes(details)+bytes((tx_errors,rx_errors)),
+                        is_fd=False,brs=False,is_error=True)
+
+    def trace(self, *, feedback=True):
+        # One 1 kHz cycle carries a pure protocol report, a true TPDO5 and
+        # a class-free counter notification. Sweep upward and downward on RX/TX.
+        ramp=tuple(range(9,96))+tuple(range(94,8,-1))
+        events=[]
+        for index in range(1000):
+            count=ramp[index%len(ramp)]
+            tx_errors,rx_errors=(0,count) if index<500 else (count,0)
+            kind=('stuff','form','crc')[index%3]
+            offset=(index+1)*.001
+            events.append((offset,self.report(kind,tx_errors,rx_errors),0xffffffff))
+            if feedback:events.append((offset+.00001,self.feedback(1),0xffffffff))
+            events.append((offset+.00002,CanFrame(0,bytes(6)+bytes((tx_errors,rx_errors)),
+                is_fd=False,brs=False,is_error=True),0xffffffff))
+        return events
+
+    def test_1000hz_interleaved_reports_from_nine_to_95_keep_valid_feedback_running(self):
+        runtime,peer,_,_=self.replay(self.trace(),until=1.05,supervised=True,stop_ack=True)
+        self.assertIsNone(runtime._error)
+        self.assertEqual(runtime.motor(1)._stats.rx_count,1000)
+        self.assertEqual(peer.protocol_reports,1000)
+        self.assertEqual(peer.counter_reports,1000)
+        self.assertEqual(len(peer.protocol_history),16)
+        self.assertEqual({item['kind'] for item in peer.protocol_history},{'stuff','form','crc'})
+        self.assertTrue(all(item['feedback_supervised'] for item in peer.protocol_history))
+        self.assertFalse(peer._feedback_supervised)
+        self.assertTrue(all(max(item['tx_errors'],item['rx_errors'])<96 for item in peer.protocol_history))
+        self.assertTrue(runtime.motor(1).stop_status()['worker_cleanup']['confirmed'])
+        self.assertEqual(peer.disable_requests,1)
+        self.assertFalse(runtime.motor(1)._motor.enabled)
+
+    def test_protocol_and_counter_stream_without_same_node_feedback_still_times_out_at_one_second(self):
+        runtime,peer,at,_=self.replay(self.trace(feedback=False),supervised=True,stop_ack=True)
+        self.assertEqual(runtime._error.diagnostic_code,'MOTOR_FEEDBACK_STALE')
+        self.assertGreaterEqual(at,11);self.assertLess(at,11.002)
+        self.assertEqual(runtime.motor(1)._stats.rx_count,0)
+        self.assertGreaterEqual(peer.protocol_reports,999)
+        self.assertGreaterEqual(peer.counter_reports,999)
+        self.assertTrue(runtime.motor(1).stop_status()['worker_cleanup']['confirmed'])
+        self.assertEqual(peer.disable_requests,1)
+
+    def test_warning_busoff_and_counter_96_still_stop_and_confirm_real_cleanup(self):
+        cases=[
+            CanFrame(4,bytes.fromhex('0004000000000009'),is_fd=False,brs=False,is_error=True),
+            CanFrame(0x40,bytes.fromhex('0000000000000009'),is_fd=False,brs=False,is_error=True),
+            self.report('stuff',0,96),self.report('form',96,0),self.report('crc',0,96),
+            CanFrame(0,bytes.fromhex('0000000000000060'),is_fd=False,brs=False,is_error=True),
+        ]
+        for frame in cases:
+            with self.subTest(can_id=frame.can_id,data=frame.data.hex()):
+                events=[(.001,self.report('stuff',0,95),0xffffffff),
+                        (.00101,self.feedback(1),0xffffffff),(.2,frame,0xffffffff)]
+                runtime,peer,at,_=self.replay(events,supervised=True,stop_ack=True)
+                self.assertEqual(runtime._error.__class__.__name__,'CanBusError')
+                self.assertEqual(runtime._error.can_id,frame.can_id)
+                self.assertEqual(runtime._error.payload_hex,frame.data.hex())
+                self.assertEqual(runtime.motor(1)._stats.rx_count,1)
+                self.assertEqual(peer.protocol_reports,1)
+                self.assertLess(at,10.21)
+                self.assertTrue(runtime.motor(1).stop_status()['worker_cleanup']['confirmed'])
+                self.assertEqual(peer.disable_requests,1)
+                self.assertFalse(runtime.motor(1)._motor.enabled)
+
+    def test_terminal_busoff_without_disable_ack_remains_unconfirmed(self):
+        frame=CanFrame(0x40,bytes.fromhex('0000000000000009'),is_fd=False,brs=False,is_error=True)
+        runtime,peer,_,_=self.replay([(.2,frame,0xffffffff)],supervised=True,stop_ack=False)
+        self.assertEqual(runtime._error.__class__.__name__,'CanBusError')
+        self.assertEqual(runtime._error.can_id,0x40)
+        self.assertFalse(runtime.motor(1).stop_status()['worker_cleanup']['confirmed'])
+        self.assertIsNotNone(runtime._cleanup_error)
+        self.assertGreaterEqual(peer.disable_requests,2)
 
 
 if __name__=='__main__':unittest.main()

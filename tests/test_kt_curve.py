@@ -125,7 +125,61 @@ class ConsistencyTests(unittest.TestCase):
         self.assertEqual(len(set(held)), 1)
         first_after = next(torque for at, torque in motor.commands if at >= 100.7)
         self.assertEqual(first_after, held[-1])
+        start, end, target = result['recorder'].feedback_holds[0]
+        self.assertGreater(end - start, 500.)
+        self.assertEqual(target, held[-1])
         self.assertTrue(all(c.kwargs['max_age'] == .1 for c in dyno.state.call_args_list))
+
+    def test_held_target_uses_real_dyno_samples_and_preserves_quality_gates(self):
+        from scripts.factory_test.report import kt_target_curve
+        from scripts.factory_test.measurements.smoothing import append_smoothed_columns
+        for case in ('good', 'excess', 'no_hold', 'dyno_gap', 'changed_target', 'missing_metadata', 'lost_row'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                rec = Recorder(0., .8)
+                if case != 'no_hold':
+                    rec.feedback_holds = [(200., 600., 2.)]
+                path = Path(directory) / 'kt.csv'
+                for i in range(81):
+                    t = i/100
+                    applied = min(i, 20)/10 + max(0, i-60)/10
+                    if case == 'changed_target' and i == 39:
+                        applied = 3.
+                    rec.command(t, applied)
+                    if not 20 < i < 60:
+                        rec.add('motor', [state(t)])
+                    if case != 'dyno_gap' or not 28 < i < 52:
+                        dy = state(t)
+                        dy.torque = applied + (4. if case == 'excess' and 26 <= i <= 54 else 0.)
+                        rec.add('dyno', [dy])
+                with path.open('w', newline='', encoding='utf-8') as target:
+                    rec.write(csv.writer(target), self.args(), 'completed')
+                append_smoothed_columns(path, .3, .3, .1, .3, .3, output_columns=OUTPUT_COLUMNS)
+                app.pack_streams(path, align_motor=True, separate_events=lambda rows: rec.separate_hold_samples(rows, 100.))
+                with path.open(encoding='utf-8', newline='') as source:
+                    packed = list(csv.DictReader(source))
+                result = dict(config=dict(RAMP_DURATION_S=.4, SAMPLE_MAX_GAP_S=.1),
+                              capture_duration_s=.8, held_target_intervals=rec.verified_holds)
+                if case == 'lost_row':
+                    packed = [row for row in packed if float(row['time_ms']) != 410.]
+                if case == 'missing_metadata':
+                    del result['held_target_intervals']
+                summary = dict(target_torque=4., stages={'kt': {'result': result}})
+                if case in ('no_hold', 'dyno_gap', 'changed_target', 'missing_metadata', 'lost_row'):
+                    with self.assertRaisesRegex(ValueError, '覆盖不足'):
+                        kt_target_curve(packed, summary)
+                else:
+                    independent = [r for r in packed if r['motor_torque'] == '']
+                    self.assertEqual([float(r['time_ms']) for r in independent], list(range(210, 600, 10)))
+                    self.assertTrue(all(r['dyno_torque_nm'] and float(r['motor_application_target_torque']) == 2.
+                                        for r in independent))
+                    points, estimated = kt_target_curve(packed, summary)
+                    self.assertFalse(estimated)
+                    self.assertEqual(len(points), 81)
+                    error = max(abs(x-y) for x,y in points)
+                    if case == 'excess':
+                        self.assertGreater(error, 3.)
+                    else:
+                        self.assertLess(error, .2)
 
     def test_motor_disable_loss_marks_failure_even_if_ramp_succeeded(self):
         motor=Mock()

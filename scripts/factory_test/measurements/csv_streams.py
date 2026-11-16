@@ -5,6 +5,7 @@
 """
 import csv
 from bisect import bisect_left
+from heapq import merge
 from itertools import zip_longest
 import os
 from pathlib import Path
@@ -76,7 +77,8 @@ def independent_rows(fields, rows, *, single_time=False, align_motor=False, max_
     return output_fields, packed
 
 
-def pack_streams(path, destination=None, *, single_time=False, align_motor=False, max_skew_ms=20.0):
+def pack_streams(path, destination=None, *, single_time=False, align_motor=False, max_skew_ms=20.0,
+                 separate_events=None):
     """默认原子替换最终文件；指定 destination 时另存并拒绝覆盖。"""
     path = Path(path)
     with path.open(encoding='utf-8', newline='') as f:
@@ -103,8 +105,14 @@ def pack_streams(path, destination=None, *, single_time=False, align_motor=False
         else:
             output_fields, packed = fields, ([row[name] for name in fields] for row in rows)
     else:
+        separate = []
+        if separate_events is not None:
+            rows, separate = separate_events(rows)
         output_fields, packed = independent_rows(fields, rows, single_time=single_time,
                                                  align_motor=align_motor, max_skew_ms=max_skew_ms)
+        if separate:
+            standalone = ([row[key] for key in output_fields] for row in separate)
+            packed = merge(packed, standalone, key=lambda values: float(values[0]))
     if destination is not None:
         destination = Path(destination)
         with destination.open('x', encoding='utf-8', newline='') as f:

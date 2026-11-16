@@ -118,7 +118,10 @@ def kt_target_curve(rows, summary):
     maximum = abs(summary['target_torque'])
     if not all(math.isfinite(v) and v > 0 for v in (maximum, duration)):
         raise ValueError('KT目标或斜坡参数无效')
-    points, times = [], []
+    holds = result.get('held_target_intervals', ()) or ()
+    observed_counts = [0] * len(holds)
+    first_pair, last_pair = math.inf, -math.inf
+    observations = []
     for row in rows:
         if row.get('dyno_torque_smooth_nm') in ('', None): continue
         if (row.get('time_ms') in ('', None)
@@ -128,10 +131,26 @@ def kt_target_curve(rows, summary):
         if not math.isfinite(at): raise ValueError('KT采样时间非有限数')
         x = (maximum*min(1.0, max(0.0, at/(duration*1000))) if estimated else
              float(row['motor_application_target_torque']))
+        hold = None
+        if 'SAMPLE_MAX_GAP_S' in config and row.get('motor_torque') == '':
+            # Additional independent dynamometer observations require the capture's hold evidence.
+            hold = next((i for i,h in enumerate(holds) if h['start_ms'] < at < h['end_ms']
+                         and h['target'] == x), None)
+            if estimated or hold is None or row.get('dyno_torque_nm') in ('', None):
+                continue
+            observed_counts[hold] += 1
+        else:
+            first_pair, last_pair = min(first_pair, at), max(last_pair, at)
         y = float(row['dyno_torque_smooth_nm'])
         if not (math.isfinite(x) and math.isfinite(y)): raise ValueError('KT数据非有限数')
-        points.append((x, y))
-        times.append(at)
+        observations.append((at, x, y, hold))
+    complete_holds = {i for i,h in enumerate(holds) if observed_counts[i] == h['dyno_samples']
+                      and first_pair <= h['start_ms'] < h['end_ms'] <= last_pair}
+    points, times = [], []
+    for at, x, y, hold in observations:
+        if hold is None or hold in complete_holds:
+            points.append((x, y))
+            times.append(at)
     if len(points) < 10: raise ValueError('KT有效目标/测功机平滑数据不足')
     if all(x == points[0][0] for x, _ in points):
         raise ValueError('KT有效数据中目标扭矩未变化，无法评价扭矩斜坡')

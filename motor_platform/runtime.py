@@ -28,6 +28,8 @@ class Stats:
     max_lateness_s: float = 0.0
     max_tx_gap_s: float = 0.0
     max_rx_gap_s: float = 0.0
+    tx_gaps_over_2ms: int = 0
+    rx_gaps_over_2ms: int = 0
     tx_gaps_over_5ms: int = 0
     max_source_s: float = 0.0
     max_usb_write_s: float = 0.0
@@ -201,6 +203,7 @@ class MotorChannel:
             # Scalar fields only: avoid recursive deepcopy while holding the I/O lock.
             data = vars(self._stats).copy()
             data['max_poll_s'] = self._runtime._max_poll_s
+            data['usb_read_wait_mode'] = getattr(self._runtime._bus.transport, 'usb_read_wait_mode', None)
             data['max_poll_overrun_s'] = self._runtime._max_poll_overrun_s
             data['recording_dropped'] = self._motor.recording_dropped
             data['can_counter_reports'] = getattr(self._runtime._bus.transport, 'counter_reports', 0)
@@ -379,7 +382,9 @@ class ControlRuntime:
                 if channel._gap_anchor is not None:
                     gap = sent-channel._gap_anchor
                     stats.max_tx_gap_s = max(stats.max_tx_gap_s, gap)
-                    stats.tx_gaps_over_5ms += int(gap > 0.005)
+                    if gap > 0.002:
+                        stats.tx_gaps_over_2ms += 1
+                        stats.tx_gaps_over_5ms += int(gap > 0.005)
                 channel._gap_anchor = sent
                 stats.max_source_s = max(stats.max_source_s, write_started-generated)
                 stats.max_usb_write_s = max(stats.max_usb_write_s, sent-write_started)
@@ -426,7 +431,10 @@ class ControlRuntime:
                         channel = self._by_id[state.node_id]
                         received = state.received_at
                         if channel._stats.rx_count:
-                            channel._stats.max_rx_gap_s = max(channel._stats.max_rx_gap_s, received-channel._last_rx)
+                            gap = received - channel._last_rx
+                            channel._stats.max_rx_gap_s = max(channel._stats.max_rx_gap_s, gap)
+                            if gap > 0.002:
+                                channel._stats.rx_gaps_over_2ms += 1
                         channel._stats.rx_count += 1
                         channel._account_feedback(state)
                         channel._last_rx = received

@@ -14,6 +14,7 @@ import time
 from ..core.can import CanFrame
 
 DLC_LENGTHS = (*range(9), 12, 16, 20, 24, 32, 48, 64)
+CAN_ERROR_WARNING_COUNT = 96  # Elmue GS_ErrorWarning
 
 
 class Setup(C.Structure):
@@ -44,6 +45,8 @@ def _check(ok):
 
 
 class _Usb:
+    _read_timer = None  # Optional on older versions of Windows.
+
     def __init__(self, path):
         if os.name != "nt":
             raise OSError("Canable backend requires Windows + WinUSB")
@@ -87,6 +90,7 @@ class _Usb:
             self.read_size = max(128, inputs[0].packet_size * 2)
             self._event = self.k.CreateEventW(None, True, False, None)
             _check(self._event)
+            self._init_read_wait()
             self._overlapped = Overlapped(event=self._event)
             self._read_buffer = C.create_string_buffer(self.read_size)
             no_timeout = C.c_uint32(0)
@@ -94,6 +98,19 @@ class _Usb:
         except BaseException:
             self.close()
             raise
+
+    def _init_read_wait(self):
+        # A USB completion can wake this wait immediately, even between TX ticks.
+        handle, pointer = W.HANDLE, C.c_void_p
+        create = _bind(self.k, "CreateWaitableTimerExW",
+                       [pointer, W.LPCWSTR, W.DWORD, W.DWORD], handle)
+        _bind(self.k, "SetWaitableTimer", [handle, C.POINTER(C.c_int64), W.LONG,
+                                           pointer, pointer, W.BOOL])
+        _bind(self.k, "WaitForMultipleObjects", [W.DWORD, C.POINTER(handle), W.BOOL, W.DWORD], W.DWORD)
+        # CREATE_WAITABLE_TIMER_HIGH_RESOLUTION; TIMER_MODIFY_STATE | SYNCHRONIZE.
+        self._read_timer = create(None, None, 0x2, 0x100002)
+        if self._read_timer:
+            self._read_wait_handles = (handle * 2)(self._event, self._read_timer)
 
     def control(self, request, *, length=0, data=None):
         incoming = data is None
@@ -116,38 +133,52 @@ class _Usb:
             value = C.c_uint32(milliseconds)
             _check(self.w.WinUsb_SetPipePolicy(self.usb, pipe, 3, 4, C.byref(value)))
             self._write_timeouts[pipe] = milliseconds
-        size = len(data)
-        buf = C.create_string_buffer(data, size)
+        # The synchronous write borrows immutable bytes until WinUSB returns.
+        packet = bytes(data)
+        size = len(packet)
         n = C.c_uint32()
-        _check(self.w.WinUsb_WritePipe(self.usb, pipe, buf, size, C.byref(n), None))
+        _check(self.w.WinUsb_WritePipe(self.usb, pipe, packet, size, C.byref(n), None))
         if n.value != size:
             raise OSError("short USB write; CAN transmission outcome uncertain")
-        return buf.raw[:n.value]
+        return packet
 
     def _read_async(self, timeout):
         """Caller timeout never cancels USB IN; preserve one pending transfer across ticks."""
         self._issue_read()
         deadline = time.perf_counter() + timeout
-        while True:
-            result = self.k.WaitForSingleObject(self._event, 0)
-            if result == 0:
-                n = C.c_uint32()
-                _check(self.w.WinUsb_GetOverlappedResult(self.usb, C.byref(self._overlapped), C.byref(n), False))
-                data = self._read_buffer.raw[:n.value]
-                self._pending = False
-                self._issue_read()  # Rearm before decoding/dispatching to reduce USB idle gaps.
-                return data
-            if result != 258:  # WAIT_TIMEOUT
-                raise C.WinError(C.get_last_error())
+        result = self.k.WaitForSingleObject(self._event, 0)
+        timer = self._read_timer
+        while result == 258:  # WAIT_TIMEOUT
             remaining = deadline - time.perf_counter()
             if remaining <= 0:
                 return None
-            # A 100 us Python sleep measured ~0.54 ms on the target Windows
-            # host, and can overshoot the next TX deadline. Keep the final
-            # 600 us awake, polling the overlapped event (ctypes releases GIL).
-            # Longer waits still sleep, so idle/SDO waits do not busy-spin.
+            # Keep the last 600 us available to the TX scheduler. Before that
+            # point sleep *on the USB event* so an arriving read can wake us.
             if remaining > 0.0006:
-                time.sleep(min(remaining - 0.0006, 0.001))
+                wait_s = min(remaining - 0.0006, 1.0)
+                if timer:
+                    due = C.c_int64(-max(1, math.ceil(wait_s * 10_000_000)))
+                    if self.k.SetWaitableTimer(timer, C.byref(due), 0, None, None, False):
+                        result = self.k.WaitForMultipleObjects(2, self._read_wait_handles, False,
+                                                               math.ceil(min(remaining, 1.0) * 1000))
+                        if result == 0:
+                            break  # USB is first when both handles are signalled.
+                        if result not in (1, 258):
+                            raise C.WinError(C.get_last_error())
+                    else:
+                        self.k.CloseHandle(timer)
+                        self._read_timer = timer = None  # Keep the USB read; use the fallback on future calls.
+                if not timer:
+                    time.sleep(min(wait_s, 0.001))
+            result = self.k.WaitForSingleObject(self._event, 0)
+        if result != 0:
+            raise C.WinError(C.get_last_error())
+        n = C.c_uint32()
+        _check(self.w.WinUsb_GetOverlappedResult(self.usb, C.byref(self._overlapped), C.byref(n), False))
+        data = self._read_buffer[:n.value]
+        self._pending = False
+        self._issue_read()  # Rearm before decoding/dispatching.
+        return data
 
     def _issue_read(self):
         if not self._pending:
@@ -170,6 +201,9 @@ class _Usb:
 
     def close(self):
         self.suspend_read()
+        if self._read_timer:
+            self.k.CloseHandle(self._read_timer)
+            self._read_timer = None
         if self._event:
             self.k.CloseHandle(self._event)
             self._event = None
@@ -386,6 +420,12 @@ class Canable:
                 return None
             self._rx.extend(chunk)
 
+    @property
+    def usb_read_wait_mode(self):
+        if not self._started or self._usb is None:
+            return None
+        return 'event_timer' if getattr(self._usb, '_read_timer', None) else 'poll'
+
     def set_feedback_supervision(self, enabled):
         """Memory-only policy switch, owned by the periodic runtime.
 
@@ -402,7 +442,10 @@ class Canable:
         # buf_store_error(), where ERID_CRC_Error is 0x200 in legacy mode too.
         if not (frame.is_error and not frame.is_fd and not frame.brs
                 and not frame.is_extended and not frame.is_remote
-                and len(frame.data) == 8 and max(frame.data[6:]) <= 8):
+                and len(frame.data) == 8):
+            return False
+        peak_count = max(frame.data[6:])
+        if peak_count >= CAN_ERROR_WARNING_COUNT or (not self._feedback_supervised and peak_count > 8):
             return False
         if frame.can_id == 0x200 and frame.data[:6] == bytes(6):
             kind = 'crc'
@@ -444,4 +487,4 @@ def is_counter_report(frame):
     return (frame.is_error and frame.can_id == 0 and not frame.is_fd and not frame.brs
             and not frame.is_extended and not frame.is_remote
             and len(frame.data) == 8 and frame.data[:6] == bytes(6)
-            and max(frame.data[6:]) < 96)
+            and max(frame.data[6:]) < CAN_ERROR_WARNING_COUNT)

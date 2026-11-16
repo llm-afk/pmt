@@ -1,6 +1,7 @@
 """扭矩输出误差测量内核；仅由上位机流程传入设备、目标和输出目录。"""
 import argparse
 import csv
+from functools import partial
 import math
 from pathlib import Path
 import sys
@@ -135,7 +136,10 @@ def run(motor, dyno, ui, args, result):
                 recorder.cutoff = min(recorder.cutoff, time.perf_counter())
                 result['reason'] = 'operator_stop'
                 break
+            previous_rx = ramp.last_at
             new_feedback = ramp.update(state.received_at, now)
+            if new_feedback and SAMPLE_MAX_GAP_S < state.received_at-previous_rx < MOTOR_FEEDBACK_TIMEOUT_S:
+                recorder.resumed_feedback(previous_rx, state.received_at)
             applied = ramp_torque(ramp.elapsed, args.torque)
             # 正常截止仍是名义斜坡终点；等回包时保留该段实测数据。
             complete = new_feedback and ramp.elapsed >= RAMP_DURATION_S
@@ -234,7 +238,10 @@ def main(argv=None, *, output_dir, quiet=False):
                 append_smoothed_columns(csv_path, SMOOTH_WINDOW_S, SMOOTH_WINDOW_S,
                                         SAMPLE_MAX_GAP_S, SMOOTH_WINDOW_S, SMOOTH_WINDOW_S,
                                         output_columns=OUTPUT_COLUMNS)
-                pack_streams(csv_path, align_motor=True)
+                separate = None
+                if result['reason'] == 'completed' and recorder.feedback_holds:
+                    separate = partial(recorder.separate_hold_samples, max_gap_ms=SAMPLE_MAX_GAP_S*1000)
+                pack_streams(csv_path, align_motor=True, separate_events=separate)
         except Exception as exc:
             if original is None:
                 raise
@@ -242,5 +249,5 @@ def main(argv=None, *, output_dir, quiet=False):
         if not quiet:
             print(f'Test result: {result["reason"]}\nCSV: {csv_path}')
     return {'reason': result['reason'], 'csv': str(csv_path),
-            'capture_duration_s': recorder.cutoff - recorder.origin,
+            'capture_duration_s': recorder.cutoff - recorder.origin, 'held_target_intervals': recorder.verified_holds,
             'config': {k: v for k, v in globals().items() if k.isupper()}, 'arguments': vars(args)}
