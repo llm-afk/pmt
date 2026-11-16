@@ -46,7 +46,8 @@ def parse_frame(data, *, torque_scale=100.0, speed_scale=100.0, received_at=0.0)
     raw_torque = -magnitude if data[2] & 0x80 else magnitude
     raw_speed = ((data[2] & 0x7F) << 8) | data[3]
     rpm = raw_speed / speed_scale
-    return DynamometerState(raw_torque/torque_scale, rpm*math.pi/30, rpm,
+    # The fixture reports torque in the opposite direction to the motor.
+    return DynamometerState(-raw_torque/torque_scale, rpm*math.pi/30, rpm,
                             raw_torque, raw_speed, received_at)
 
 

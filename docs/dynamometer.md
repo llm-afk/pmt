@@ -41,7 +41,9 @@ with Dynamometer(port="COM22") as dyno:  # 上层配置实际端口；此处只�
 串口分片、合包均按流解析，不以一次 read 当作一帧。
 CRC 不是绝对的身份标识，偶然误匹配仍有可能；`discarded_bytes` 是跳过的字节数，不是丢帧数。
 
-沿用旧脚本缩放：`torque = signed_raw / torque_scale`，默认 `torque_scale=100`（Nm）；
+工位以电机方向为正。v1.0.29 起，`raw_torque` 保留测功机回包的带符号计数，
+工位扭矩 `torque = -raw_torque / torque_scale`，默认每 100 个计数对应 1 Nm。
+例如，原始计数 −2128 对应工位 +21.28 Nm。设备卡、测试记录和报告使用工位方向。
 `rpm = raw_speed / speed_scale`，默认 `speed_scale=100`，`speed = rpm * π / 30`（rad/s）。
 旧代码标记缩放待校准，仍需实机确认；脚本可传入不同缩放。
 `power = torque * speed` 保留符号。线路没有转速方向位，不能据此判定完整机械功率流向；

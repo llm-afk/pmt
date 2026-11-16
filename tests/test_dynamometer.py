@@ -42,12 +42,15 @@ class Transport:
 class DynamometerTests(unittest.TestCase):
     def test_crc_and_signed_torque_unsigned_speed(self):
         self.assertEqual(crc16(b'123456789'), 0x4B37)
-        s = parse_frame(frame(-1234, 32767), received_at=1)
-        self.assertEqual(s.torque, -12.34)
-        self.assertEqual(s.rpm, 327.67)
-        self.assertAlmostEqual(s.speed, 327.67*math.pi/30)
-        self.assertEqual(s.power, s.torque*s.speed)
-        self.assertEqual(s.received_at, 1)
+        for raw_torque, motor_torque in ((-2128, 21.28), (2128, -21.28), (0, 0.0)):
+            with self.subTest(raw_torque=raw_torque):
+                state = parse_frame(frame(raw_torque, 32767), received_at=1)
+                self.assertEqual(state.raw_torque, raw_torque)
+                self.assertEqual(state.torque, motor_torque)
+                self.assertEqual(state.rpm, 327.67)
+                self.assertAlmostEqual(state.speed, 327.67*math.pi/30)
+                self.assertAlmostEqual(state.power, motor_torque*state.speed)
+                self.assertEqual(state.received_at, 1)
         with self.assertRaises(ValueError):
             parse_frame(b'123456')
 
@@ -116,7 +119,7 @@ class DynamometerTests(unittest.TestCase):
         with Dynamometer(port='COM_TEST', transport=transport, capacity=3) as d:
             transport.incoming.put(b''.join(frame(i) for i in range(10)))
             wait_for(lambda: d.stats()['rx_count'] == 10)
-            self.assertEqual(d.state().torque, 0.09)
+            self.assertEqual(d.state().torque, -0.09)
             self.assertEqual(d.stats()['dropped_samples'], 7)
             self.assertEqual([s.raw_torque for s in d.drain()], [7, 8, 9])
             self.assertEqual(d.drain(), [])
@@ -152,7 +155,8 @@ class DynamometerTests(unittest.TestCase):
         for scale in (0, -1, float('inf'), True):
             with self.assertRaises(ValueError):
                 Dynamometer(port='COM_TEST', torque_scale=scale)
-        self.assertEqual(parse_frame(frame(1000, 1000), torque_scale=1000, speed_scale=10).rpm, 100)
+        state = parse_frame(frame(1000, 1000), torque_scale=1000, speed_scale=10)
+        self.assertEqual((state.torque, state.rpm), (-1.0, 100))
 
 
 class DynamometerOwnershipTests(unittest.TestCase):

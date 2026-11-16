@@ -3,5 +3,5 @@
 Keep the UI, Windows EXE metadata, logs and release manifest on this version.
 """
 
-VERSION = '1.0.28'
+VERSION = '1.0.29'
 VERSION_LABEL = 'v'+VERSION
