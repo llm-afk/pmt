@@ -30,8 +30,8 @@ HARDWARE_C = {'1': 'C2_jieke', '2': 'C2_xinzhi', '3': 'C2_PRO_jieke',
               '4': 'C2_PRO_xinzhi', '5': 'A2_jieke', '6': 'A2_xinzhi'}
 HARDWARE_D = {}
 HARDWARE_FIELDS = {'A': HARDWARE_A, 'B': HARDWARE_B, 'C': HARDWARE_C, 'D': HARDWARE_D}
-# Both documented hip categories use ID 2. Add the swing category once its MES code is known.
-JOINT_NODE_IDS = {'HIPX': 2, 'HIPY': 2, 'KNEE': 3}
+# Production mapping confirmed by the fixture owner: swing / hip / knee.
+JOINT_NODE_IDS = {'HIPX': 1, 'HIPY': 2, 'KNEE': 3}
 TEST_TORQUE_BY_BC = {'11': 30.0, '22': 30.0, '13': 50.0, '14': 50.0}
 
 
@@ -55,10 +55,9 @@ def hardware_torque_limit(hardware):
     return TEST_TORQUE_BY_BC.get(hardware[1:3]) if isinstance(hardware,str) and len(hardware)==4 else None
 MATERIALS = {
     'C2': {'HIPX': ['LFRR', 'LRRF'], 'HIPY': ['LFXX', 'RFXX', 'LRXX', 'RRXX'],
-           'KNEE': ['0STD', '0PRO'], 'BATY': ['8S2P', '8S5P'], '0LEG': ['LXXX', 'RXXX']},
+           'KNEE': ['0STD', '0PRO']},
     'A2': {'HIPX': ['LFRR', 'LRRF'], 'HIPY': ['LFRR', 'LRRF'],
-           'KNEE': ['LFRR', 'LRRF'], 'WHEL': ['LFRR', 'LRRF'],
-           'BATY': ['0STD'], 'NAVI': ['0001']},
+           'KNEE': ['LFRR', 'LRRF'], 'WHEL': ['LFRR', 'LRRF'], 'NAVI': ['0001']},
 }
 
 

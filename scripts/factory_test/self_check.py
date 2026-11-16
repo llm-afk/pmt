@@ -642,7 +642,7 @@ def run(destination):
             window.vars['category'].set(config.category)
             window.vars['subcategory'].set(config.subcategory)
             assert window.selection_changed('project') is True
-            for category, expected in (('hipx',2),('hipy',2),('knee',3)):
+            for category, expected in (('hipx',1),('hipy',2),('knee',3)):
                 window.vars['category'].set(category)
                 assert window.selection_changed('category') is True
                 assert window.config.target_id == load_config(config_path).target_id == expected

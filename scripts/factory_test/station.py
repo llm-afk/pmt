@@ -31,7 +31,7 @@ class RecoveryRequired(RuntimeError):
 class Services:
     def __init__(self, config, cancelled, emit, delivery=None, *, firmware_sha256=None):
         self.config, self.cancelled, self.emit = config, cancelled, emit
-        self.motor = Maintenance(config, cancelled)
+        self.motor = Maintenance(config,cancelled,progress=lambda message:self.emit('maintenance_progress',message))
         self.delivery = delivery
         self.firmware_sha256 = firmware_sha256
 

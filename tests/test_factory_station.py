@@ -1,7 +1,9 @@
 import copy
+from collections import deque
+from types import SimpleNamespace as NS
 from dataclasses import asdict, replace
 import io
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 import json
 import os
 from pathlib import Path
@@ -16,8 +18,9 @@ from scripts.factory_test.station_config import (StationConfig, load_config, sav
                                                 hardware_parts, hardware_input_value, temporary_sn)
 from scripts.factory_test.integrations import (MesClient, PrinterClient, PrintUnknown,
     IntegrationError, PendingConfiguration, mes_payload)
-from motor_platform.components.motor.client import SdoReplyTimeout
-from scripts.factory_test.maintenance import Maintenance, MotorAbsent, MotorIdentityUnreadable
+from motor_platform.components.motor.client import SdoReplyTimeout, CanBusError
+from scripts.factory_test.maintenance import (Maintenance, MotorAbsent, MotorIdentityUnreadable,
+    MultipleMotors, ResetReadbackUnconfirmed)
 from scripts.factory_test.station import StationRunner, DemoServices, PresenceLatch, RecoveryRequired
 from tests.test_motor import FakeTransport
 
@@ -107,7 +110,7 @@ class ConfigTests(unittest.TestCase):
             save_config(config, path)
             loaded = load_config(path)
             self.assertEqual(asdict(loaded), asdict(config))
-            self.assertEqual(loaded.target_id, 2)
+            self.assertEqual(loaded.target_id, 1)
             self.assertNotIn('target_id', json.loads(path.read_text(encoding='utf-8')))
             self.assertEqual(loaded.production_date, '')
             self.assertNotIn('api_key', json.loads(path.read_text(encoding='utf-8')))
@@ -130,11 +133,20 @@ class ConfigTests(unittest.TestCase):
     def test_material_and_side_set_the_production_id_for_both_product_families(self):
         from scripts.factory_test.station_config import MATERIALS
         for project, categories in MATERIALS.items():
-            for category, expected in (('HIPX',2),('HIPY',2),('KNEE',3)):
+            for category, expected in (('HIPX',1),('HIPY',2),('KNEE',3)):
                 for subcategory in categories[category]:
                     with self.subTest(project=project, category=category, subcategory=subcategory):
                         config=StationConfig(project=project, category=category, subcategory=subcategory)
                         self.assertEqual(config.require_target_id(), expected)
+
+
+    def test_material_dropdown_excludes_battery_and_whole_leg_for_all_projects(self):
+        from scripts.factory_test.station_config import MATERIALS, material_options
+        for project in (*MATERIALS,'CUSTOM'):
+            values=material_options(project)
+            self.assertNotIn('BATY',values)
+            self.assertNotIn('0LEG',values)
+            for category in ('HIPX','HIPY','KNEE'):self.assertIn(category,values)
 
 
 class MesTests(unittest.TestCase):
@@ -332,7 +344,7 @@ class MaintenanceTests(unittest.TestCase):
             self.assertEqual(len(calls),1 if model=='221' else 2)
             if model=='111':
                 self.assertEqual(calls[1],(1,0x200A,4,int.from_bytes(SN.encode()[24:]+b'\0\0','little')))
-            maintenance.wait_sn.assert_called_once_with(SN)
+            maintenance.wait_sn.assert_called_once_with(SN,previous_id=1)
 
     def test_adm_id_reset_lost_ack_requires_readback_instead_of_rewriting(self):
         maintenance=Maintenance(StationConfig())
@@ -344,7 +356,7 @@ class MaintenanceTests(unittest.TestCase):
         maintenance.wait_sn=Mock()
         maintenance.assign_id(1,SN)
         self.assertEqual(maintenance.write.call_count,1)
-        maintenance.wait_sn.assert_called_once_with(SN)
+        maintenance.wait_sn.assert_called_once_with(SN,previous_id=1)
 
     def calibration_fixture(self, reads, model='221'):
         config=StationConfig(model=model,hardware_version='0'+model)
@@ -578,3 +590,242 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(latch.wait_removal)
         latch.observe(False,5);latch.observe(False,7)
         self.assertFalse(latch.observe(True,8));self.assertTrue(latch.observe(True,9))
+
+
+
+class ResetRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.stack=ExitStack();self.addCleanup(self.stack.close)
+        self.folder=Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
+        self.now=1000.
+        self.stack.enter_context(patch('time.monotonic',side_effect=lambda:self.now))
+        self.stack.enter_context(patch('time.perf_counter',side_effect=lambda:self.now))
+
+    @staticmethod
+    def fault():
+        return CanFrame(0x0c,bytes.fromhex('0010020000000079'),
+                        is_fd=False,brs=False,is_error=True)
+
+    def drive(self, *, model='221', node=1, sn=SN):
+        state=NS(node=node,stored_id=node,raw=bytearray(sn.encode().ljust(28,b'\0')),
+            writes=[],sessions=[],reset=False,reset_error=True,reset_rejected=False,
+            reset_timeout=False,persistent=False,wrong_id=False,wrong_sn=False,extra_node=None,
+            fail_disable=False,fail_index=None,readback_faults=deque(),cancel=False)
+        config=StationConfig(model=model,hardware_version='0'+model)
+        def reply(frame):
+            selected=frame.can_id-0x600;index=int.from_bytes(frame.data[1:3],'little')
+            if selected!=state.node and not (state.reset and selected==state.extra_node):return []
+            if frame.data[0]==0x40:
+                if index==0x2040:
+                    if state.reset and selected==state.node:
+                        if state.readback_faults:
+                            fault=state.readback_faults.popleft()
+                            if fault:return [self.fault()]
+                        if state.persistent:return [self.fault()]
+                    value=selected if selected!=state.node else (1 if state.reset and state.wrong_id else state.stored_id)
+                    return [CanFrame(0x580+selected,b'\x4f'+frame.data[1:4]+bytes((value,0,0,0)))]
+                if 0x2004<=index<=0x200a:
+                    raw=(b'ANOTHER-MOTOR'.ljust(28,b'\0') if state.reset and state.wrong_sn else state.raw)
+                    offset=(index-0x2004)*4
+                    return [CanFrame(0x580+selected,b'\x43'+frame.data[1:4]+bytes(raw[offset:offset+4]))]
+            else:
+                value=int.from_bytes(frame.data[4:8],'little')
+                state.writes.append((selected,index,value))
+                if index==0x2002 and state.fail_disable:return [self.fault()]
+                if index==state.fail_index:return [self.fault()]
+                reboot=(index==0x200a or index==0x2040 and model[0]=='2')
+                if reboot and state.reset_rejected:
+                    return [CanFrame(0x580+selected,b'\x80'+frame.data[1:4]+bytes(4))]
+                if index==0x2040:state.stored_id=value
+                elif 0x2004<=index<=0x200a:
+                    offset=(index-0x2004)*4;state.raw[offset:offset+4]=frame.data[4:8]
+                if reboot:
+                    state.reset=True;state.node=state.stored_id
+                    if state.reset_timeout:return []
+                    if state.reset_error:return [self.fault()]
+                return [CanFrame(0x580+selected,b'\x60'+frame.data[1:4]+bytes(4))]
+            raise AssertionError('Unexpected wire request '+frame.data.hex())
+        @contextmanager
+        def bench_factory(**kwargs):
+            transport=FakeTransport();transport.on_send=reply
+            def receive(timeout):
+                self.now+=.001 if transport.queue else timeout
+                return transport.queue.popleft() if transport.queue else None
+            transport.recv=receive
+            bus=MotorBus(transport)
+            bench=NS(_bus=bus,motor=bus.motor)
+            state.sessions.append(transport)
+            try:yield bench
+            finally:bus.close()
+        maintenance=Maintenance(config,lambda:state.cancel,bench_factory)
+        def wait(duration):
+            maintenance.check_stop();self.now+=duration;maintenance.check_stop()
+        maintenance.wait=wait
+        return maintenance,state
+
+    @staticmethod
+    def id_writes(state):
+        return [row for row in state.writes if row[1]==0x2040]
+
+    def test_field_can_error_after_adm_id_write_recovers_by_readback_without_rewrite(self):
+        from scripts.factory_test.diagnostics import DiagnosticLogs, log_scope
+        maintenance,state=self.drive(sn='C2HIPXLFRRXC02232611130045')
+        logs=DiagnosticLogs(self.folder);self.addCleanup(logs.close)
+        with log_scope(logs.station):maintenance.assign_id(1,'C2HIPXLFRRXC02232611130045')
+        self.assertEqual(state.node,3)
+        self.assertEqual(self.id_writes(state),[(1,0x2040,3)])
+        self.assertTrue(all(session.closed for session in state.sessions))
+        self.assertTrue(all(frame.data[0]==0x40 for session in state.sessions[1:] for frame in session.sent))
+        text=logs.station.path.read_text(encoding='utf-8')
+        self.assertIn('[sdo.write.ack_unconfirmed]',text)
+        self.assertIn('0010020000000079',text)
+        self.assertIn('[motor.reset.verified]',text)
+        self.assertIn('[motor.id.verified]',text)
+        self.assertNotIn(' ERROR ',text)
+        row=next(json.loads(line[line.index('{'):]) for line in text.splitlines() if '[motor.reset.verified]' in line)
+        self.assertGreaterEqual(row['stable_reads'],2)
+
+    def test_missing_id_write_ack_also_requires_fresh_readback_and_one_write(self):
+        maintenance,state=self.drive();state.reset_timeout=True
+        maintenance.assign_id(1,SN)
+        self.assertEqual(self.id_writes(state),[(1,0x2040,3)])
+        self.assertTrue(all(session.closed for session in state.sessions))
+
+    def test_intermittent_readback_errors_reset_consecutive_confirmation_count(self):
+        maintenance,state=self.drive()
+        state.readback_faults.extend((True,False,True,False,False))
+        maintenance.assign_id(1,SN)
+        self.assertEqual(self.id_writes(state),[(1,0x2040,3)])
+        self.assertGreaterEqual(len(state.sessions),7)
+        self.assertTrue(all(frame.data[0]==0x40 for session in state.sessions[1:] for frame in session.sent))
+
+    def test_persistent_can_error_fails_with_bounded_readonly_retries(self):
+        maintenance,state=self.drive();state.persistent=True
+        with self.assertRaises(ResetReadbackUnconfirmed) as caught:maintenance.assign_id(1,SN)
+        self.assertEqual(caught.exception.diagnostic_context['target_id'],3)
+        self.assertIn('0010020000000079',caught.exception.diagnostic_context['last_error'])
+        self.assertEqual(self.id_writes(state),[(1,0x2040,3)])
+        self.assertLess(self.now,1012)
+        self.assertTrue(all(session.closed for session in state.sessions))
+        self.assertTrue(all(frame.data[0]==0x40 for session in state.sessions[1:] for frame in session.sent))
+
+    def test_wrong_sn_or_wrong_id_value_never_completes_reset_verification(self):
+        for field in ('wrong_sn','wrong_id'):
+            with self.subTest(field=field):
+                maintenance,state=self.drive();setattr(state,field,True)
+                with self.assertRaises(ResetReadbackUnconfirmed):maintenance.assign_id(1,SN)
+                self.assertEqual(self.id_writes(state),[(1,0x2040,3)])
+                self.assertTrue(all(session.closed for session in state.sessions))
+
+    def test_old_and_new_ids_both_responding_abort_the_post_reset_scan(self):
+        maintenance,state=self.drive();state.extra_node=1
+        with self.assertRaises(MultipleMotors):maintenance.assign_id(1,SN)
+        self.assertEqual(self.id_writes(state),[(1,0x2040,3)])
+        self.assertTrue(all(session.closed for session in state.sessions))
+
+    def test_gd_reset_tail_ack_error_recovers_but_id_write_remains_strict(self):
+        maintenance,state=self.drive(model='111')
+        maintenance.assign_id(1,SN)
+        self.assertEqual(self.id_writes(state),[(1,0x2040,3)])
+        self.assertEqual([index for _,index,_ in state.writes],[0x2002,0x2040,0x200a])
+        self.assertEqual(state.node,3)
+        maintenance,state=self.drive(model='111');state.fail_index=0x2040
+        with self.assertRaises(CanBusError):maintenance.assign_id(1,SN)
+        self.assertEqual([index for _,index,_ in state.writes],[0x2002,0x2040])
+        self.assertEqual(len(state.sessions),1)
+
+    def test_disable_error_and_explicit_sdo_rejection_do_not_enter_reconnect_path(self):
+        maintenance,state=self.drive();state.fail_disable=True
+        with self.assertRaises(CanBusError):maintenance.assign_id(1,SN)
+        self.assertEqual(self.id_writes(state),[])
+        self.assertEqual(len(state.sessions),1)
+        maintenance,state=self.drive();state.reset_rejected=True
+        with self.assertRaises(SdoError):maintenance.assign_id(1,SN)
+        self.assertEqual(len(state.sessions),1)
+        self.assertEqual(state.node,1)
+
+    def test_sn_final_segment_can_error_requires_exact_complete_readback_without_rewrite(self):
+        maintenance,state=self.drive(node=3)
+        maintenance.write_sn(maintenance.config.base_sn,SN)
+        self.assertEqual(bytes(state.raw),maintenance.config.base_sn.encode()+bytes(2))
+        self.assertEqual([index for _,index,_ in state.writes],
+                         [0x2002,*range(0x2004,0x200b)])
+        self.assertTrue(all(frame.data[0]==0x40 for session in state.sessions[1:] for frame in session.sent))
+
+    def test_nonfinal_sn_error_or_final_rejection_stops_without_replaying_any_segment(self):
+        maintenance,state=self.drive(node=3);state.fail_index=0x2006
+        with self.assertRaises(CanBusError):maintenance.write_sn(maintenance.config.base_sn,SN)
+        self.assertEqual([index for _,index,_ in state.writes],[0x2002,0x2004,0x2005,0x2006])
+        self.assertEqual(len(state.sessions),1)
+        maintenance,state=self.drive(node=3);state.reset_rejected=True
+        with self.assertRaises(SdoError):maintenance.write_sn(maintenance.config.base_sn,SN)
+        self.assertEqual(len(state.sessions),1)
+
+    def test_user_stop_before_or_during_reset_never_becomes_a_retry(self):
+        maintenance,state=self.drive();state.cancel=True
+        with self.assertRaises(InterruptedError):maintenance.assign_id(1,SN)
+        self.assertEqual(state.writes,[])
+        maintenance,state=self.drive();maintenance.cancelled=lambda:state.reset
+        with self.assertRaises(InterruptedError):maintenance.assign_id(1,SN)
+        self.assertEqual(self.id_writes(state),[(1,0x2040,3)])
+        self.assertEqual(len(state.sessions),1)
+        self.assertTrue(all(session.closed for session in state.sessions))
+
+    def test_usb_access_failure_is_not_silently_classified_as_expected_can_reboot(self):
+        maintenance,state=self.drive()
+        maintenance.write=Mock(side_effect=OSError('USB access denied'))
+        with self.assertRaisesRegex(OSError,'USB access denied'):maintenance.assign_id(1,SN)
+        self.assertEqual(len(state.sessions),1)
+        maintenance.write.assert_called_once()
+
+    def test_regular_write_keeps_can_error_and_uncertain_transaction_guard(self):
+        transport=FakeTransport();transport.on_send=lambda frame:[self.fault()]
+        bus=MotorBus(transport);bench=NS(_bus=bus)
+        with self.assertRaises(CanBusError):Maintenance.write(bench,3,0x2004,4,123)
+        self.assertTrue(bus._sdo_uncertain)
+        with self.assertRaises(SdoError):Maintenance.write(bench,3,0x2004,4,123)
+        self.assertEqual(len(transport.sent),1)
+
+    def test_persistent_reset_fault_blocks_calibration_sn_allocation_print_and_upload(self):
+        maintenance,state=self.drive();state.persistent=True
+        config=replace(maintenance.config,simulation=True)
+        service=DemoServices(config,lambda:False,lambda *args:None)
+        service.assign_id=lambda node,sn:maintenance.assign_id(node,sn)
+        for name in ('write_sn','calibrate','measure','allocate','print_sn','upload'):
+            setattr(service,name,Mock())
+        result=StationRunner(config,root=self.folder/'flow',services=service).begin(SN,1)
+        self.assertEqual(result['steps'],dict(firmware='DONE',assign_id='FAILED'))
+        self.assertEqual(result['diagnostic']['code'],'MOTOR_RESET_READBACK_UNCONFIRMED')
+        for name in ('write_sn','calibrate','measure','allocate','print_sn','upload'):
+            getattr(service,name).assert_not_called()
+        self.assertEqual(self.id_writes(state),[(1,0x2040,3)])
+
+    def test_hipx_side_swing_with_incoming_id_one_does_not_rewrite_id(self):
+        maintenance,state=self.drive(node=1)
+        maintenance.config=replace(maintenance.config,category='HIPX',subcategory='LFRR')
+        self.assertEqual(maintenance.config.require_target_id(),1)
+        maintenance.assign_id(1,SN)
+        self.assertEqual(state.writes,[])
+        self.assertEqual(state.sessions,[])
+
+    def test_reset_progress_updates_existing_worker_hint_without_overriding_stop_or_failure(self):
+        from tests.test_factory_modes import window
+        host=window();host.stopping=False;host.terminal_prompt=None;host.set_prompt=Mock()
+        message='正在重连核对 ID 3 和写入结果，请保持供电及 CAN 连接。'
+        host.events.put(('maintenance_progress',message));host.process_events()
+        host.set_prompt.assert_called_once_with('请保持供电和 CAN 连接',message,'#2563EB')
+        host.set_prompt.reset_mock();host.stopping=True
+        host.events.put(('maintenance_progress',message));host.process_events()
+        host.set_prompt.assert_not_called()
+        host.stopping=False;host.terminal_prompt=('failed','details','red')
+        host.events.put(('maintenance_progress',message));host.process_events()
+        host.set_prompt.assert_not_called()
+
+    def test_successful_reset_progress_reports_completion_only_after_verification(self):
+        maintenance,state=self.drive();maintenance.progress=Mock()
+        maintenance.assign_id(1,SN)
+        self.assertIn('正在重连核对',maintenance.progress.call_args_list[0].args[0])
+        self.assertIn('重连核对完成',maintenance.progress.call_args_list[-1].args[0])
+        maintenance,state=self.drive();state.persistent=True;maintenance.progress=Mock()
+        with self.assertRaises(ResetReadbackUnconfirmed):maintenance.assign_id(1,SN)
+        self.assertFalse(any('完成' in call.args[0] for call in maintenance.progress.call_args_list))

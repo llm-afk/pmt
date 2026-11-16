@@ -1482,7 +1482,7 @@ class FactoryWindow:
                         self.set_prompt(title,hint,'#2563EB')
                     self.refresh_progress()
                 self.write_log(dict(STEPS).get(name,'两项性能测试')+'：'+statuses[state],persist=False)
-            elif kind=='firmware_progress':
+            elif kind in ('firmware_progress','maintenance_progress'):
                 if not self.stopping and not self.terminal_prompt:
                     self.set_prompt('请保持供电和 CAN 连接',value,'#2563EB')
                 self.write_log(value,persist=False)

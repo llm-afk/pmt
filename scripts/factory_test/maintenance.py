@@ -3,8 +3,8 @@ from contextlib import contextmanager
 import time
 
 from motor_platform import Bench, Canable, CanFrame, SdoError
-from motor_platform.components.motor.client import SdoReplyTimeout
-from .diagnostics import current_log, log_event, idle_poll, idle_evidence
+from motor_platform.components.motor.client import SdoReplyTimeout, CanBusError
+from .diagnostics import current_log, log_event, log_scope, idle_poll, idle_evidence
 
 
 class MotorAbsent(TimeoutError):
@@ -21,10 +21,27 @@ class MotorIdentityUnreadable(RuntimeError):
         super().__init__(f'电机 ID {node} 已响应，但 SN 读取未完成：{cause}')
 
 
+class ResetReadbackUnconfirmed(RuntimeError):
+    diagnostic_code = 'MOTOR_RESET_READBACK_UNCONFIRMED'
+    diagnostic_hint = '复位后的目标 ID / 完整 SN 未核对成功。检查原始 CAN 错误、工位供电和接线；禁止自动重写 ID 或 SN。'
+
+    def __init__(self, **context):
+        self.diagnostic_context = context
+        super().__init__('复位后未能确认目标 ID 和完整 SN，已停止；不会自动重写')
+
+
+def reset_readback_waiting(error):
+    target = current_log()
+    return (bool(getattr(target, 'context', {}).get('reset_readback'))
+            and isinstance(error, (OSError, SdoError, MotorIdentityUnreadable))
+            and not isinstance(error, InterruptedError))
+
+
 class Maintenance:
-    def __init__(self, config, cancelled=lambda: False, bench_factory=Bench, *, diagnostic_poll=False):
+    def __init__(self, config, cancelled=lambda: False, bench_factory=Bench, *, diagnostic_poll=False, progress=lambda message:None):
         self.config, self.cancelled, self.bench_factory = config, cancelled, bench_factory
         self.diagnostic_poll = diagnostic_poll
+        self.progress = progress
 
     def event(self, name, **details):
         evidence = idle_evidence()
@@ -59,7 +76,7 @@ class Maintenance:
                     self.event('transport.releasing', node_id=node)
         except BaseException as exc:
             if idle_evidence() is None and not (self.diagnostic_poll and isinstance(exc, TimeoutError)):
-                log_event('transport.failed', level='ERROR', error=exc, node_id=node,
+                log_event('transport.failed', level='WARNING' if reset_readback_waiting(exc) else 'ERROR', error=exc, node_id=node,
                           adapter_sn=self.config.adapter_sn, elapsed_s=round(time.perf_counter()-started, 4))
             raise
         self.event('transport.closed', node_id=node, elapsed_s=round(time.perf_counter()-started, 4))
@@ -106,11 +123,11 @@ class Maintenance:
             if evidence is not None:
                 evidence['sdo'] = failure
             elif not diagnostic_probe or not isinstance(exc, TimeoutError):
-                log_event('sdo.read.failed',level='ERROR',error=exc,**failure)
+                log_event('sdo.read.failed',level='WARNING' if reset_readback_waiting(exc) else 'ERROR',error=exc,**failure)
             raise
 
     @staticmethod
-    def write(bench, node, index, size, value, timeout=.5):
+    def write(bench, node, index, size, value, timeout=.5, *, reset_expected=False):
         bus = bench._bus
         started, request, entered = time.perf_counter(), None, False
         try:
@@ -126,11 +143,13 @@ class Maintenance:
                 entered = True
                 bus._write_sdo(node, index, request, time.perf_counter()+timeout)
         except BaseException as exc:
-            log_event('sdo.write.failed', level='ERROR', error=exc, node_id=node,index=f'0x{index:04X}',
+            pending = reset_expected and entered and isinstance(exc, (TimeoutError, CanBusError))
+            log_event('sdo.write.ack_unconfirmed' if pending else 'sdo.write.failed',
+                       level='WARNING' if pending else 'ERROR', error=exc, node_id=node,index=f'0x{index:04X}',
                       size=size,value=value,can_id=f'0x{0x600+node:03X}',payload=request.data.hex() if request else None,
                       timeout_s=timeout,elapsed_s=round(time.perf_counter()-started,4),
                       write_call_entered=entered,outcome='ACK_NOT_CONFIRMED' if entered else 'NOT_STARTED',
-                      automatic_retry=False)
+                      automatic_retry=False, reset_expected=reset_expected, readback_required=bool(pending))
             raise
         log_event('sdo.write.ack',node_id=node,index=f'0x{index:04X}',
                   elapsed_s=round(time.perf_counter()-started,4))
@@ -138,6 +157,10 @@ class Maintenance:
     def probe(self):
         """只读固定工位 ID；空白 SN 也可被发现，不要求预先写过 SN。"""
         with self.connect() as bench:
+            actual_id = self.read(bench,self.config.target_id,0x2040,1,timeout=.15)
+            if actual_id != self.config.target_id:
+                raise SdoError(f'目标 ID {self.config.target_id} 的 0x2040 读回值为 {actual_id}')
+            self.event('motor.id.readback',node_id=self.config.target_id,value=actual_id)
             self.event('motor.sn.read.request',node_id=self.config.target_id,timeout_s=.15)
             raw = bench.motor(self.config.target_id).read_serial_bytes(timeout=.15)
             sn = raw.rstrip(b'\0').decode('ascii', errors='replace') or '未写入 SN'
@@ -214,38 +237,84 @@ class Maintenance:
             log_event('motor.disable.request',node_id=source_id,reason='before_id_change')
             motor.disable()
             log_event('motor.disable.ack',node_id=source_id,reason='before_id_change')
-            try:
-                self.write(bench, source_id, 0x2040, 1, target)
-            except TimeoutError:
-                if not adm:
-                    raise
-                # ADM 的 0x2040 回调立即 ResetDSP，ACK 可能丢失；后续读回是唯一证明。
+            if adm:
+                self._reset_write(bench,source_id,0x2040,1,target,reason='id_change')
+            else:
+                self.write(bench,source_id,0x2040,1,target)
             if not adm:
                 # GD 在启动时缓存 CAN ID。写回原 SN 末段触发已存在的重启回调，SN 不变。
-                try:
-                    self.write(bench, source_id, 0x200A, 4, int.from_bytes(raw[24:28], 'little'))
-                except TimeoutError:
-                    pass  # 仅末段复位可丢 ACK，仍必须从目标 ID 完整读回。
-        self.wait_sn(expected_current)
+                self._reset_write(bench,source_id,0x200A,4,int.from_bytes(raw[24:28], 'little'),reason='id_change_reboot')
+        self.wait_sn(expected_current, previous_id=source_id)
         log_event('motor.id.verified',node_id=target,sn=expected_current)
 
-    def wait_sn(self, expected):
-        # 最后一段 SN 触发 GD/ADM 软复位，等待之后另开 USB 会话读回。
-        self.wait(1.0)
-        deadline = time.monotonic()+8
-        attempt = 0
-        while time.monotonic() < deadline:
-            attempt += 1
-            self.check_stop()
-            try:
-                received = self.probe()
-                log_event('motor.sn.readback',attempt=attempt,expected=expected,received=received)
-                if received == expected:
-                    return
-            except (OSError, TimeoutError, SdoError) as exc:
-                log_event('motor.sn.reconnect_wait',level='WARNING',error=exc,attempt=attempt)
-            self.wait(.25)
-        raise RuntimeError('写 SN 后未能重连并完整读回，请检查电源和 ID；不会自动重写')
+    def _reset_write(self, bench, node, index, size, value, *, reason):
+        known_reset = ((index == 0x2040 and size == 1 and self.config.model[0] == '2')
+                       or (index == 0x200A and size == 4))
+        if not known_reset:
+            raise ValueError('仅已知会触发复位的 ID / SN 末段写入可转入重连核验')
+        self.check_stop()
+        try:
+            self.write(bench,node,index,size,value,reset_expected=True)
+        except (TimeoutError, CanBusError) as exc:
+            log_event('motor.reset.readback_required','复位写入应答未确认，关闭旧会话后只读核验',
+                level='WARNING',node_id=node,index=f'0x{index:04X}',reason=reason,
+                error_type=type(exc).__name__,message_detail=str(exc),automatic_retry=False)
+            # Do not clear _sdo_uncertain or send another command on this session.
+            # The caller exits connect() before any readback and never replays the write.
+
+    def wait_sn(self, expected, *, previous_id=None):
+        target = self.config.require_target_id()
+        purpose = 'id_change' if previous_id is not None else 'sn_write'
+        owner = current_log()
+        scoped = owner.bind(reset_readback=True,reset_reason=purpose) if owner else None
+        with log_scope(scoped):
+            log_event('motor.reset.readback.start','等待驱动器重启并核对目标 ID / 完整 SN',
+                target_id=target,previous_id=previous_id,expected_sn=expected,
+                settle_s=1.0,timeout_s=8.0,required_stable_reads=2,automatic_retry=False)
+            self.progress(f'正在重连核对 ID {target} 和写入结果，请保持供电及 CAN 连接。')
+            self.wait(1.0)
+            started = time.monotonic()
+            deadline = started+8
+            attempt = matched = errors = 0
+            observed = None
+            last_error = None
+            while time.monotonic() < deadline:
+                attempt += 1
+                self.check_stop()
+                try:
+                    received = self.probe()
+                    observed = dict(node_id=target,sn=received)
+                    matched = matched+1 if received == expected else 0
+                    log_event('motor.sn.readback',attempt=attempt,expected=expected,received=received,
+                              node_id=target,stable_reads=matched)
+                    if matched >= 2:
+                        if previous_id is not None:
+                            # Re-scan after an ID-changing reboot: the old ID or any
+                            # additional responding ID must not be silently accepted.
+                            observed = self.discover(exhaustive=True)
+                            if observed != dict(node_id=target,sn=expected):
+                                matched = 0
+                                log_event('motor.reset.identity_pending',level='WARNING',
+                                    expected_id=target,expected_sn=expected,observed=observed,attempt=attempt)
+                        if matched >= 2:
+                            log_event('motor.reset.verified','重启后目标 ID / 完整 SN 已核对',
+                                node_id=target,sn=expected,previous_id=previous_id,attempts=attempt,
+                                stable_reads=matched,reconnect_errors=errors,
+                                elapsed_s=round(time.monotonic()-started,3),automatic_retry=False)
+                            self.progress(f'重连核对完成：ID {target} 和完整 SN 一致。')
+                            return
+                except InterruptedError:
+                    raise
+                except (OSError, SdoError, MotorIdentityUnreadable) as exc:
+                    matched = 0
+                    errors += 1
+                    last_error = str(exc)
+                    log_event('motor.sn.reconnect_wait','重启窗口内只读重连，尚未确认结果',
+                        level='WARNING',error=exc,attempt=attempt,target_id=target,automatic_retry=False)
+                self.wait(min(.25,max(0,deadline-time.monotonic())))
+            raise ResetReadbackUnconfirmed(target_id=target,expected_sn=expected,previous_id=previous_id,
+                attempts=attempt,reconnect_errors=errors,timeout_s=8.0,last_observed=observed,
+                last_error=last_error,automatic_retry=False)
 
     def write_sn(self, sn, expected_current):
         if len(sn) != 26 or not sn.isascii() or not sn.isalnum():
@@ -267,13 +336,11 @@ class Maintenance:
             log_event('motor.disable.ack',node_id=node,reason='before_sn_write')
             for offset, index in enumerate(range(0x2004, 0x200B)):
                 self.check_stop()
-                try:
-                    self.write(bench, node, index, 4, int.from_bytes(raw[offset*4:offset*4+4], 'little'))
-                except TimeoutError:
-                    if index != 0x200A:
-                        raise
-                    log_event('motor.sn.reset_ack_missing','末段写入触发复位，等待完整读回证明',level='WARNING')
-                    # 仅最后一段允许因复位丢 ACK，必须另开会话完整读回证明。
+                value = int.from_bytes(raw[offset*4:offset*4+4], 'little')
+                if index == 0x200A:
+                    self._reset_write(bench,node,index,4,value,reason='sn_write_reboot')
+                else:
+                    self.write(bench,node,index,4,value)
         self.wait_sn(sn)
         log_event('motor.sn.verified',node_id=node,sn=sn)
 
