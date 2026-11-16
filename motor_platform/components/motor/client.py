@@ -5,6 +5,7 @@ import threading
 import time
 from typing import Protocol
 
+from ...core import io_trace
 from .protocol import (CanFrame, MitCommand, control_frame, feedback_request_frame,
                        mit_frame, parse_state, validate_node)
 
@@ -74,6 +75,13 @@ class MotorBus:
         for motor in self._motors.values():
             if frame.can_id == 0x190 + motor.node_id:
                 motor.last_state = parse_state(frame, motor.node_id, time.perf_counter())
+                state = motor.last_state
+                io_trace.record('motor.sample', device='motor', direction='DECODED',
+                    interface='CANable:'+str(getattr(self.transport,'serial_number','')),
+                    raw=frame.data, can_id=frame.can_id, position_rad=state.position,
+                    velocity_rad_s=state.velocity, torque_nm=state.torque,
+                    motor_temperature_c=state.motor_temperature, driver_temperature_c=state.board_temperature,
+                    error_code=state.error_code, received_at=state.received_at)
                 with motor._samples_lock:
                     if motor._samples is not None:
                         if len(motor._samples) == motor._samples.maxlen:

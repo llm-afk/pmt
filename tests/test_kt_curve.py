@@ -239,7 +239,9 @@ class ConsistencyTests(unittest.TestCase):
         dyno.__enter__.return_value = dyno
         bench = MagicMock()
         bench.__enter__.return_value = bench
-        bench.start.return_value = nullcontext(NS(motor=lambda node: None))
+        motor = MagicMock()
+        motor.monitor.side_effect = lambda: events.append('monitor')
+        bench.start.return_value = nullcontext(NS(motor=lambda node: motor))
         def run(motor, dyno, ui, args, result):
             events.append('run')
             rec = Recorder(0, 5)
@@ -272,7 +274,7 @@ class ConsistencyTests(unittest.TestCase):
             self.assertNotIn('motor_speed_smooth_rad_s', rows[0])
             self.assertNotIn('dyno_speed_smooth_rad_s', rows[0])
         self.assertEqual(events, ['off', ('current', 0), ('voltage', 24.), ('current', 3.),
-                                  'on', ('wait', .5), 'run', 'off', 'off'])
+                                  'monitor', 'on', ('wait', .5), 'run', 'off', 'off'])
 
 
 if __name__ == '__main__':

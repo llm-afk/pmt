@@ -3,6 +3,7 @@ import threading
 import time
 
 from ...transports.serial_scpi import SerialScpi
+from ...core import io_trace
 from .protocol import (PowerMeasurement, PowerState, PowerSupplyError,
                        number, parse_number, parse_output, parse_mode)
 
@@ -109,7 +110,11 @@ class PowerSupply:
             self._check()
             voltage = parse_number(self._transport.query('MEAS:VOLT?'))
             current = parse_number(self._transport.query('MEAS:CURR?'))
-            return PowerMeasurement(voltage, current, time.perf_counter())
+            measured=PowerMeasurement(voltage, current, time.perf_counter())
+            io_trace.record('power.sample',device='power_supply',interface=getattr(self._transport,'port',''),
+                            direction='DECODED',voltage_v=voltage,current_a=current,
+                            received_at=measured.received_at)
+            return measured
 
     def read_state(self):
         """Fresh measurements, setpoints, output and CV/CC; never a local cache."""
@@ -120,8 +125,12 @@ class PowerSupply:
             output = parse_output(self._transport.query('OUTP?'))
             mode = parse_mode(self._transport.query('OUTP:CVCC?'))
             measured = self.measure()
-            return PowerState(measured.voltage, measured.current, measured.received_at,
+            state=PowerState(measured.voltage, measured.current, measured.received_at,
                               voltage_set, current_set, output, mode)
+            io_trace.record('power.state',device='power_supply',interface=getattr(self._transport,'port',''),
+                            direction='DECODED',voltage_v=state.voltage,current_a=state.current,
+                            output_enabled=output,voltage_set=voltage_set,current_set=current_set,mode=mode)
+            return state
 
     def _write(self, command):
         with self._lock:

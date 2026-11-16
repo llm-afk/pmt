@@ -5,6 +5,7 @@ Only inspect() is read-only. open() explicitly configures and starts CAN FD.
 """
 import ctypes as C
 from collections import deque
+from ..core import io_trace
 from ctypes import wintypes as W
 import math
 import os
@@ -15,6 +16,11 @@ from ..core.can import CanFrame
 
 DLC_LENGTHS = (*range(9), 12, 16, 20, 24, 32, 48, 64)
 CAN_ERROR_WARNING_COUNT = 96  # Elmue GS_ErrorWarning
+PROTOCOL_ERROR_FLAGS = (
+    (0x01, 'bit'), (0x02, 'form'), (0x04, 'stuff'),
+    (0x08, 'bit_dominant'), (0x10, 'bit_recessive'),
+    (0x20, 'overload'), (0x40, 'error_announcement'), (0x80, 'transmission'),
+)
 
 
 class Setup(C.Structure):
@@ -376,7 +382,15 @@ class Canable:
         if not self._started:
             raise RuntimeError("CANable is not open")
         self._echo = self._echo % 255 + 1
-        self._usb.transfer(self._usb.output, encode_usb(frame, self._echo), timeout=0.1)
+        try:
+            self._usb.transfer(self._usb.output, encode_usb(frame, self._echo), timeout=0.1)
+        except BaseException as exc:
+            io_trace.record('can.tx.failed',device='motor_can',interface='CANable:'+str(self.serial_number),
+                            direction='TX',raw=frame.data,can_id=frame.can_id,error=repr(exc))
+            raise
+        io_trace.record('can.tx', device='motor_can', interface='CANable:'+str(self.serial_number),
+                        direction='TX', raw=frame.data, can_id=frame.can_id, is_fd=frame.is_fd,
+                        brs=frame.brs, echo_id=self._echo)
 
     def recv(self, timeout=0.1):
         if not self._started:
@@ -390,12 +404,18 @@ class Canable:
                 if len(self._rx) >= size:
                     packet = bytes(self._rx[:size])
                     del self._rx[:size]
+                    echo, can_id, dlc, channel, flags, _ = struct.unpack_from('<IIBBBB',packet)
+                    io_trace.record('can.echo' if echo!=0xffffffff else 'can.error' if can_id&0x20000000 else 'can.rx',
+                        device='motor_can', interface='CANable:'+str(self.serial_number), direction='RX',
+                        raw=packet[12:12+DLC_LENGTHS[dlc]] if dlc<len(DLC_LENGTHS) else packet[12:],
+                        can_id=can_id&0x1fffffff, echo_id=echo, dlc=dlc,
+                        channel=channel, flags=flags, usb_packet_hex=packet.hex())
                     frame = decode_usb(packet)
                     if frame is not None:
                         # Class-free Elmue notifications carry only counters.
                         # Elmue assigns 0x200 to CRC errors, so it follows the
                         # protocol-error policy below instead of this path.
-                        if is_counter_report(frame):
+                        if is_counter_report(frame, supervised=self._feedback_supervised):
                             self.counter_reports += 1
                             self.last_counter_report = {
                                 'can_id': frame.can_id, 'data': frame.data.hex(),
@@ -445,10 +465,31 @@ class Canable:
                 and len(frame.data) == 8):
             return False
         peak_count = max(frame.data[6:])
-        if peak_count >= CAN_ERROR_WARNING_COUNT or (not self._feedback_supervised and peak_count > 8):
+        if not self._feedback_supervised and peak_count > 8:
             return False
-        if frame.can_id == 0x20 and frame.data[:6] == bytes(6) and self._feedback_supervised:
-            kind = 'ack'
+        if self._feedback_supervised:
+            # Protocol/ACK/CRC and controller-state bits can share a report.
+            # Warning/passive counters describe bus health; real TPDO5s prove continuity.
+            # Buffer overflow, transceiver faults, bus-off and restart stay fatal.
+            if (not frame.can_id or frame.can_id & ~0x22C or frame.data[0]
+                    or frame.data[1] & ~0x7C or frame.data[4:6] != bytes(2)):
+                return False
+            if frame.data[1] and not frame.can_id & 0x4:
+                return False
+            kinds = []
+            if frame.can_id & 0x8:
+                if not frame.data[2]:
+                    return False
+                kinds.extend(name for mask, name in PROTOCOL_ERROR_FLAGS if frame.data[2] & mask)
+            elif frame.data[2:4] != bytes(2):
+                return False
+            if frame.can_id & 0x4:
+                kinds.append('controller')
+            if frame.can_id & 0x20:
+                kinds.append('ack')
+            if frame.can_id & 0x200:
+                kinds.append('crc')
+            kind = '+'.join(kinds)
         elif frame.can_id == 0x200 and frame.data[:6] == bytes(6):
             kind = 'crc'
         elif (frame.can_id == 0x8 and frame.data[:2] == bytes(2)
@@ -458,7 +499,7 @@ class Canable:
             return False
         self.protocol_reports += 1
         self.last_protocol_report = dict(can_id=frame.can_id, data=frame.data.hex(), received_at=now,
-            kind=kind, location=frame.data[3],
+            kind=kind, location=frame.data[3], controller_status=frame.data[1],
             tx_errors=frame.data[6], rx_errors=frame.data[7], feedback_supervised=self._feedback_supervised)
         self.protocol_history.append(self.last_protocol_report)
         while self._recent_protocol_reports and now-self._recent_protocol_reports[0] >= 1:
@@ -479,8 +520,8 @@ class Canable:
                 usb.close()
 
 
-def is_counter_report(frame):
-    """Consume class-free Elmue counter notifications below warning level.
+def is_counter_report(frame, *, supervised=False):
+    """Consume class-free Elmue counter notifications, with per-node runtime supervision.
 
     This backend requires Elmue firmware. Its error ID 0x200 means CRC error
     (ERID_CRC_Error), including legacy mode. Nonzero IDs and detail bytes must
@@ -489,4 +530,4 @@ def is_counter_report(frame):
     return (frame.is_error and frame.can_id == 0 and not frame.is_fd and not frame.brs
             and not frame.is_extended and not frame.is_remote
             and len(frame.data) == 8 and frame.data[:6] == bytes(6)
-            and max(frame.data[6:]) < CAN_ERROR_WARNING_COUNT)
+            and (supervised or max(frame.data[6:]) < CAN_ERROR_WARNING_COUNT))

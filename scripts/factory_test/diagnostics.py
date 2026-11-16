@@ -29,7 +29,7 @@ RETENTION_DAYS = 30
 POLL_SUMMARY_SECONDS = 60
 HEALTH_SUMMARY_SECONDS = 300
 LOCAL_TIME = timezone(timedelta(hours=8))
-OWNED_LOG = re.compile(r'(?:(?:run|motor)-\d{8}-\d{6}-[0-9a-f]{32}|station-\d{8}(?:-\d{4,})?)\.log')
+OWNED_LOG = re.compile(r'(?:(?:run|motor)-\d{8}-\d{6}-[0-9a-f]{32}|station-\d{8}(?:-\d{4,})?)(?:\.log|-io\.csv)')
 _target = ContextVar('factory_diagnostic_target', default=None)
 _idle = ContextVar('factory_idle_probe', default=None)
 _secret_key = re.compile(r'(?i)^(?:x[-_]?api[-_]?key|(?:(?:mes|sn|report)[-_])?api[-_]?key|(?:oss[-_]?)?access[-_]?key(?:[-_]?(?:id|secret))?|protected_credentials|secret|password|authorization|proxy[-_]authorization|cookie|set[-_]cookie|token|signature|security[-_]?token|x[-_]oss[-_]security[-_]token)$')
@@ -199,7 +199,7 @@ class LogTarget:
 
 class DiagnosticLogs:
     def __init__(self, storage_root, *, simulation=False, clock=time.time,
-                 monotonic=time.monotonic, failure=lambda message: None):
+                 monotonic=time.monotonic, failure=lambda message: None, capture_io=False):
         self.root = Path(storage_root)/'logs'
         self.simulation, self.clock, self.monotonic = simulation, clock, monotonic
         self.failure = failure
@@ -223,10 +223,24 @@ class DiagnosticLogs:
         stamp = datetime.fromtimestamp(self.clock(), LOCAL_TIME).strftime('%Y%m%d-%H%M%S')
         self.path = self.directory()/f'run-{stamp}-{self.boot_id}.log'
         self.closed = False
+        self.io_capture = None
+        capture_error = None
+        if capture_io:
+            from .io_capture import IoCapture
+            from motor_platform.core import io_trace
+            try:
+                self.io_capture = IoCapture(self.path.with_name(self.path.stem+"-io.csv"),
+                                             failure=lambda message: self.failure(message))
+                io_trace.install(self.io_capture)
+            except Exception as exc:
+                capture_error = "详细通信 CSV 创建失败："+str(exc)
         self.station.event('application.start', '上位机启动', runtime=self.runtime_info(),
                            retention_days=RETENTION_DAYS, log_directory=str(self.path.parent),
                            log_policy='one_file_per_run')
         self.cleanup(force=True)
+        if capture_error:
+            self.station.event("io.capture.failed",capture_error,level="ERROR")
+            self.last_error=capture_error
 
     def directory(self, simulation=None):
         if simulation is None and hasattr(self, 'path'):
@@ -321,6 +335,11 @@ class DiagnosticLogs:
                 context = self.redact(dict(schema_version=2, sequence=self.sequence, boot_id=self.boot_id,
                     log_file=target.reference, thread=threading.current_thread().name,
                     uptime_s=round(self.monotonic()-self.started, 3), **details))
+                if self.io_capture is not None:
+                    if event.startswith(("application.", "connection.", "flow.", "calibration.", "test.", "debug.", "motor.settings.")):
+                        self.io_capture.context(context, event)
+                    if event.startswith(("application.", "connection.", "flow.", "calibration.", "test.", "debug.", "motor.settings.", "power.", "printer.")):
+                        self.io_capture.record(event, device="station", details=context)
                 display = self.redact(str(message)).replace('\r',r'\r').replace('\n',r'\n')
                 line = f'{stamp} {level:7} [{event}] {display}'
                 line += ' '+json.dumps(context, ensure_ascii=False, default=str, allow_nan=False, separators=(',', ':'))+'\n'
@@ -529,6 +548,8 @@ class DiagnosticLogs:
     def export_boot(self, destination):
         """Export one run log at a stable byte cutoff while writers continue appending."""
         destination = Path(destination)
+        if self.io_capture is not None:
+            self.io_capture.flush()
         if destination.suffix.lower() != '.zip':
             raise ValueError('请选择 ZIP 文件名')
         with self.lock:
@@ -549,6 +570,17 @@ class DiagnosticLogs:
                 with zipfile.ZipFile(name,'w',zipfile.ZIP_DEFLATED,compresslevel=1) as archive:
                     with archive.open(reference,'w') as out:
                         self._copy_boot_records(source,out,end,summary)
+                    if self.io_capture is not None and self.io_capture.path.exists():
+                        with self.io_capture.path.open('rb') as capture:
+                            remaining=os.fstat(capture.fileno()).st_size
+                            with archive.open(self.io_capture.path.relative_to(self.root).as_posix(),'w') as out:
+                                while remaining:
+                                    chunk=capture.read(min(1048576,remaining))
+                                    if not chunk:
+                                        break
+                                    out.write(chunk)
+                                    remaining-=len(chunk)
+                        summary.append('详细通信 CSV：'+json.dumps(self.io_capture.status(),ensure_ascii=False))
                     archive.writestr('诊断摘要.txt', ('\n'.join(summary)+'\n').encode('utf-8-sig'))
                 os.replace(name,destination)
             finally:
@@ -666,7 +698,7 @@ class DiagnosticLogs:
                             continue
                         path = directory/entry.name
                         with self.lock:
-                            if path == self.path:
+                            if path == self.path or self.io_capture is not None and path == self.io_capture.path:
                                 continue
                             if self._owned(path) and path.stat().st_mtime < cutoff:
                                 path.unlink()
@@ -691,3 +723,5 @@ class DiagnosticLogs:
                 records=self.sequence+1, error_records=self.level_counts['ERROR'],
                 warning_records=self.level_counts['WARNING'])
             self.closed = True
+        if self.io_capture is not None:
+            self.io_capture.close()

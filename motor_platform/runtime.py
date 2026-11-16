@@ -65,6 +65,8 @@ class MotorChannel:
         self.name = name
         self._rate_hz = rate_hz
         self._target = MitCommand()
+        self._last_sent_target = None
+        self._last_sent_can_id = None
         self._source = self._on_sent = None
         self._active = False
         self._monitoring = False
@@ -213,7 +215,11 @@ class MotorChannel:
             state = self._motor.last_state
             started = getattr(self._runtime, '_poll_started', 0)
             return dict(statistics=self.stats(), last_feedback=asdict(state) if state else None,
-                        target=asdict(self._target), captured_at=now,
+                        target=asdict(self._target),
+                        last_submitted=(dict(can_id=self._last_sent_can_id,
+                            data=(self._last_sent_target.pack() if self._last_sent_target else bytes(16)).hex(),
+                            submitted_at=self._stats.last_tx_at) if self._last_sent_can_id is not None else None),
+                        captured_at=now,
                         worker_alive=self._runtime._thread.is_alive(),
                         worker_error=repr(self._runtime._error) if self._runtime._error else None,
                         poll_inflight_ms=(now-started)*1000 if started else 0, stop_status=self.stop_status())
@@ -362,6 +368,8 @@ class ControlRuntime:
                 stats.max_source_s = max(stats.max_source_s, write_started-generated)
                 stats.max_usb_write_s = max(stats.max_usb_write_s, sent-write_started)
                 stats.tx_count += 1
+                channel._last_sent_target = target if controlling else None
+                channel._last_sent_can_id = (0x400 if controlling else 0x100) + channel.node_id
                 # At intentionally slow poll rates, time spent idle before a request
                 # is not time spent waiting for its response.
                 if not channel._requests_since_feedback and (not channel._last_rx or period >= MOTOR_FEEDBACK_TIMEOUT_S):

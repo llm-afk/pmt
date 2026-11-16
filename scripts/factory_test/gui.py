@@ -152,7 +152,8 @@ class FactoryWindow:
             self.saved_credentials = dict.fromkeys(SECRET_FIELDS,'')
             self.credential_error = str(exc)
             credential_exception = exc
-        self.diagnostics = diagnostics or DiagnosticLogs(storage_root or state_root(), simulation=self.config.simulation)
+        self.diagnostics = diagnostics or DiagnosticLogs(storage_root or state_root(), simulation=self.config.simulation,
+                                                       capture_io=not self.config.simulation and not preview_only)
         self.diagnostics.failure = lambda message:self.events.put(('log_failure',message))
         if self.diagnostics.last_error:
             self.diagnostics.failure(self.diagnostics.last_error)
@@ -805,6 +806,8 @@ class FactoryWindow:
             self.write_log('[配置] '+('已读取工位配置：' if self.config_existed else '首次启动，使用默认工位配置：')+str(self.config_path))
         self.write_log('[存储] 工位数据目录：'+str(self.storage_root or state_root()))
         self.write_log('[日志] 当前启动记录：'+str(self.diagnostics.station.path)+'；日志保留 30 天。')
+        if self.diagnostics.io_capture is not None:
+            self.write_log('[详细采集] 全部硬件通信 CSV：'+str(self.diagnostics.io_capture.path))
         self.log_configuration()
         self.write_log('[探测] '+('设备监视已启用，等待环境就绪后探测硬件。' if self.config.automatic else
             '设备监视已暂停，可在工位配置 → 管理中启用。'))

@@ -1,5 +1,6 @@
 """One receive worker per instrument, fresh latest state and bounded sample FIFO."""
 from collections import deque
+from ...core import io_trace
 import threading
 import time
 
@@ -127,6 +128,11 @@ class Dynamometer:
                 frames = parser.feed(data)
                 states = [parse_frame(frame, torque_scale=self.torque_scale,
                                       speed_scale=self.speed_scale, received_at=received) for frame in frames]
+                for frame, state in zip(frames, states):
+                    io_trace.record('dynamometer.sample', device='dynamometer', interface=self.port,
+                        direction='DECODED', raw=frame, torque_nm=state.torque, raw_torque=state.raw_torque,
+                        raw_speed=state.raw_speed, rpm=state.rpm, speed_rad_s=state.speed,
+                        received_at=state.received_at)
                 with self._condition:
                     self._bytes += len(data)
                     self._discarded = parser.discarded_bytes

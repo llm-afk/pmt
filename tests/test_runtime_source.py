@@ -31,6 +31,10 @@ class RuntimeSourceTests(unittest.TestCase):
         self.assertEqual(generated, [1.0105])
         self.assertEqual(sent, [(1.0105, 1.0105)])
         self.assertEqual(channel.stats()['skipped_periods'], 10)
+        submitted=channel.diagnostic_snapshot()['last_submitted']
+        self.assertEqual(submitted['can_id'],tr.sent[-1].can_id)
+        self.assertEqual(submitted['data'],tr.sent[-1].data.hex())
+        self.assertEqual(submitted['submitted_at'],1.0105)
         tr.send = lambda frame: (_ for _ in ()).throw(OSError('failed USB write'))
         with self.assertRaises(OSError):
             rt._tick(1.012)

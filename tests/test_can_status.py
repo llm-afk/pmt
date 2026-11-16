@@ -38,10 +38,9 @@ class SupervisedProtocolTests(unittest.TestCase):
 
     def test_supervision_never_hides_severe_unknown_or_malformed_errors(self):
         can=Canable('offline');can.set_feedback_supervision(True)
-        for cid,data in [(0x48,'000008000000f800'),(0x204,'003000000000867f'),
-                         (8,'0000040000000060'),(8,'0000020000006000'),
-                         (8,'0000040000010001'),(8,'0000060000000009'),
-                         (8,'0000010000000001'),(0x20,'0000000000006000'),
+        for cid,data in [(0x48,'000008000000f800'),(0x100,'0000000000000000'),
+                         (4,'0001000000000001'),
+                         (8,'0000040000010001'),(8,'0000000000000001'),
                          (0x20,'0000000000010800'),(0x60,'0000000000000800')]:
             with self.subTest(cid=cid,data=data):
                 self.assertFalse(can._record_transient(CanFrame(cid,bytes.fromhex(data),is_fd=False,brs=False,is_error=True),0))
@@ -105,11 +104,16 @@ class CounterReportUsbTests(unittest.TestCase):
                 self.assertGreater(can.last_counter_report['received_at'], 0)
                 can._usb.transfer.assert_called_once()
 
-    def test_supervised_protocol_reports_below_warning_preserve_following_feedback(self):
+    def test_supervised_protocol_reports_preserve_following_feedback_across_counter_levels(self):
         feedback = CanFrame(0x191, bytes(8), is_fd=False, brs=False)
         for cid, kind, prefix in ((8, 'stuff', '000004000000'), (8, 'form', '000002000000'),
-                                  (0x200, 'crc', '000000000000'), (0x20, 'ack', '000000000000')):
-            for tx, rx in ((0, 9), (9, 0), (95, 95)):
+                                  (0x200, 'crc', '000000000000'), (0x20, 'ack', '000000000000'),
+                                  (8, 'bit', '000001000000'), (8, 'bit_dominant', '000008000000'),
+                                  (8, 'bit_recessive', '000010000000'), (8, 'overload', '000020000000'),
+                                  (8, 'error_announcement', '000040000000'), (8, 'transmission', '000080000000'),
+                                  (8, 'form+stuff', '000006000000'), (8, 'bit+transmission', '000081000000'),
+                                  (0x228, 'bit_recessive+ack+crc', '000010000000')):
+            for tx, rx in ((0, 9), (9, 0), (95, 95), (96,0), (255,255)):
                 with self.subTest(kind=kind, tx=tx, rx=rx):
                     raw = bytes.fromhex(prefix) + bytes((tx, rx))
                     packet = self.packet(0x20000000 | cid, raw)
@@ -128,7 +132,8 @@ class CounterReportUsbTests(unittest.TestCase):
         from motor_platform import MotorBus
         from motor_platform.components.motor.client import CanBusError
         ack = self.packet(0x581, bytes.fromhex('6002200000000000'))
-        for cid, prefix in ((8, '000004000000'), (8, '000002000000'), (0x200, '000000000000')):
+        for cid, prefix in ((8, '000004000000'), (8, '000002000000'),
+                            (8, '000010000000'), (0x228, '000010000000'), (0x200, '000000000000')):
             for tx, rx, count in ((0, 8, 3), (8, 0, 3), (0, 9, 1), (9, 0, 1)):
                 with self.subTest(can_id=cid, prefix=prefix, tx=tx, rx=rx, count=count):
                     raw = bytes.fromhex(prefix) + bytes((tx, rx))
@@ -137,7 +142,8 @@ class CounterReportUsbTests(unittest.TestCase):
                     with self.assertRaises(CanBusError) as caught:
                         MotorBus(can)._wait_sdo(1, 0x2002, time.perf_counter() + .1)
                     self.assertEqual(caught.exception.can_id, cid)
-                    self.assertEqual(bytes(can._rx), ack)
+                    consumed = 3 if cid in (8,0x200) and prefix != '000010000000' and max(tx,rx)<=8 else 1
+                    self.assertEqual(bytes(can._rx),packet*(count-consumed)+ack)
 
     def test_elmue_crc_reports_keep_protocol_history_under_supervision(self):
         data = bytes.fromhex('0000000000000001')
@@ -172,17 +178,11 @@ class CounterReportUsbTests(unittest.TestCase):
     def test_severe_or_malformed_counter_frames_remain_errors(self):
         data = bytes.fromhex('0000000000000001')
         cases = [
-            (0x204, data, 0),  # Controller state combined with CRC class.
             (0x240, data, 0),  # Bus-off combined with CRC class.
             (0x208, data, 0),  # Multiple protocol error classes.
-            (4, bytes.fromhex('0004000000000009'), 0),  # Explicit controller RX warning.
-            (4, bytes.fromhex('0008000000000900'), 0),  # Explicit controller TX warning.
-            (8, bytes.fromhex('0000060000000009'), 0),  # Mixed form/stuff flags.
-            (8, bytes.fromhex('0000040000000060'), 0),
-            (8, bytes.fromhex('0000020000006000'), 0),
-            (0x200, bytes.fromhex('0000000000000060'), 0),
+            (4, bytes.fromhex('0001000000000009'), 0),  # Controller RX overflow.
+            (4, bytes.fromhex('0002000000000900'), 0),  # Controller TX overflow.
             (0x200, bytes.fromhex('0000020000000001'), 0),
-            (0x200, bytes.fromhex('000000000000ff00'), 0),
             (0x200, bytes.fromhex('0000000000010001'), 0),
             (0x200, data[:7], 0),
             (0x200, data, 2),  # FD error report.

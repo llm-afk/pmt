@@ -971,20 +971,25 @@ class SupervisedCounterRangeReplayTests(unittest.TestCase):
     @staticmethod
     def report(kind,tx_errors,rx_errors):
         details=bytearray(6)
-        if kind in ('form','stuff'):
-            details[2]=2 if kind=='form' else 4
-        return CanFrame(0x200 if kind=='crc' else 8,bytes(details)+bytes((tx_errors,rx_errors)),
+        flags=dict(form=2,stuff=4,bit=1,bit_dominant=8,bit_recessive=16,
+                   overload=32,error_announcement=64,transmission=128)
+        if kind in flags:
+            details[2]=flags[kind]
+        can_id={'crc':0x200,'ack':0x20}.get(kind,8)
+        return CanFrame(can_id,bytes(details)+bytes((tx_errors,rx_errors)),
                         is_fd=False,brs=False,is_error=True)
 
     def trace(self, *, feedback=True):
         # One 1 kHz cycle carries a pure protocol report, a true TPDO5 and
         # a class-free counter notification. Sweep upward and downward on RX/TX.
-        ramp=tuple(range(9,96))+tuple(range(94,8,-1))
+        ramp=(0,8,9,95,96,127,128,255,128,127,96,95,9,8)
         events=[]
         for index in range(1000):
             count=ramp[index%len(ramp)]
             tx_errors,rx_errors=(0,count) if index<500 else (count,0)
-            kind=('stuff','form','crc')[index%3]
+            kinds=('stuff','form','crc','ack','bit','bit_dominant',
+                   'bit_recessive','overload','error_announcement','transmission')
+            kind=kinds[index%len(kinds)]
             offset=(index+1)*.001
             events.append((offset,self.report(kind,tx_errors,rx_errors),0xffffffff))
             if feedback:events.append((offset+.00001,self.feedback(1),0xffffffff))
@@ -992,17 +997,19 @@ class SupervisedCounterRangeReplayTests(unittest.TestCase):
                 is_fd=False,brs=False,is_error=True),0xffffffff))
         return events
 
-    def test_1000hz_interleaved_reports_from_nine_to_95_keep_valid_feedback_running(self):
+    def test_1000hz_interleaved_reports_and_full_counter_range_keep_valid_feedback_running(self):
         runtime,peer,_,_=self.replay(self.trace(),until=1.05,supervised=True,stop_ack=True)
         self.assertIsNone(runtime._error)
         self.assertEqual(runtime.motor(1)._stats.rx_count,1000)
         self.assertEqual(peer.protocol_reports,1000)
         self.assertEqual(peer.counter_reports,1000)
         self.assertEqual(len(peer.protocol_history),16)
-        self.assertEqual({item['kind'] for item in peer.protocol_history},{'stuff','form','crc'})
+        self.assertEqual({item['kind'] for item in peer.protocol_history},
+                         {'stuff','form','crc','ack','bit','bit_dominant','bit_recessive',
+                          'overload','error_announcement','transmission'})
         self.assertTrue(all(item['feedback_supervised'] for item in peer.protocol_history))
         self.assertFalse(peer._feedback_supervised)
-        self.assertTrue(all(max(item['tx_errors'],item['rx_errors'])<96 for item in peer.protocol_history))
+        self.assertTrue(any(max(item['tx_errors'],item['rx_errors'])>=128 for item in peer.protocol_history))
         self.assertTrue(runtime.motor(1).stop_status()['worker_cleanup']['confirmed'])
         self.assertEqual(peer.disable_requests,1)
         self.assertFalse(runtime.motor(1)._motor.enabled)
@@ -1017,12 +1024,25 @@ class SupervisedCounterRangeReplayTests(unittest.TestCase):
         self.assertTrue(runtime.motor(1).stop_status()['worker_cleanup']['confirmed'])
         self.assertEqual(peer.disable_requests,1)
 
-    def test_warning_busoff_and_counter_96_still_stop_and_confirm_real_cleanup(self):
+    def test_controller_warnings_and_passive_states_leave_continuity_to_real_feedback(self):
+        for status in (4,8,16,32,64):
+            with self.subTest(status=status):
+                frame=CanFrame(4,bytes((0,status,0,0,0,0,128,128)),
+                               is_fd=False,brs=False,is_error=True)
+                events=[(index*.001,self.feedback(1),0xffffffff) for index in range(1,1001)]
+                events.append((.2,frame,0xffffffff))
+                runtime,peer,_,_=self.replay(events,until=1.05,supervised=True,stop_ack=True)
+                self.assertIsNone(runtime._error)
+                self.assertEqual(runtime.motor(1)._stats.rx_count,1000)
+                self.assertEqual(peer.last_protocol_report['controller_status'],status)
+                self.assertTrue(runtime.motor(1).stop_status()['worker_cleanup']['confirmed'])
+
+    def test_busoff_overflow_and_transceiver_faults_still_stop_and_confirm_real_cleanup(self):
         cases=[
-            CanFrame(4,bytes.fromhex('0004000000000009'),is_fd=False,brs=False,is_error=True),
+            CanFrame(4,bytes.fromhex('0001000000000009'),is_fd=False,brs=False,is_error=True),
             CanFrame(0x40,bytes.fromhex('0000000000000009'),is_fd=False,brs=False,is_error=True),
-            self.report('stuff',0,96),self.report('form',96,0),self.report('crc',0,96),
-            CanFrame(0,bytes.fromhex('0000000000000060'),is_fd=False,brs=False,is_error=True),
+            CanFrame(0x10,bytes.fromhex('0000000004000000'),is_fd=False,brs=False,is_error=True),
+            CanFrame(8,bytes.fromhex('0000040000010000'),is_fd=False,brs=False,is_error=True),
         ]
         for frame in cases:
             with self.subTest(can_id=frame.can_id,data=frame.data.hex()):
@@ -1051,7 +1071,7 @@ class SupervisedCounterRangeReplayTests(unittest.TestCase):
 
 
 
-class SupervisedAckReplayTests(unittest.TestCase):
+class SupervisedBusErrorReplayTests(unittest.TestCase):
     replay=OneSecondFeedbackTests.replay
     feedback=staticmethod(OneSecondFeedbackTests.feedback)
 
@@ -1077,17 +1097,32 @@ class SupervisedAckReplayTests(unittest.TestCase):
         self.assertTrue(runtime.motor(1).stop_status()['worker_cleanup']['confirmed'])
         self.assertEqual(peer.disable_requests,1)
 
-    def test_repeated_ack_errors_cannot_refresh_the_one_second_motor_deadline(self):
-        events=[(index*.001,self.ack_report(),0xffffffff) for index in range(1,1201)]
-        runtime,peer,at,sent=self.replay(events,supervised=True,stop_ack=True,
-                                       command=MitCommand(torque=2))
-        self.assertEqual(runtime._error.diagnostic_code,'MOTOR_FEEDBACK_STALE')
-        self.assertGreaterEqual(at,11)
-        self.assertLess(at,11.002)
-        self.assertEqual(runtime.motor(1)._stats.rx_count,0)
-        self.assertGreaterEqual(peer.protocol_reports,999)
-        self.assertGreaterEqual(len([frame for frame in sent if frame.can_id==0x401]),990)
+    def test_field_recessive_bit_error_keeps_fresh_feedback_and_real_disable_ack(self):
+        events=[(index*.001,self.feedback(1),0xffffffff) for index in range(1,1601)]
+        events.append((1.1442,CanFrame(8,bytes.fromhex('0000100000000000'),
+                                     is_fd=False,brs=False,is_error=True),0xffffffff))
+        runtime,peer,_,_=self.replay(events,until=1.601,supervised=True,
+                                    stop_ack=True,command=MitCommand(torque=2))
+        self.assertIsNone(runtime._error)
+        self.assertEqual(runtime.motor(1)._stats.rx_count,1600)
+        self.assertEqual(peer.last_protocol_report['kind'],'bit_recessive')
         self.assertTrue(runtime.motor(1).stop_status()['worker_cleanup']['confirmed'])
+        self.assertEqual(peer.disable_requests,1)
+
+    def test_bus_error_notifications_cannot_refresh_the_one_second_motor_deadline(self):
+        for report in (self.ack_report(),CanFrame(8,bytes.fromhex('0000100000000000'),
+                        is_fd=False,brs=False,is_error=True)):
+            with self.subTest(can_id=report.can_id,data=report.data.hex()):
+                events=[(index*.001,report,0xffffffff) for index in range(1,1201)]
+                runtime,peer,at,sent=self.replay(events,supervised=True,stop_ack=True,
+                                               command=MitCommand(torque=2))
+                self.assertEqual(runtime._error.diagnostic_code,'MOTOR_FEEDBACK_STALE')
+                self.assertGreaterEqual(at,11)
+                self.assertLess(at,11.002)
+                self.assertEqual(runtime.motor(1)._stats.rx_count,0)
+                self.assertGreaterEqual(peer.protocol_reports,999)
+                self.assertGreaterEqual(len([frame for frame in sent if frame.can_id==0x401]),990)
+                self.assertTrue(runtime.motor(1).stop_status()['worker_cleanup']['confirmed'])
 
 
 

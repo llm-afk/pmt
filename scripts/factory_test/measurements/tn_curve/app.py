@@ -323,10 +323,11 @@ def main(argv=None, *, output_dir, quiet=False):
                         writer = csv.writer(csvfile)
                         writer.writerow(COLUMNS)
                         with Bench(transport=Canable(args.serial), motor_ids=[args.id], rate_hz=MOTOR_HZ) as bench:
-                            power.enable()  # Zero current limit, independent motor battery.
                             with bench.start() as control:
-                                run(control.motor(args.id), dyno, power, pool, ui, writer, summary,
-                                    torque=args.torque)
+                                motor = control.motor(args.id)
+                                motor.monitor()
+                                power.enable()  # Zero current limit, independent motor battery.
+                                run(motor, dyno, power, pool, ui, writer, summary, torque=args.torque)
                 finally:
                     # Executor has joined any in-flight set_current before OFF.
                     power_off(power, summary)

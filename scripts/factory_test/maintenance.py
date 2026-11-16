@@ -1,5 +1,6 @@
 """工装侧 SDO 维护协议，单接收者。只在自动工位实际运行时打开硬件。"""
 from contextlib import contextmanager
+import struct
 import time
 
 from motor_platform import Bench, Canable, CanFrame, SdoError
@@ -381,6 +382,22 @@ class Maintenance:
                         log_event('motor.disable.request',node_id=node,reason='after_calibration')
                         motor.disable()
                         log_event('calibration.confirmed',node_id=node,stable_samples=stable,disable_ack=True)
+                        if adm:
+                            settings = {}
+                            for index, size, name in ((0x2000,2,'error_code'),
+                                                      (0x205B,4,'torque_limit_nm'),
+                                                      (0x2044,2,'heartbeat_consumer_enable')):
+                                self.check_stop()
+                                try:
+                                    value = self.read(bench,node,index,size,timeout=.15,diagnostic_probe=True)
+                                except Exception as exc:
+                                    log_event('motor.settings.unavailable',level='WARNING',node_id=node,
+                                              index=f'0x{index:04X}',error=exc,settings=settings)
+                                    break
+                                settings[name] = dict(index=f'0x{index:04X}',raw_hex=value.to_bytes(size,'little').hex(),
+                                    value=struct.unpack('<f',value.to_bytes(4,'little'))[0]
+                                          if name=='torque_limit_nm' else value)
+                            log_event('motor.settings.snapshot',node_id=node,phase='after_calibration',settings=settings)
                         return
                     self.wait(.2)
                 raise TimeoutError('校准完成等待超时')

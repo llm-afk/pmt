@@ -214,11 +214,13 @@ def main(argv=None, *, output_dir, quiet=False):
                             with TerminalConsole(title='关节输出扭矩一致性测试', prompt='torque> ',
                                                  commands='status | quit') as ui:
                                 with Bench(transport=Canable(args.serial), motor_ids=[args.id], rate_hz=MOTOR_HZ) as bench:
-                                    power.enable()  # 电源读回已完成，之后采集循环不做阻塞 SCPI 查询。
-                                    time.sleep(LOAD_SETTLE_S)  # 先建立阻尼，此时尚未使能电机。
                                     with bench.start() as control:
+                                        motor = control.motor(args.id)
+                                        motor.monitor()
                                         try:
-                                            run(control.motor(args.id), dyno, ui, args, result)
+                                            power.enable()  # 建立阻尼期间保持零目标监视。
+                                            time.sleep(LOAD_SETTLE_S)
+                                            run(motor, dyno, ui, args, result)
                                         finally:
                                             power_off(power)  # 降扭矩、失能之后立即关闭阻尼输出。
                         finally:

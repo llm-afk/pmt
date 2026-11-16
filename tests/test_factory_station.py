@@ -374,12 +374,25 @@ class MaintenanceTests(unittest.TestCase):
 
     def test_adm_completion_requires_reset_flag_and_new_completion_not_only_ack(self):
         # 初始无错、确认标志已清、进行中、完成两次，最后才失能放行。
-        maintenance,motor,_=self.calibration_fixture([0,0,0,0,0,1,0,1])
-        maintenance.calibrate()
+        maintenance,motor,_=self.calibration_fixture([0,0,0,0,0,1,0,1,0,0x41F00000,1])
+        with patch('scripts.factory_test.maintenance.log_event') as log:
+            maintenance.calibrate()
         self.assertEqual([call.args[2:5] for call in maintenance.write.call_args_list],
                          [(0x2072,2,0),(0x2002,2,0xF1)])
-        self.assertEqual(maintenance.read.call_count,8)
+        self.assertEqual(maintenance.read.call_count,11)
+        self.assertEqual([call.args[2] for call in maintenance.read.call_args_list[-3:]],
+                         [0x2000,0x205B,0x2044])
+        snapshot=next(call.kwargs for call in log.call_args_list if call.args[0]=='motor.settings.snapshot')
+        self.assertEqual(snapshot['settings']['torque_limit_nm']['value'],30.)
         self.assertEqual(motor.disable.call_count,2)
+
+    def test_optional_settings_read_failure_does_not_undo_confirmed_calibration(self):
+        maintenance,motor,_=self.calibration_fixture([0,0,0,0,0,1,0,1,SdoError('unsupported')])
+        with patch('scripts.factory_test.maintenance.log_event') as log:
+            maintenance.calibrate()
+        self.assertEqual(motor.disable.call_count,2)
+        self.assertTrue(any(call.args[0]=='motor.settings.unavailable' for call in log.call_args_list))
+        self.assertEqual(maintenance.write.call_count,2)
 
     def test_old_gd_calibration_does_not_prove_this_calibration(self):
         maintenance,_,_=self.calibration_fixture([0],model='111')
