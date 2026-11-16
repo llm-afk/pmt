@@ -41,9 +41,25 @@ class SupervisedProtocolTests(unittest.TestCase):
         for cid,data in [(0x48,'000008000000f800'),(0x204,'003000000000867f'),
                          (8,'0000040000000060'),(8,'0000020000006000'),
                          (8,'0000040000010001'),(8,'0000060000000009'),
-                         (8,'0000010000000001'),(0x20,'0000000000000100')]:
+                         (8,'0000010000000001'),(0x20,'0000000000006000'),
+                         (0x20,'0000000000010800'),(0x60,'0000000000000800')]:
             with self.subTest(cid=cid,data=data):
                 self.assertFalse(can._record_transient(CanFrame(cid,bytes.fromhex(data),is_fd=False,brs=False,is_error=True),0))
+
+    def test_ack_error_during_sdo_cannot_be_confused_with_a_disable_ack(self):
+        import time
+        from unittest.mock import Mock
+        from motor_platform import MotorBus
+        from motor_platform.components.motor.client import CanBusError
+        error=CounterReportUsbTests.packet(0x20000020,bytes.fromhex('0000000000000800'))
+        ack=CounterReportUsbTests.packet(0x581,bytes.fromhex('6002200000000000'))
+        can=Canable('offline');can._started=True;can._usb=Mock()
+        can._usb.transfer.return_value=error+ack
+        with self.assertRaises(CanBusError) as caught:
+            MotorBus(can)._wait_sdo(1,0x2002,time.perf_counter()+.1)
+        self.assertEqual(caught.exception.can_id,0x20)
+        self.assertEqual(bytes(can._rx),ack)
+        self.assertEqual(can.protocol_reports,0)
 
     def test_error_only_usb_batch_yields_to_feedback_and_lease_guards(self):
         import struct
@@ -92,7 +108,7 @@ class CounterReportUsbTests(unittest.TestCase):
     def test_supervised_protocol_reports_below_warning_preserve_following_feedback(self):
         feedback = CanFrame(0x191, bytes(8), is_fd=False, brs=False)
         for cid, kind, prefix in ((8, 'stuff', '000004000000'), (8, 'form', '000002000000'),
-                                  (0x200, 'crc', '000000000000')):
+                                  (0x200, 'crc', '000000000000'), (0x20, 'ack', '000000000000')):
             for tx, rx in ((0, 9), (9, 0), (95, 95)):
                 with self.subTest(kind=kind, tx=tx, rx=rx):
                     raw = bytes.fromhex(prefix) + bytes((tx, rx))

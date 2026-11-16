@@ -258,8 +258,8 @@ class Motor:
                 self._bus.transport.send(control_frame(self.node_id, False))
                 self.enabled = None
 
-    def send_mit(self, command: MitCommand, *, auto_enable: bool = True):
-        frame = mit_frame(self.node_id, command, auto_enable=auto_enable)
+    def send_mit(self, command: MitCommand):
+        frame = mit_frame(self.node_id, command)
         with self._bus._lock:
             self._bus._check()
             self._bus.transport.send(frame)

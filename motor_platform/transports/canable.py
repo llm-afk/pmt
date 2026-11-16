@@ -436,7 +436,7 @@ class Canable:
         self._feedback_supervised = enabled
 
     def _record_transient(self, frame, now):
-        # Low-counter form/stuff/CRC reports are not feedback or ACKs. During
+        # Transient bus-error notifications are not motor feedback. During
         # periodic operation, the runtime's per-node feedback deadline decides continuity.
         # The firmware-specific CRC ID comes from Elmue candlelight_def.h and
         # buf_store_error(), where ERID_CRC_Error is 0x200 in legacy mode too.
@@ -447,7 +447,9 @@ class Canable:
         peak_count = max(frame.data[6:])
         if peak_count >= CAN_ERROR_WARNING_COUNT or (not self._feedback_supervised and peak_count > 8):
             return False
-        if frame.can_id == 0x200 and frame.data[:6] == bytes(6):
+        if frame.can_id == 0x20 and frame.data[:6] == bytes(6) and self._feedback_supervised:
+            kind = 'ack'
+        elif frame.can_id == 0x200 and frame.data[:6] == bytes(6):
             kind = 'crc'
         elif (frame.can_id == 0x8 and frame.data[:2] == bytes(2)
                 and frame.data[2] in (2, 4) and frame.data[4:6] == bytes(2)):

@@ -342,7 +342,7 @@ class ControlRuntime:
                     raise TypeError("MIT source must return MitCommand")
             write_started = time.perf_counter()
             if controlling:
-                channel._motor.send_mit(target, auto_enable=False)
+                channel._motor.send_mit(target)
             else:
                 channel._motor.request_feedback()
             sent = time.perf_counter()

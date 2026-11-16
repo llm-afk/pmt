@@ -107,7 +107,7 @@ command = MitCommand(position=0.0, velocity=0.0, torque=0.0, kp=0, kd=0)
 | 失能 | `0x600 + node` | `2B 02 20 00 02 00 00 00` |
 | 控制字 ACK | `0x580 + node` | `60 02 20 00 00 00 00 00` |
 | MIT 指令并自动使能 | `0x400 + node` | 16 字节 `<fffHH`：position, velocity, torque, kp×100, kd×100 |
-| 周期 MIT 目标（保持当前使能状态） | `0x100 + node` | 同上，监视时为全零目标 |
+| 全零目标监视 | `0x100 + node` | 16 字节全零，不自动使能 |
 | 状态 | `0x190 + node` | 16 字节 `<fffhh`：position, velocity, torque, motor_temp×10, board_temp×10 |
 | 带错误状态 | `0x190 + node` | 20 字节：上述 16 字节 + uint16 error + 未定义的 2 字节 |
 
