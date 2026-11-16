@@ -304,7 +304,7 @@ class ManualSession:
                 if not recent or sample['at']-recent[-1]['at']>=.1:
                     recent.append(sample)
                 if current_log():
-                    current_log().sample('debug.telemetry',sample=sample,
+                    current_log().sample('debug.telemetry',interval=5.0,sample=sample,
                                          statistics=statistics if channel is not None else dict(simulated=True))
                 self.emit('control_sample', sample)
         except BaseException as exc:

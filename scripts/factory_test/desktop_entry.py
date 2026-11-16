@@ -25,23 +25,34 @@ def main():
         raise SystemExit(0 if run(args.self_check)['ok'] else 1)
     from scripts.factory_test.lifecycle import StationInstance, AlreadyRunning
     from scripts.factory_test.station_config import state_root
+    logs = None
     try:
         with StationInstance(state_root()):
-            from scripts.factory_test.gui import main as gui_main
-            gui_main()
+            from scripts.factory_test.diagnostics import DiagnosticLogs
+            logs = DiagnosticLogs(state_root(), simulation=False)
+            try:
+                from scripts.factory_test.gui import main as gui_main
+                gui_main(diagnostics=logs)
+            except Exception as exc:
+                if not logs.closed:
+                    logs.station.event('application.startup.failed', '窗口启动或主线程退出异常',level='ERROR',error=exc)
+                exc.add_note('本次启动日志：'+str(logs.station.path) if not logs.last_error else logs.last_error)
+                raise
+            finally:
+                logs.close()
     except AlreadyRunning as exc:
         already_running_notice(str(exc))
         return
     except Exception as exc:
-        # Import/Tk initialization failures happen before the normal window logger exists.
-        try:
-            from scripts.factory_test.diagnostics import DiagnosticLogs
-            from scripts.factory_test.station_config import state_root
-            logs = DiagnosticLogs(state_root(), simulation=False)
-            logs.station.event('application.startup.failed', '窗口启动或主线程退出异常',level='ERROR',error=exc)
-            exc.add_note('启动失败日志：'+str(logs.station.path) if not logs.last_error else logs.last_error)
-        except Exception as log_exc:
-            exc.add_note('启动失败日志也未能保存：'+str(log_exc))
+        if logs is None:
+            try:
+                from scripts.factory_test.diagnostics import DiagnosticLogs
+                logs = DiagnosticLogs(state_root(), simulation=False)
+                logs.station.event('application.startup.failed', '程序初始化失败',level='ERROR',error=exc)
+                exc.add_note('启动失败日志：'+str(logs.station.path) if not logs.last_error else logs.last_error)
+                logs.close()
+            except Exception as log_exc:
+                exc.add_note('启动失败日志也未能保存：'+str(log_exc))
         raise
 
 

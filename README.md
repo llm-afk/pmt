@@ -19,7 +19,7 @@ PMT 是 Production Motor Test 的缩写。本目录只维护电机产测上位�
     ├─ install_drivers.cmd    驱动安装入口
     └─ release-manifest.json  版本、文件指纹和验证结果
 
-工位配置、加密密钥、运行日志和新报告默认保存在 %LOCALAPPDATA%\MirrorMe\FactoryStation。
+工位配置、加密密钥、运行日志和新报告默认保存在 %LOCALAPPDATA%\MirrorMe\FactoryStation。每次启动只生成一份 run-日期时间-启动标识.log，覆盖启动至退出的全部设备、工件和服务过程；日志默认保留 30 天。
 APP 直接放在根目录 EXE 旁的 firmware 文件夹；更换该文件后自动重新检查版本。
 旧的独立实验脚本、终端工具、历史实验输出和重复部署目录已清理。
 

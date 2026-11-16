@@ -70,7 +70,8 @@ os._exit(7)
 
     def test_entry_keeps_lock_through_gui_lifetime_and_releases_after_return(self):
         from scripts.factory_test.desktop_entry import main
-        def gui():
+        def gui(*, diagnostics):
+            self.assertIsNotNone(diagnostics)
             with self.assertRaises(AlreadyRunning):
                 with StationInstance(self.root): pass
         with patch('scripts.factory_test.station_config.state_root',return_value=self.root), \

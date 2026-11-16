@@ -375,7 +375,16 @@ def run(destination):
             # only production entry into a simulated run. Bootstrap is guarded above.
             real_root = tk.Toplevel(root)
             real_root.withdraw()
-            real_window = FactoryWindow(real_root, config_path=config_path, storage_root=folder/'production-ui')
+            from .diagnostics import DiagnosticLogs
+            with patch('pathlib.Path.open',side_effect=OSError(28,'simulated startup log disk full')):
+                early_logs=DiagnosticLogs(folder/'production-ui')
+            assert early_logs.last_error
+            real_window = FactoryWindow(real_root, config_path=config_path, storage_root=folder/'production-ui',
+                diagnostics=early_logs)
+            assert real_window.diagnostics is early_logs
+            assert any(kind=='log_failure' and 'simulated startup log disk full' in message
+                for kind,message in real_window.events.queue)
+            assert len(list((folder/'production-ui/logs').rglob('*.log')))==1
             assert real_window.config.simulation is False
             real_window.shutdown.set(); real_window.diagnostics.close(); real_root.destroy()
             assert not hasattr(window, 'sn_entry')
@@ -740,6 +749,9 @@ def run(destination):
             assert all(marker in saved_log for marker in ('connection.open','flow.start','flow.end',
                 'delivery.succeeded','connection.close',record['request_id'],'PRINT_ACK_INVALID','schema_version'))
             assert record['connection_log'] == connection_log.relative_to(window.diagnostics.root).as_posix()
+            assert record['connection_id'] == window.diagnostics.latest.scope
+            assert record['log_boot_id'] == window.diagnostics.boot_id
+            assert list(window.diagnostics.root.rglob('*.log')) == [connection_log]
             import zipfile
             archive_path=folder/'exported-session.zip'
             with patch('scripts.factory_test.gui.filedialog.asksaveasfilename',return_value=str(archive_path)):

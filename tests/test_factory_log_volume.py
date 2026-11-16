@@ -114,69 +114,64 @@ class LogVolumeTests(unittest.TestCase):
         self.assertEqual(self.logs.idle_polls,{})
 
 
-    def test_station_rotates_whole_records_and_motor_keeps_one_connection_file(self):
-        with patch('scripts.factory_test.diagnostics.STATION_LOG_BYTES',1024):
-            target=self.logs.station
-            for i in range(24): target.event('rotation.event',index=i,payload='x'*300)
-            files=list(target.path.parent.glob('station-*.log'))
-            self.assertGreater(len(files),2)
-            values=[]
-            for path in files:
-                self.assertLessEqual(path.stat().st_size,1024)
-                values.extend(data['index'] for event,data in self.records(path) if event=='rotation.event')
-            self.assertEqual(sorted(values),list(range(24)))
-            motor=self.logs.observe(True,identity=dict(node_id=1,sn='same'),config=self.config)
-            for i in range(10): motor.event('motor.detail',payload='x'*300)
-            self.assertGreater(motor.path.stat().st_size,1024)
-            self.assertEqual(list(motor.path.parent.glob('motor-*.log')),[motor.path])
-            archive=self.root/'parts.zip';self.logs.export_boot(archive)
-            with zipfile.ZipFile(archive) as exported:
-                self.assertTrue(all(path.relative_to(self.logs.root).as_posix() in exported.namelist() for path in files))
-                content=''.join(exported.read(name).decode('utf-8-sig') for name in exported.namelist())
-            self.assertEqual(content.count('[rotation.event]'),24)
-            self.assertEqual(content.count('[motor.detail]'),10)
-
-    def test_rotation_never_splits_an_oversized_event_or_reuses_existing_part(self):
+    def test_multiple_motors_modes_and_midnight_keep_one_run_file(self):
         target=self.logs.station
-        existing=target.path.with_name(target.path.stem+'-0007.log')
-        existing.write_text('older evidence',encoding='utf-8')
-        with patch('scripts.factory_test.diagnostics.STATION_LOG_BYTES',1024):
-            target.event('large.event',payload='x'*6000)
-            target.event('after.large')
-        self.assertEqual(existing.read_text(encoding='utf-8'),'older evidence')
-        events=[(e,d) for p in target.path.parent.glob('station-*.log') if p!=existing for e,d in self.records(p)]
-        large=[d for e,d in events if e=='large.event']
-        self.assertEqual(len(large),1)
-        self.assertEqual(large[0]['payload'],'x'*6000)
-        self.assertTrue(target.path.with_name(target.path.stem+'-0008.log').exists())
+        for i in range(24): target.event('run.event',index=i,payload='x'*300)
+        for i in range(3):
+            motor=self.logs.observe(True,identity=dict(node_id=1,sn=str(i)),config=self.config)
+            motor.event('motor.detail',index=i)
+            self.logs.finish_connection('replacement')
+            self.advance(86400)
+        self.logs.simulation=True
+        self.logs.station.event('preview.mode')
+        self.logs.close()
+        self.assertEqual(list(self.logs.root.rglob('*.log')),[target.path])
+        events=self.records()
+        self.assertEqual([d['index'] for e,d in events if e=='run.event'],list(range(24)))
+        self.assertEqual([d['connection_no'] for e,d in events if e=='connection.open'],[1,2,3])
+        self.assertEqual(events[-1][0],'application.stop')
+        self.assertEqual(events[-1][1]['connections'],3)
+        archive=self.root/'run.zip';self.logs.export_boot(archive)
+        with zipfile.ZipFile(archive) as exported:
+            self.assertEqual(set(exported.namelist()),{target.reference,'诊断摘要.txt'})
+            self.assertEqual(exported.read(target.reference).decode('utf-8').count('[motor.detail]'),3)
 
-    def test_export_cut_is_complete_while_new_writes_cross_rotation_threshold(self):
+    def test_large_critical_event_and_its_full_stack_are_not_split_or_truncated(self):
+        target=self.logs.station
+        try: raise RuntimeError('long failure '+('z'*6000))
+        except RuntimeError as exc:
+            target.event('large.failure',error=exc,level='ERROR',payload='x'*6000)
+        target.event('after.large')
+        self.assertEqual(list(target.path.parent.glob('*.log')),[target.path])
+        large=next(data for event,data in self.records() if event=='large.failure')
+        self.assertEqual(large['payload'],'x'*6000)
+        self.assertEqual(large['diagnostic']['message'],'long failure '+('z'*6000))
+        self.assertIn('Traceback (most recent call last)',target.path.read_text(encoding='utf-8'))
+
+    def test_export_cut_is_complete_while_the_same_log_keeps_growing(self):
         entered=threading.Event();release=threading.Event()
         original=self.logs._copy_boot_records
         def delayed(*args):
             entered.set();release.wait(3)
             return original(*args)
-        with patch('scripts.factory_test.diagnostics.STATION_LOG_BYTES',1024):
-            for i in range(8): self.logs.station.event('before.export',index=i,payload='x'*300)
-            with patch.object(self.logs,'_copy_boot_records',side_effect=delayed),ThreadPoolExecutor(max_workers=1) as pool:
-                out=self.root/'concurrent.zip';job=pool.submit(self.logs.export_boot,out)
-                try:
-                    self.assertTrue(entered.wait(2))
-                    self.logs.station.event('after.export',payload='x'*900)
-                finally:
-                    release.set()
-                job.result(timeout=4)
-            with zipfile.ZipFile(out) as archive:
-                text=''.join(archive.read(name).decode('utf-8-sig') for name in archive.namelist())
-            self.assertEqual(text.count('[before.export]'),8)
-            self.assertNotIn('[after.export]',text)
-            self.advance(6)
-            self.logs.station.event('after.release')
-            self.logs.export_boot(self.root/'second.zip')
-            with zipfile.ZipFile(self.root/'second.zip') as archive:
-                text=''.join(archive.read(name).decode('utf-8-sig') for name in archive.namelist())
-            self.assertEqual(text.count('[before.export]'),8)
-            self.assertEqual(text.count('[after.export]'),1)
+        for i in range(8): self.logs.station.event('before.export',index=i,payload='x'*300)
+        with patch.object(self.logs,'_copy_boot_records',side_effect=delayed),ThreadPoolExecutor(max_workers=1) as pool:
+            out=self.root/'concurrent.zip';job=pool.submit(self.logs.export_boot,out)
+            try:
+                self.assertTrue(entered.wait(2))
+                self.logs.station.event('after.export',payload='x'*900)
+            finally:
+                release.set()
+            job.result(timeout=4)
+        with zipfile.ZipFile(out) as archive:
+            text=archive.read(self.logs.station.reference).decode('utf-8-sig')
+        self.assertEqual(text.count('[before.export]'),8)
+        self.assertNotIn('[after.export]',text)
+        self.logs.export_boot(self.root/'second.zip')
+        with zipfile.ZipFile(self.root/'second.zip') as archive:
+            text=archive.read(self.logs.station.reference).decode('utf-8-sig')
+        self.assertEqual(text.count('[before.export]'),8)
+        self.assertEqual(text.count('[after.export]'),1)
 
     def test_retention_cleans_old_station_parts_and_preserves_other_files(self):
         folder=self.logs.station.path.parent
@@ -186,3 +181,76 @@ class LogVolumeTests(unittest.TestCase):
         self.logs.cleanup(force=True)
         self.assertFalse(expired.exists())
         self.assertTrue(unrelated.exists())
+
+    def test_same_second_restart_creates_separate_complete_run_logs(self):
+        first=self.logs.station.path
+        self.logs.close()
+        other=DiagnosticLogs(self.root,clock=lambda:self.clock,monotonic=lambda:self.tick)
+        self.addCleanup(other.close)
+        other.station.event('new.run.only');other.close()
+        self.assertNotEqual(first,other.station.path)
+        self.assertEqual(len(list(first.parent.glob('run-*.log'))),2)
+        for path in (first,other.station.path):
+            events=[e for e,_ in self.records(path)]
+            self.assertEqual(events[0],'application.start')
+            self.assertEqual(events[-1],'application.stop')
+            self.assertEqual(events.count('application.start'),1)
+        self.assertNotIn('new.run.only',first.read_text(encoding='utf-8'))
+
+    def test_connection_scope_keeps_first_snapshot_sample_and_probe_for_each_motor(self):
+        for _ in range(2):
+            target=self.logs.observe(True,identity=dict(node_id=1,sn='same'),config=self.config)
+            self.logs.snapshot('same.snapshot',dict(same=True))
+            target.sample('same.sample',interval=300)
+            self.logs.probe(target,'printer','READY','OK',elapsed=.01,evidence=dict(port='USB001'))
+            self.logs.finish_connection('replace')
+        events=self.records()
+        for name in ('same.snapshot','same.sample','devices.probe.changed'):
+            rows=[data for event,data in events if event==name]
+            self.assertEqual(len(rows),2)
+            self.assertEqual([row['connection_no'] for row in rows],[1,2])
+        self.assertEqual(self.logs.samples,{})
+        self.assertTrue(all(key[0]==self.logs.boot_id for key in self.logs.snapshots))
+
+    def test_report_from_an_old_run_is_logged_here_without_modifying_or_resurrecting_old_file(self):
+        target=self.logs.observe(True,identity=dict(node_id=1,sn='old'),config=self.config)
+        directory=self.root/'data/old-report';directory.mkdir(parents=True)
+        (directory/'station.json').write_text(json.dumps(dict(connection_log=target.reference,
+            log_boot_id=self.logs.boot_id,connection_id=target.scope,connection_no=1,
+            session='old-session',request_id='old-request',module_sn='old-sn')),encoding='utf-8')
+        self.logs.close();old_bytes=target.path.read_bytes()
+        fresh=DiagnosticLogs(self.root,clock=lambda:self.clock,monotonic=lambda:self.tick)
+        self.addCleanup(fresh.close)
+        fresh.record_target(directory).event('delivery.receipt',report_id=17)
+        self.assertEqual(target.path.read_bytes(),old_bytes)
+        row=next(data for event,data in self.records(fresh.station.path) if event=='delivery.receipt')
+        self.assertEqual(row['boot_id'],fresh.boot_id)
+        self.assertEqual(row['source_boot_id'],self.logs.boot_id)
+        self.assertEqual(row['connection_id'],target.scope)
+        self.assertEqual(row['session'],'old-session')
+        target.path.unlink()
+        fresh.record_target(directory).event('delivery.after.retention',report_id=17)
+        self.assertFalse(target.path.exists())
+        self.assertIn('delivery.after.retention',fresh.station.path.read_text(encoding='utf-8'))
+
+    def test_steady_checks_keep_counters_but_not_repeated_http_evidence(self):
+        for _ in range(1200):
+            self.advance(3)
+            self.logs.probe(self.logs.station,'printer','READY','OK',elapsed=.01,
+                evidence=dict(response=dict(online=True),exchange='raw-probe-'+('x'*10000)))
+        self.logs.close()
+        rows=self.records()
+        changed=[data for event,data in rows if event=='devices.probe.changed']
+        summaries=[data for event,data in rows if event=='devices.probe.summary']
+        self.assertEqual(len(changed),1)
+        self.assertEqual(summaries[-1]['counts'],dict(OK=1200))
+        self.assertTrue(all('evidence' not in row for row in summaries))
+        self.assertLess(self.logs.station.path.stat().st_size,25000)
+
+    def test_retention_protects_the_current_run_without_any_motor_and_accepts_new_names(self):
+        old=self.logs.station.path.with_name('run-20000101-000000-'+('a'*32)+'.log')
+        old.write_text('old',encoding='utf-8')
+        for path in (old,self.logs.station.path):os.utime(path,(self.clock-31*86400,)*2)
+        self.logs.cleanup(force=True)
+        self.assertFalse(old.exists())
+        self.assertTrue(self.logs.station.path.exists())

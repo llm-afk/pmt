@@ -233,6 +233,8 @@ class StationRunner:
                            production_date=production_date,
                            request_id=str(uuid.uuid4()), created_at=datetime.now().astimezone().isoformat())
         if self.log:
+            self.record.update(log_boot_id=self.log.owner.boot_id,
+                connection_id=self.log.context.get('connection_id'), connection_no=self.log.context.get('connection_no'))
             self.record['connection_log'] = self.log.reference
             self.record['connection_logs'] = [self.log.reference]
         self.save()
@@ -279,6 +281,8 @@ class StationRunner:
         if current != expected and not self.config.simulation:
             raise RecoveryRequired('当前电机与未完成工件 SN 不符')
         if self.log:
+            record.update(log_boot_id=self.log.owner.boot_id,
+                connection_id=self.log.context.get('connection_id'), connection_no=self.log.context.get('connection_no'))
             record['connection_log'] = self.log.reference
             references = record.setdefault('connection_logs', [])
             if self.log.reference not in references:

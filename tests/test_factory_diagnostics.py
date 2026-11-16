@@ -87,12 +87,14 @@ class DiagnosticTests(unittest.TestCase):
         for excluded in (self.logs.boot_id,'other.boot','foreign.interleaved','sensitive-example','raw configuration'):
             self.assertNotIn(excluded,content)
 
-    def test_each_connection_including_an_untested_motor_has_one_file(self):
+    def test_connections_share_one_run_file_with_distinct_ids_and_numbers(self):
         first = self.connect()
         self.disconnect()
         second = self.connect()  # Same ID/SN still creates a distinct physical cycle.
-        self.assertNotEqual(first.path,second.path)
-        self.assertEqual(len(list((self.folder/'logs/production').glob('motor-*.log'))),2)
+        self.assertEqual(first.path,second.path)
+        self.assertNotEqual(first.context['connection_id'],second.context['connection_id'])
+        self.assertEqual([first.context['connection_no'],second.context['connection_no']],[1,2])
+        self.assertEqual(list((self.folder/'logs/production').glob('*.log')),[first.path])
         text = first.path.read_text(encoding='utf-8')
         self.assertIn('connection.open',text)
         self.assertIn('disconnect_confirmed',text)
@@ -115,7 +117,7 @@ class DiagnosticTests(unittest.TestCase):
         self.tick += 86400
         self.assertEqual(self.connect().path,first.path)
         self.logs.station.event('after_midnight')
-        self.assertEqual(len(list((self.folder/'logs/production').glob('station-*.log'))),2)
+        self.assertEqual(list((self.folder/'logs/production').glob('*.log')),[first.path])
 
     def test_retention_only_removes_expired_owned_logs_and_keeps_active_logs(self):
         active = self.connect()
@@ -137,24 +139,24 @@ class DiagnosticTests(unittest.TestCase):
         self.assertFalse(expired.exists())
         self.assertTrue(all(path.exists() for path in (active.path,recent,unrelated,report,record)))
 
-    def test_late_background_result_goes_to_original_connection_not_next_motor(self):
+    def test_late_background_result_retains_original_workpiece_in_one_run_log(self):
         first = self.connect('first motor')
         directory = self.folder/'data/case'
         directory.mkdir(parents=True)
         (directory/'station.json').write_text(json.dumps(dict(connection_log=first.reference,
+            log_boot_id=self.logs.boot_id, connection_id=first.scope,connection_no=1,
             session='case-session',request_id='same-request')),encoding='utf-8')
         self.disconnect()
         second = self.connect('second motor')
         self.logs.record_target(directory).event('delivery.receipt',report_id=123)
-        self.assertIn('delivery.receipt',first.path.read_text(encoding='utf-8'))
-        self.assertNotIn('delivery.receipt',second.path.read_text(encoding='utf-8'))
-        old = self.now-31*86400
-        os.utime(first.path,(old,old))
-        self.logs.cleanup(force=True)
-        self.assertFalse(first.path.exists())
-        self.logs.record_target(directory).event('delivery.very_late_receipt',report_id=123)
-        self.assertFalse(first.path.exists())
-        self.assertIn('expired_connection_log',self.logs.station.path.read_text(encoding='utf-8'))
+        line=next(line for line in second.path.read_text(encoding='utf-8').splitlines() if '[delivery.receipt]' in line)
+        data=json.loads(line[line.index('{'):])
+        self.assertEqual(data['connection_id'],first.scope)
+        self.assertNotEqual(data['connection_id'],second.scope)
+        self.assertEqual(data['session'],'case-session')
+        self.assertEqual(data['boot_id'],self.logs.boot_id)
+        self.assertEqual(list(first.path.parent.glob('*.log')),[first.path])
+
 
     def test_traceback_context_and_credentials_are_preserved_or_redacted(self):
         target = self.connect()
@@ -259,10 +261,12 @@ class DiagnosticTests(unittest.TestCase):
         host.shutdown.is_set.return_value = False
         host.shutdown.wait.side_effect = wait
         host.controller()
-        logs = sorted((self.folder/'logs/preview').glob('motor-*.log'))
-        self.assertEqual(len(logs),2)
-        self.assertEqual(sum('disconnect_confirmed' in p.read_text(encoding='utf-8') for p in logs),1)
-        self.assertTrue(all('flow.start' not in p.read_text(encoding='utf-8') for p in logs))
+        logs = sorted((self.folder/'logs/production').glob('run-*.log'))
+        self.assertEqual(len(logs),1)
+        text=logs[0].read_text(encoding='utf-8')
+        self.assertEqual(text.count('[connection.open]'),2)
+        self.assertEqual(text.count('disconnect_confirmed'),1)
+        self.assertNotIn('flow.start',text)
         probes = [event for kind,event in host.events.queue if kind=='motor_probe']
         self.assertEqual([value['motor_probe'] for value in probes], ['present','absent','present'])
 
@@ -579,12 +583,29 @@ class DiagnosticTests(unittest.TestCase):
              patch('scripts.factory_test.gui.main',side_effect=RuntimeError('Tk startup unavailable')):
             with self.assertRaises(RuntimeError) as error:
                 desktop_entry.main()
-        files = list((self.folder/'early-startup/logs/production').glob('station-*.log'))
+        files = list((self.folder/'early-startup/logs/production').glob('run-*.log'))
         self.assertEqual(len(files),1)
         text = files[0].read_text(encoding='utf-8')
         self.assertIn('application.startup.failed',text)
         self.assertIn('Tk startup unavailable',text)
         self.assertIn(str(files[0]),error.exception.__notes__[0])
+
+
+    def test_entry_and_partially_initialized_window_use_the_same_log_on_failure(self):
+        from scripts.factory_test import desktop_entry
+        def failed_window(*, diagnostics):
+            diagnostics.station.event('window.partially_initialized')
+            raise RuntimeError('late initialization failure')
+        root=self.folder/'late-startup'
+        with patch('sys.argv',['factory-app']), \
+             patch('scripts.factory_test.station_config.state_root',return_value=root), \
+             patch('scripts.factory_test.gui.main',side_effect=failed_window):
+            with self.assertRaises(RuntimeError):desktop_entry.main()
+        files=list((root/'logs/production').glob('*.log'))
+        self.assertEqual(len(files),1)
+        text=files[0].read_text(encoding='utf-8')
+        for event in ('application.start','window.partially_initialized','application.startup.failed','application.stop'):
+            self.assertEqual(text.count('['+event+']'),1)
 
 
 if __name__ == '__main__':

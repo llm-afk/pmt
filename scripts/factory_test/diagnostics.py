@@ -1,5 +1,5 @@
-"""Connection-scoped diagnostics. Retention owns logs only, never production data."""
-from contextlib import contextmanager, ExitStack, nullcontext
+"""One durable log per application run, with connection/workpiece correlation."""
+from contextlib import contextmanager
 from contextvars import ContextVar
 from collections import Counter
 from dataclasses import asdict, is_dataclass
@@ -26,10 +26,10 @@ from .station_config import READINESS_LABELS
 
 
 RETENTION_DAYS = 30
-STATION_LOG_BYTES = 10*1024*1024
-POLL_SUMMARY_SECONDS = 30
+POLL_SUMMARY_SECONDS = 60
+HEALTH_SUMMARY_SECONDS = 300
 LOCAL_TIME = timezone(timedelta(hours=8))
-OWNED_LOG = re.compile(r'(?:motor-\d{8}-\d{6}-[0-9a-f]{32}|station-\d{8}(?:-\d{4,})?)\.log')
+OWNED_LOG = re.compile(r'(?:(?:run|motor)-\d{8}-\d{6}-[0-9a-f]{32}|station-\d{8}(?:-\d{4,})?)\.log')
 _target = ContextVar('factory_diagnostic_target', default=None)
 _idle = ContextVar('factory_idle_probe', default=None)
 _secret_key = re.compile(r'(?i)^(?:x[-_]?api[-_]?key|(?:(?:mes|sn|report)[-_])?api[-_]?key|(?:oss[-_]?)?access[-_]?key(?:[-_]?(?:id|secret))?|protected_credentials|secret|password|authorization|proxy[-_]authorization|cookie|set[-_]cookie|token|signature|security[-_]?token|x[-_]oss[-_]security[-_]token)$')
@@ -155,23 +155,27 @@ def idle_poll(device, route):
 
 
 class LogTarget:
-    def __init__(self, owner, path, context=None, *, create=True):
+    def __init__(self, owner, path, context=None):
         self.owner, self.path = owner, Path(path)
-        self.context, self.create = context or {}, create
+        self.context = context or {}
 
     @property
     def reference(self):
         return self.path.relative_to(self.owner.root).as_posix()
 
+    @property
+    def scope(self):
+        return self.context.get('connection_id') or self.owner.boot_id
+
     def bind(self, **context):
-        return LogTarget(self.owner, self.path, {**self.context, **context}, create=self.create)
+        return LogTarget(self.owner, self.path, {**self.context, **context})
 
     def event(self, event, message='', *, level='INFO', error=None, **details):
         self.owner.append(self, event, message, level=level, error=error,
                           details={**self.context, **details})
 
     def sample(self, event, message='', *, interval=1.0, **details):
-        key = (self.reference, event)
+        key = (self.scope, event)
         with self.owner.lock:
             now = self.owner.monotonic()
             if now-self.owner.samples.get(key, float('-inf')) < interval:
@@ -198,26 +202,28 @@ class DiagnosticLogs:
         self.samples, self.snapshots = {}, {}
         self.probes = {}
         self.idle_polls = {}
-        self.rotation_next = {}
-        self.rotation_retry = {}
         self.pending_probes = set()
-        self.station_probe_file = None
         self.secrets = set()
         self.sequence = 0
-        self.boot_files = {}
+        self.connection_count = 0
+        self.level_counts = Counter()
+        stamp = datetime.fromtimestamp(self.clock(), LOCAL_TIME).strftime('%Y%m%d-%H%M%S')
+        self.path = self.directory()/f'run-{stamp}-{self.boot_id}.log'
         self.closed = False
         self.station.event('application.start', '上位机启动', runtime=self.runtime_info(),
-                           retention_days=RETENTION_DAYS, log_directory=str(self.directory()))
+                           retention_days=RETENTION_DAYS, log_directory=str(self.path.parent),
+                           log_policy='one_file_per_run')
         self.cleanup(force=True)
 
     def directory(self, simulation=None):
+        if simulation is None and hasattr(self, 'path'):
+            return self.path.parent
         simulation = self.simulation if simulation is None else simulation
         return self.root/('preview' if simulation else 'production')
 
     @property
     def station(self):
-        date = datetime.fromtimestamp(self.clock(), LOCAL_TIME).strftime('%Y%m%d')
-        return LogTarget(self, self.directory()/f'station-{date}.log')
+        return LogTarget(self, self.path, dict(mode='preview' if self.simulation else 'production'))
 
     @property
     def current(self):
@@ -286,15 +292,14 @@ class DiagnosticLogs:
 
     def append(self, target, event, message, *, level, error, details):
         with self.lock:
+            if self.closed:
+                return
             try:
                 if not self._owned(target.path):
                     raise OSError('日志路径不属于工位日志目录，或路径包含链接')
-                if not target.create and not target.path.exists():
-                    # A delayed upload must not resurrect a log already expired by retention.
+                if target.path != self.path:
+                    details.setdefault('source_log', target.reference)
                     target = self.station
-                    details['expired_connection_log'] = details.get('connection_log', '')
-                    if not self._owned(target.path):
-                        raise OSError('当天工位日志路径包含链接')
                 target.path.parent.mkdir(parents=True, exist_ok=True)
                 stamp = datetime.fromtimestamp(self.clock(), LOCAL_TIME).isoformat(timespec='milliseconds')
                 self.sequence += 1
@@ -305,19 +310,17 @@ class DiagnosticLogs:
                     uptime_s=round(self.monotonic()-self.started, 3), **details))
                 display = self.redact(str(message)).replace('\r',r'\r').replace('\n',r'\n')
                 line = f'{stamp} {level:7} [{event}] {display}'
-                line += ' '+json.dumps(context, ensure_ascii=False, default=str, allow_nan=False)+'\n'
+                line += ' '+json.dumps(context, ensure_ascii=False, default=str, allow_nan=False, separators=(',', ':'))+'\n'
                 if error is not None:
                     line += self.redact(''.join(traceback.format_exception(type(error), error, error.__traceback__)))
                     if not line.endswith('\n'):
                         line += '\n'
-                self.rotate_station(target.path, len(line.encode('utf-8')))
                 with target.path.open('a', encoding='utf-8') as stream:
-                    if target.path not in self.boot_files:
-                        self.boot_files[target.path] = stream.tell()
                     stream.write(line)
-                    if error is not None or level == 'ERROR' or event in ('connection.open', 'connection.close', 'flow.step.done', 'flow.start'):
+                    if error is not None or level == 'ERROR' or event in ('connection.open', 'connection.close', 'flow.step.done', 'flow.start', 'application.stop'):
                         stream.flush()
                         os.fsync(stream.fileno())
+                self.level_counts[level] += 1
                 self.last_error = None
             except Exception as exc:
                 message = '诊断日志保存失败：'+str(exc)
@@ -327,39 +330,6 @@ class DiagnosticLogs:
                         self.failure(message)
                     except Exception:
                         pass  # Diagnostics must not prevent motor cleanup.
-
-    def rotate_station(self, path, incoming):
-        """Rotate daily station logs; motor connection files keep their stable path."""
-        if not re.fullmatch(r'station-\d{8}\.log', path.name) or not path.exists():
-            return
-        size = path.stat().st_size
-        if not size or size+incoming <= STATION_LOG_BYTES or self.monotonic()<self.rotation_retry.get(path,0):
-            return
-        if path not in self.rotation_next:
-            parts = [int(match[1]) for part in path.parent.glob(path.stem+'-*.log')
-                     if (match := re.fullmatch(re.escape(path.stem)+r'-(\d{4,})\.log',part.name))]
-            self.rotation_next[path] = max(parts,default=0)+1
-        while True:
-            number = self.rotation_next[path]
-            self.rotation_next[path] += 1
-            archive = path.with_name(f'{path.stem}-{number:04d}.log')
-            if archive.exists() or archive.is_symlink():
-                continue
-            if not self._owned(archive):
-                raise OSError('日志分卷路径不属于工位目录')
-            try:
-                path.rename(archive)
-            except FileExistsError:
-                continue
-            except OSError:
-                # An export/viewer can temporarily hold a Windows read handle.
-                # Keep writing evidence and retry rotation after the handle is released.
-                self.rotation_retry[path] = self.monotonic()+5
-                return
-            if path in self.boot_files:
-                self.boot_files[archive] = self.boot_files.pop(path)
-            self.rotation_retry.pop(path,None)
-            return
 
     def poll_result(self, target, device, route, evidence, *, error=None, elapsed=0):
         diagnostic = self.redact(error_details(error)) if error is not None else None
@@ -373,7 +343,7 @@ class DiagnosticLogs:
         signature = json.dumps(self.redact(dict(state=state,diagnostic=diagnostic,
             request=stable_request,identity=identity)),sort_keys=True,default=str)
         route = self.redact(route)
-        key = (target.reference,device,json.dumps(route,sort_keys=True,default=str))
+        key = (target.scope,device,json.dumps(route,sort_keys=True,default=str))
         now = self.monotonic()
         stamp = datetime.fromtimestamp(self.clock(),LOCAL_TIME).isoformat(timespec='milliseconds')
         with self.lock:
@@ -382,7 +352,7 @@ class DiagnosticLogs:
             if changed:
                 if previous is not None:
                     self.poll_summary(key,previous,final=True)
-                stats = dict(signature=signature,route=route,context=target.context,state=state,code=code,count=0,
+                stats = dict(signature=signature,route=route,target=target,state=state,code=code,count=0,
                     reported_count=0,started=now,reported_at=now,first_at=stamp,last_at=stamp,max_elapsed_ms=0)
                 self.idle_polls[key] = stats
             else:
@@ -401,13 +371,13 @@ class DiagnosticLogs:
                     evidence=evidence,elapsed_ms=round(elapsed*1000,1),count=1)
                 stats['first_sequence'] = self.sequence
                 stats['reported_count'] = 1
-            elif now-stats['reported_at'] >= POLL_SUMMARY_SECONDS:
+            elif now-stats['reported_at'] >= (HEALTH_SUMMARY_SECONDS if state in ('READY','ABSENT') else POLL_SUMMARY_SECONDS):
                 self.poll_summary(key,stats)
 
     def poll_summary(self, key, stats, *, final=False, export_snapshot=False):
         if stats['count']<=stats['reported_count'] and not export_snapshot:
             return
-        target = LogTarget(self,self.root/key[0],context=stats['context'],create=False)
+        target = stats['target']
         target.event('devices.poll.summary','空闲探测累计',
             level='WARNING' if stats['state']=='ERROR' else 'INFO',device=key[1],route=stats['route'],
             state=stats['state'],code=stats['code'],count=stats['count'],
@@ -421,7 +391,7 @@ class DiagnosticLogs:
     def flush_idle(self, target=None, *, final=False, export_snapshot=False):
         with self.lock:
             for key,stats in tuple(self.idle_polls.items()):
-                if target is None or key[0]==target.reference:
+                if target is None or key[0]==target.scope:
                     self.poll_summary(key,stats,final=final,export_snapshot=export_snapshot)
                     if final:
                         self.idle_polls.pop(key,None)
@@ -440,16 +410,14 @@ class DiagnosticLogs:
             if present:
                 if self.active is None:
                     self.flush_probes(self.station)
-                    stamp = datetime.fromtimestamp(self.clock(), LOCAL_TIME).strftime('%Y%m%d-%H%M%S')
                     connection_id = uuid.uuid4().hex
-                    self.active = LogTarget(self, self.directory()/f'motor-{stamp}-{connection_id}.log',
-                                            dict(connection_id=connection_id, mode='preview' if self.simulation else 'production'))
+                    self.connection_count += 1
+                    self.snapshot('connection.configuration', config, target=self.station)
+                    self.active = self.station.bind(connection_id=connection_id, connection_no=self.connection_count)
                     self.latest = self.active
                     self.connected_at = now
                     self.identity = identity
-                    self.active.event('connection.open', '识别到电机，开始记录连接周期', identity=identity,
-                                      config=config, runtime=self.runtime_info())
-                    self.station.event('connection.index', '电机连接日志', connection_log=self.active.reference, identity=identity)
+                    self.active.event('connection.open', f'电机连接 #{self.connection_count}，开始记录', identity=identity)
                 elif self.absent_since is not None:
                     self.active.event('connection.restored', '短暂通信中断后恢复', gap_s=round(now-self.absent_since, 3), identity=identity)
                 if self.identity != identity:
@@ -472,17 +440,16 @@ class DiagnosticLogs:
                 self.flush_idle(target,final=True)
                 target.event('connection.close', '结束连接周期记录', reason=reason,
                              duration_s=round(self.monotonic()-self.connected_at, 3), identity=self.identity)
-                self.station.event('connection.closed', '电机连接周期结束', connection_log=target.reference, reason=reason)
                 self.latest = target
-                self.samples = {key:value for key,value in self.samples.items() if key[0] != target.reference}
-                self.snapshots = {key:value for key,value in self.snapshots.items() if key[0] != target.reference}
+                self.samples = {key:value for key,value in self.samples.items() if key[0] != target.scope}
+                self.snapshots = {key:value for key,value in self.snapshots.items() if key[0] != target.scope}
             self.active = None
             self.identity = None
             self.absent_since = self.connected_at = None
 
     def snapshot(self, event, value, *, target=None):
         target = target or self.current
-        key = (target.reference, event)
+        key = (target.scope, event)
         clean = self.redact(value)
         with self.lock:
             if self.snapshots.get(key) == clean:
@@ -491,15 +458,11 @@ class DiagnosticLogs:
         target.event(event, details=clean)
 
     def probe(self, target, device, state, code, *, elapsed, evidence, route=(), error=None):
-        """Count every completed idle check. Keep full evidence at transitions and heartbeats."""
+        """Full evidence at transitions; unchanged checks retain compact totals only."""
         with self.lock:
-            key = (target.reference, device)
-            if target.path.name.startswith('station-') and target.reference == self.station.reference:
-                if self.station_probe_file and self.station_probe_file != target.path:
-                    self.flush_probes(LogTarget(self,self.station_probe_file,create=False))
-                self.station_probe_file = target.path
+            key = (target.scope, device)
             now = self.monotonic()
-            stats = self.probes.setdefault(key, dict(counts=Counter(), consecutive_unready=0,
+            stats = self.probes.setdefault(key, dict(target=target, counts=Counter(), consecutive_unready=0,
                 max_consecutive_unready=0, max_elapsed_ms=0, last_ready_at=None))
             previous = stats.get('code')
             changed = (state, code, route) != stats.get('signature')
@@ -511,76 +474,68 @@ class DiagnosticLogs:
             if state == 'READY':
                 stats['last_ready_at'] = datetime.fromtimestamp(self.clock(), LOCAL_TIME).isoformat(timespec='milliseconds')
             stats.update(signature=(state,code,route), code=code, state=state)
-            late = target.reference != self.current.reference
-            if changed or late or now-stats.get('reported_at', now) >= 30:
-                stats['reported_at'] = now
-                target.event('devices.probe.changed' if changed else 'devices.probe.summary',
-                    level='WARNING' if changed and state in ('OFFLINE','ERROR','UNKNOWN') else 'INFO',
-                    error=error if changed else None, device=device, previous_code=previous, elapsed_ms=ms,
+            late = target.scope != self.current.scope
+            interval = HEALTH_SUMMARY_SECONDS if state == 'READY' else POLL_SUMMARY_SECONDS
+            if changed:
+                target.event('devices.probe.changed',
+                    level='WARNING' if state in ('OFFLINE','ERROR','UNKNOWN') else 'INFO',
+                    error=error, device=device, previous_code=previous, elapsed_ms=ms,
                     evidence=evidence, **self.probe_totals(stats))
+                stats['reported_at'] = now
+            elif late or now-stats.get('reported_at',now) >= interval:
+                self.probe_summary(key, stats)
             if late and key not in self.pending_probes:
                 self.probes.pop(key, None)
 
     @staticmethod
     def probe_totals(stats):
-        return {key:value for key,value in stats.items() if key not in ('signature','reported_at')}
+        return {key:value for key,value in stats.items() if key not in ('signature','reported_at','target')}
+
+    def probe_summary(self, key, stats, **flags):
+        stats['target'].event('devices.probe.summary', device=key[1], **flags, **self.probe_totals(stats))
+        stats['reported_at'] = self.monotonic()
 
     def flush_probes(self, target):
         with self.lock:
             for key in tuple(self.probes):
-                if key[0] == target.reference:
-                    target.event('devices.probe.summary', device=key[1], final=True,
-                                 check_in_flight=key in self.pending_probes, **self.probe_totals(self.probes[key]))
+                if key[0] == target.scope:
+                    self.probe_summary(key, self.probes[key], final=True, check_in_flight=key in self.pending_probes)
                     if key not in self.pending_probes:
                         del self.probes[key]
 
     def track_probe(self, target, device, *, finished=False):
-        key = (target.reference,device)
+        key = (target.scope, device)
         with self.lock:
             if finished:
                 self.pending_probes.discard(key)
-                if target.reference != self.current.reference and key in self.probes:
-                    target.event('devices.probe.summary',device=device,final=True,
-                                 **self.probe_totals(self.probes.pop(key)))
+                if target.scope != self.current.scope and key in self.probes:
+                    self.probe_summary(key, self.probes.pop(key), final=True)
             else:
                 self.pending_probes.add(key)
 
     def export_boot(self, destination):
-        """Export this boot and all its parts; pin mutable station files during compression."""
+        """Export one run log at a stable byte cutoff while writers continue appending."""
         destination = Path(destination)
         if destination.suffix.lower() != '.zip':
             raise ValueError('请选择 ZIP 文件名')
-        with ExitStack() as readers:
-            with self.lock:
-                for (ref,device),stats in self.probes.items():
-                    LogTarget(self,self.root/ref,create=False).event('devices.probe.summary', device=device,
-                        export_snapshot=True, **self.probe_totals(stats))
-                self.flush_idle(export_snapshot=True)
-                files = []
-                for path,offset in self.boot_files.items():
-                    end = path.stat().st_size if self._owned(path) and path.is_file() else None
-                    pinned = None
-                    if end is not None and re.fullmatch(r'station-\d{8}\.log',path.name):
-                        pinned = readers.enter_context(path.open('rb'))
-                    files.append((path,offset,end,pinned))
-                cutoff = datetime.fromtimestamp(self.clock(),LOCAL_TIME).isoformat(timespec='seconds')
-            summary = [f'上位机 v{VERSION}',f'启动编号 {self.boot_id}',f'导出截止 {cutoff}']
+        with self.lock:
+            for key,stats in self.probes.items():
+                self.probe_summary(key,stats,export_snapshot=True)
+            self.flush_idle(export_snapshot=True)
+            if not self._owned(self.path):
+                raise OSError('本次启动日志路径不属于工位目录')
+            source = self.path.open('rb')
+            end = os.fstat(source.fileno()).st_size
+            cutoff = datetime.fromtimestamp(self.clock(),LOCAL_TIME).isoformat(timespec='seconds')
+        with source:
+            reference = self.path.relative_to(self.root).as_posix()
+            summary = [f'上位机 v{VERSION}',f'启动编号 {self.boot_id}',f'导出截止 {cutoff}',reference]
             fd, name = tempfile.mkstemp(prefix='.station-logs-',suffix='.tmp',dir=destination.parent)
             os.close(fd)
             try:
                 with zipfile.ZipFile(name,'w',zipfile.ZIP_DEFLATED,compresslevel=1) as archive:
-                    for path,offset,end,pinned in files:
-                        reference = path.relative_to(self.root).as_posix()
-                        summary.extend(('',reference))
-                        if end is None or end <= offset:
-                            summary.append('原日志已清理或截断')
-                            continue
-                        try:
-                            with (nullcontext(pinned) if pinned else path.open('rb')) as source, archive.open(reference,'w') as out:
-                                source.seek(offset)
-                                self._copy_boot_records(source,out,end-offset,summary)
-                        except FileNotFoundError:
-                            summary.append('原日志已清理')
+                    with archive.open(reference,'w') as out:
+                        self._copy_boot_records(source,out,end,summary)
                     archive.writestr('诊断摘要.txt', ('\n'.join(summary)+'\n').encode('utf-8-sig'))
                 os.replace(name,destination)
             finally:
@@ -588,7 +543,7 @@ class DiagnosticLogs:
 
     def _copy_boot_records(self, source, out, remaining, summary):
         header = re.compile(rb'^\d{4}-\d\d-\d\dT\S+\s+(\w+)\s+\[([^\]]+)\]')
-        marker = re.compile(rb' \{"schema_version": \d+, "sequence": \d+, "boot_id": "([0-9a-f]{32})", "log_file":')
+        marker = re.compile(rb' \{"schema_version":\s*\d+,\s*"sequence":\s*\d+,\s*"boot_id":\s*"([0-9a-f]{32})",\s*"log_file":')
         selected = False
         errors = Counter()
         malformed = 0
@@ -666,15 +621,11 @@ class DiagnosticLogs:
         reference = record.get('connection_log', '')
         if not isinstance(reference, str):
             reference = ''
-        path = self.root/reference
-        try:
-            owned = bool(reference) and self._owned(path)
-        except OSError:
-            owned = False
-        target = LogTarget(self, path, create=False) if owned else self.station
-        return target.bind(connection_log=reference, session=record.get('session'),
-                           request_id=record.get('request_id'), module_sn=record.get('module_sn'),
-                           report_directory=str(directory))
+        return self.station.bind(connection_log=reference, source_log=reference,
+            source_boot_id=record.get('log_boot_id'), connection_id=record.get('connection_id'),
+            connection_no=record.get('connection_no'), session=record.get('session'),
+            request_id=record.get('request_id'), module_sn=record.get('module_sn'),
+            report_directory=str(directory))
 
     def cleanup(self, *, force=False):
         with self.lock:
@@ -702,7 +653,7 @@ class DiagnosticLogs:
                             continue
                         path = directory/entry.name
                         with self.lock:
-                            if self.active and path == self.active.path:
+                            if path == self.path:
                                 continue
                             if self._owned(path) and path.stat().st_mtime < cutoff:
                                 path.unlink()
@@ -722,5 +673,8 @@ class DiagnosticLogs:
             self.finish_connection('application_closed_before_disconnect')
             self.flush_probes(self.station)
             self.flush_idle(final=True)
-            self.station.event('application.stop', '上位机退出')
+            self.station.event('application.stop', '本次运行结束',
+                connections=self.connection_count, elapsed_s=round(self.monotonic()-self.started,3),
+                records=self.sequence+1, error_records=self.level_counts['ERROR'],
+                warning_records=self.level_counts['WARNING'])
             self.closed = True

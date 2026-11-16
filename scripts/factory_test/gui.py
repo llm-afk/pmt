@@ -84,7 +84,7 @@ class EventWriter:
 
 
 class FactoryWindow:
-    def __init__(self, root, *, config_path=None, storage_root=None, preview_only=False):
+    def __init__(self, root, *, config_path=None, storage_root=None, preview_only=False, diagnostics=None):
         self.root = root
         self.config_path = Path(config_path).resolve() if config_path else Path(storage_root or state_root())/'station.json'
         self.storage_root = storage_root
@@ -151,8 +151,10 @@ class FactoryWindow:
             self.saved_credentials = dict.fromkeys(SECRET_FIELDS,'')
             self.credential_error = str(exc)
             credential_exception = exc
-        self.diagnostics = DiagnosticLogs(storage_root or state_root(), simulation=self.config.simulation,
-            failure=lambda message:self.events.put(('log_failure',message)))
+        self.diagnostics = diagnostics or DiagnosticLogs(storage_root or state_root(), simulation=self.config.simulation)
+        self.diagnostics.failure = lambda message:self.events.put(('log_failure',message))
+        if self.diagnostics.last_error:
+            self.diagnostics.failure(self.diagnostics.last_error)
         self.diagnostics.register_secret(os.environ.get(self.config.api_key_env, ''))
         for value in self.saved_credentials.values():
             self.diagnostics.register_secret(value)
@@ -875,7 +877,7 @@ class FactoryWindow:
         if not filename:
             return
         self.export_button.config(state='disabled')
-        self.settings_notice.set('正在整理本次启动与电机连接日志…')
+        self.settings_notice.set('正在导出本次运行日志…')
         def save():
             try:
                 self.diagnostics.export_boot(filename)
@@ -1278,7 +1280,7 @@ class FactoryWindow:
             timing['max_work_ms'] = max(timing['max_work_ms'],round(elapsed*1000,1))
             if max(lag,elapsed)>=.25:
                 timing['stalls'] += 1
-            if start-self.ui_interval_started>=30 or timing['stalls'] and start-self.ui_interval_started>=5:
+            if start-self.ui_interval_started>=300 or timing['stalls'] and start-self.ui_interval_started>=5:
                 self.diagnostics.current.event('ui.performance',page=self.page,busy=self.busy,
                     interval_s=round(start-self.ui_interval_started,2),**timing)
                 self.ui_interval_started=start
@@ -1692,9 +1694,9 @@ class FactoryWindow:
         self.root.destroy()
 
 
-def main():
+def main(*, diagnostics=None):
     root = tk.Tk()
-    window = FactoryWindow(root)
+    window = FactoryWindow(root, diagnostics=diagnostics)
     previous_hook = threading.excepthook
     previous_unraisable = sys.unraisablehook
     def thread_exception(args):
