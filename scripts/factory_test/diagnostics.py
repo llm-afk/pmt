@@ -69,8 +69,9 @@ def error_details(error):
         current = current.__cause__ or (None if current.__suppress_context__ else current.__context__)
         if current is None and isinstance(reason, BaseException) and id(reason) not in seen:
             current = reason
-    code = getattr(error, 'diagnostic_code', None)
-    hint = getattr(error, 'diagnostic_hint', None)
+    specific = next((item for item in chain if item.get('diagnostic_code')), {})
+    code = getattr(error, 'diagnostic_code', None) or specific.get('diagnostic_code')
+    hint = getattr(error, 'diagnostic_hint', None) or specific.get('diagnostic_hint')
     windows_codes = [item.get('winerror') for item in chain]
     errnos = [item.get('errno') for item in chain]
     types = {item['type'] for item in chain}

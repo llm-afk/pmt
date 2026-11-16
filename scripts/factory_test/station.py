@@ -24,16 +24,26 @@ STEPS = (
 )
 
 
+class MeasurementFailed(RuntimeError):
+    def __init__(self, summary):
+        super().__init__(summary.get('error') or '测试未通过或未完成；不会申请正式 SN')
+        diagnostic = summary.get('diagnostic') or {}
+        self.diagnostic_code = diagnostic.get('code', 'TEST_NOT_PASSED')
+        self.diagnostic_hint = diagnostic.get('hint', '查看测试数据、原始故障快照和停机确认记录。')
+        self.diagnostic_context = dict(original=diagnostic, stages=summary.get('stages', {}))
+
+
 class RecoveryRequired(RuntimeError):
     pass
 
 
 class Services:
-    def __init__(self, config, cancelled, emit, delivery=None, *, firmware_sha256=None):
+    def __init__(self, config, cancelled, emit, delivery=None, *, firmware_sha256=None, hardware_ports=None):
         self.config, self.cancelled, self.emit = config, cancelled, emit
         self.motor = Maintenance(config,cancelled,progress=lambda message:self.emit('maintenance_progress',message))
         self.delivery = delivery
         self.firmware_sha256 = firmware_sha256
+        self.hardware_ports = dict(hardware_ports or {})
 
     def firmware(self, node, expected_sn):
         from .firmware import check_firmware
@@ -58,19 +68,21 @@ class Services:
     def measure(self, directory, base_sn):
         args = SimpleNamespace(id=self.config.target_id, serial=self.config.adapter_sn, torque=self.config.torque)
         stages = []
+        power_port = self.hardware_ports.get('power') or self.config.power_port
+        dyno_port = self.hardware_ports.get('dyno') or self.config.dyno_port
         for name, module, csv in app.STAGES:
             def run(*argv, _name=name, _module=module, **kwargs):
                 self.check_stop()
                 started = time.perf_counter()
                 log_event('test.stage.start', stage=_name, output_directory=str(directory/_name),
                           motor_id=self.config.target_id, target_torque=self.config.torque,
-                          power_port=self.config.power_port, dyno_port=self.config.dyno_port,
+                          power_port=power_port, dyno_port=dyno_port,
                           parameters={key:value for key,value in vars(_module).items() if key.isupper() and
                                       key not in ('COLUMNS','OUTPUT_COLUMNS')})
                 self.emit('step', dict(name=_name, status='RUNNING'))
                 previous_ports = (_module.POWER_PORT, _module.DYNO_PORT)
                 try:
-                    _module.POWER_PORT, _module.DYNO_PORT = self.config.power_port, self.config.dyno_port
+                    _module.POWER_PORT, _module.DYNO_PORT = power_port, dyno_port
                     result = _module.main(*argv, **kwargs)
                 except BaseException as exc:
                     log_event('test.stage.failed', level='ERROR', error=exc, stage=_name,
@@ -168,12 +180,12 @@ class DemoServices(Services):
 
 class StationRunner:
     def __init__(self, config, *, root=None, emit=lambda *_: None, cancelled=lambda: False, services=None, delivery=None,
-                 log_target=None, firmware_sha256=None):
+                 log_target=None, firmware_sha256=None, hardware_ports=None):
         self.config, self.emit, self.cancelled = config, emit, cancelled
         self.root = Path(root) if root else state_root()
         self.pointer = self.root / ('demo-active.json' if config.simulation else 'active.json')
         self.services = services or (DemoServices if config.simulation else Services)(
-            config, cancelled, emit, delivery=delivery, firmware_sha256=firmware_sha256)
+            config, cancelled, emit, delivery=delivery, firmware_sha256=firmware_sha256, hardware_ports=hardware_ports)
         self.record = None
         self.log = log_target or current_log()
 
@@ -386,7 +398,7 @@ class StationRunner:
                 if summary['status'] == 'PASS':
                     atomic_json(directory/'summary.json', summary)
                     return
-                failure = RuntimeError(summary.get('error') or '测试未通过或未完成；不会申请正式 SN')
+                failure = MeasurementFailed(summary)
                 for note in summary.get('error_notes', []):
                     failure.add_note(note)
                 try:

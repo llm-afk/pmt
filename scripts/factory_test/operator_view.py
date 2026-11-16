@@ -176,7 +176,7 @@ def build_settings(self):
     self.credential_notice=tk.StringVar()
     ttk.Label(printer,textvariable=self.credential_notice,foreground='#64748B',wraplength=650).pack(anchor='w',pady=3)
     tools=ttk.Frame(tabs,padding=16)
-    tabs.add(tools,text='管理')
+    tabs.add(tools,text='维护与诊断')
     self.auto_control=ttk.Checkbutton(tools,text='启用设备监视',variable=self.auto,command=self.apply_config)
     self.auto_control.pack(anchor='w',pady=7)
     ttk.Label(tools,text='异常工件会自动收尾、保存记录并隔离本次流程。\n以下入口仅供工程人员查阅和补处理。',foreground='#64748B').pack(anchor='w',pady=12)

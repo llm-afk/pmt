@@ -309,8 +309,11 @@ class ManualSession:
                 self.emit('control_sample', sample)
         except BaseException as exc:
             target = current_log() or (self.diagnostics.current if self.diagnostics else None)
+            cancelled = (isinstance(exc,InterruptedError) and self.stop.is_set()
+                         and not self.state_change_started and not getattr(exc,'__notes__',[]))
             if target:
-                target.event('debug.exception',level='ERROR',error=exc,node_id=self.node,enabled=self.enabled,
+                target.event('debug.cancelled' if cancelled else 'debug.exception',
+                    level='INFO' if cancelled else 'ERROR',error=None if cancelled else exc,node_id=self.node,enabled=self.enabled,
                     adapter_sn=self.config.adapter_sn,firmware=self.firmware,last_command=command,
                     command_age_ms=round((time.perf_counter()-command_at)*1000,1) if command_at is not None else None,
                     feedback_age_ms=round((time.perf_counter()-state.received_at)*1000,1) if state is not None else None,
@@ -320,7 +323,7 @@ class ManualSession:
             notes=list(getattr(exc,'__notes__',[]))
             if notes:
                 self.cleanup_confirmed=False
-            failed = '；'.join([str(exc),*notes])
+            failed = '' if cancelled else '；'.join([str(exc),*notes])
         finally:
             if channel is not None and self.enabled:
                 try:

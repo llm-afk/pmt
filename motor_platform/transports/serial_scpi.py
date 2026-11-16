@@ -1,5 +1,7 @@
 """Bounded, serialized ASCII line transactions over RS-232 (pyserial optional)."""
+from collections import deque
 import math
+import uuid
 import threading
 import time
 
@@ -17,6 +19,8 @@ class SerialScpi:
         self._serial = None
         self._uncertain = False
         self._lock = threading.RLock()
+        self._history = deque(maxlen=24)
+        self._session_id = None
 
     def open(self):
         with self._lock:
@@ -38,6 +42,8 @@ class SerialScpi:
                 raise
             self._serial = stream
             self._uncertain = False
+            self._history.clear()
+            self._session_id = uuid.uuid4().hex
         return self
 
     @staticmethod
@@ -52,20 +58,40 @@ class SerialScpi:
         if self._uncertain and not allow_uncertain:
             raise RuntimeError('SCPI response alignment uncertain; close and reopen the session')
 
+    def _remember(self, kind, command, started, *, reply=None, error=None):
+        item = dict(kind=kind, command=command, elapsed_ms=round((time.perf_counter()-started)*1000, 3),
+                    thread=threading.current_thread().name)
+        if reply is not None:
+            item.update(reply=reply[:256].decode('ascii', errors='replace'), reply_hex=reply[:256].hex(),
+                        reply_bytes=len(reply))
+        if error is not None:
+            item.update(error_type=type(error).__name__, error=str(error))
+        self._history.append(item)
+
+    def diagnostic_snapshot(self):
+        with self._lock:
+            return dict(port=self.port, baudrate=self.baudrate, session_id=self._session_id,
+                        opened=self._serial is not None, alignment_uncertain=self._uncertain,
+                        exchanges=[dict(item) for item in self._history])
+
     def write(self, command, *, allow_uncertain=False):
         data = self._encode(command)
         with self._lock:
             self._check(allow_uncertain)
+            started = time.perf_counter()
             try:
                 if self._serial.write(data) != len(data):
                     raise OSError('incomplete serial write')
-            except BaseException:
+            except BaseException as exc:
                 self._uncertain = True
+                self._remember('write', command, started, error=exc)
                 raise
+            self._remember('write', command, started)
 
     def query(self, command):
         with self._lock:
             self._check()
+            started, raw = time.perf_counter(), None
             self.write(command)
             try:
                 raw = self._serial.read_until(b'\n', 1025)
@@ -76,14 +102,17 @@ class SerialScpi:
                 reply = raw.decode('ascii').strip()
                 if not reply:
                     raise ValueError(f'empty SCPI reply to {command}')
+                self._remember('query', command, started, reply=raw)
                 return reply
-            except BaseException:
+            except BaseException as exc:
                 # Never assign a late, untagged reply to the next query.
                 self._uncertain = True
+                self._remember('query', command, started, reply=raw, error=exc)
                 raise
 
     def close(self):
         with self._lock:
-            stream, self._serial = self._serial, None
-            if stream is not None:
-                stream.close()
+            if self._serial is not None:
+                # Keep ownership on a failed close, so callers cannot silently open a second session.
+                self._serial.close()
+                self._serial = None

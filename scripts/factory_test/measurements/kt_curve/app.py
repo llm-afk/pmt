@@ -9,7 +9,8 @@ import time
 from motor_platform import Bench, Canable, Dynamometer, MitCommand, PowerSupply
 from motor_platform.components.dynamometer import detect_dynamometers
 from motor_platform.components.power_supply.discovery import resolve_power_port
-from .. import power_off, record_shutdown_failure
+from .. import (power_off, record_shutdown_failure, power_observer,
+                device_snapshot, log_measurement_snapshot)
 from ..console import WindowConsole as TerminalConsole
 from scripts.factory_test.measurements.smoothing import append_smoothed_columns
 from scripts.factory_test.measurements.csv_streams import pack_streams
@@ -151,12 +152,15 @@ def run(motor, dyno, ui, args, result):
                 next_display = now+.1
             time.sleep(TARGET_UPDATE_S)
     except BaseException as exc:
+        result['runtime_snapshot'] = device_snapshot(motor,dyno,target=applied,loop_at=locals().get('now',time.perf_counter()))
         result['reason'] = 'operator_stop' if isinstance(exc, KeyboardInterrupt) else 'error'
         if recorder is not None:
             recorder.cutoff = min(recorder.cutoff, time.perf_counter())
         raise
     finally:
         original = sys.exception()
+        if 'runtime_snapshot' not in result:
+            result['runtime_snapshot'] = device_snapshot(motor,dyno,target=applied,loop_at=locals().get('now',time.perf_counter()))
         try:
             ui._notice = '正在降扭矩、失能；随后关闭阻尼器电源'
             ui.app.invalidate()
@@ -188,7 +192,7 @@ def main(argv=None, *, output_dir, quiet=False):
                                  speed_scale=DYNO_SPEED_SCALE) as dyno:
                     dyno.receive_state(timeout=1)
                     # 先占用被动测功机串口，再探测 SCPI 电源。
-                    with PowerSupply(port=resolve_power_port(POWER_PORT)) as power:
+                    with PowerSupply(port=resolve_power_port(POWER_PORT), observer=power_observer()) as power:
                         try:
                             power.disable()
                             power.set_current(0)
@@ -213,6 +217,7 @@ def main(argv=None, *, output_dir, quiet=False):
                 recorder = result.get('recorder', Recorder(0, RAMP_DURATION_S))
                 recorder.write(csv.writer(target), args, result['reason'])
     finally:
+        log_measurement_snapshot('kt',result)
         # 所有设备已经停止；平滑和磁盘输出不占用控制循环。
         original = sys.exception()
         try:

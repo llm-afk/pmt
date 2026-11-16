@@ -3,7 +3,7 @@
 Python/Windows scheduling is best effort. No catch-up bursts or hard real-time guarantee.
 """
 from concurrent.futures import Future
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import math
 import queue
 import threading
@@ -26,6 +26,7 @@ class Stats:
     feedback_limited_periods: int = 0
     max_lateness_s: float = 0.0
     max_tx_gap_s: float = 0.0
+    max_rx_gap_s: float = 0.0
     tx_gaps_over_5ms: int = 0
     max_source_s: float = 0.0
     max_usb_write_s: float = 0.0
@@ -41,6 +42,15 @@ class RuntimeShutdownError(RuntimeError):
         self.cleanup_confirmed = cleanup_confirmed
         if not cleanup_confirmed:
             self.add_note('工装停机未确认：CAN 工作线程退出时电机失能未获确认，请切断工装电源。')
+
+
+class MotorFeedbackTimeout(TimeoutError):
+    diagnostic_code = 'MOTOR_FEEDBACK_STALE'
+    diagnostic_hint = '电机反馈超过允许间隔；核对故障快照的反馈年龄、收发数量、USB耗时、工作线程及指令租约。已停止本次测试。'
+
+    def __init__(self, message, snapshot, limit):
+        super().__init__(message)
+        self.diagnostic_context = dict(snapshot, feedback_limit_ms=limit*1000)
 
 
 class MotorChannel:
@@ -123,7 +133,8 @@ class MotorChannel:
             self._runtime._check()
             state = self._motor.last_state
             if state is None or time.perf_counter() - state.received_at > max_age:
-                raise TimeoutError(f"{self.name}: motor feedback absent or stale")
+                raise MotorFeedbackTimeout(f"{self.name}: motor feedback absent or stale",
+                                           self.diagnostic_snapshot(), max_age)
             return state
 
     def start_recording(self, capacity=8192):
@@ -144,6 +155,11 @@ class MotorChannel:
             data['can_protocol_reports'] = getattr(self._runtime._bus.transport, 'protocol_reports', 0)
             data['can_last_protocol_report'] = getattr(self._runtime._bus.transport, 'last_protocol_report', None)
             data['can_last_counter_report'] = getattr(self._runtime._bus.transport, 'last_counter_report', None)
+            now = time.perf_counter()
+            feedback = self._motor.last_state
+            data.update(feedback_age_ms=(now-feedback.received_at)*1000 if feedback else None,
+                        last_tx_age_ms=(now-data['last_tx_at'])*1000 if data['tx_count'] else None,
+                        inflight=self._inflight, lease_remaining_ms=(self._expires-now)*1000 if self._active else None)
             span = data["last_tx_at"] - data["first_tx_at"]
             data.update(node_id=self.node_id, name=self.name, target_hz=self._rate_hz,
                         periodic_active=self._active or self._monitoring,
@@ -151,6 +167,18 @@ class MotorChannel:
                         enabled=self._motor.enabled,
                         actual_tx_hz=(data["tx_count"]-1)/span if span > 0 else 0.0)
             return data
+
+    def diagnostic_snapshot(self):
+        """Memory only: retain the fault instant before cleanup changes the state."""
+        with self._runtime._lock:
+            now = time.perf_counter()
+            state = self._motor.last_state
+            started = getattr(self._runtime, '_poll_started', 0)
+            return dict(statistics=self.stats(), last_feedback=asdict(state) if state else None,
+                        target=asdict(self._target), captured_at=now,
+                        worker_alive=self._runtime._thread.is_alive(),
+                        worker_error=repr(self._runtime._error) if self._runtime._error else None,
+                        poll_inflight_ms=(now-started)*1000 if started else 0)
 
 
 class ControlRuntime:
@@ -258,7 +286,8 @@ class ControlRuntime:
                         channel._stats.feedback_limited_periods += 1
                         channel._next = now + 1/channel._rate_hz
                         if now-channel._last_rx > 0.1:
-                            raise TimeoutError(f"{channel.name}: feedback not keeping up for 100 ms")
+                            raise MotorFeedbackTimeout(f"{channel.name}: feedback not keeping up for 100 ms",
+                                                       channel.diagnostic_snapshot(), 0.1)
                         continue
                     target, due, period = channel._target, channel._next, 1/channel._rate_hz
                     source, on_sent = (channel._source, channel._on_sent) if controlling else (None, None)
@@ -317,8 +346,9 @@ class ControlRuntime:
                     deadlines = [min(c._next,c._expires) if c._active else c._next
                                  for c in self._channels.values() if c._active or c._monitoring]
                 remaining = min(0.005, max(0.000001, min(deadlines)-time.perf_counter())) if deadlines else 0.005
-                poll_started = time.perf_counter()
+                poll_started = self._poll_started = time.perf_counter()
                 state = self._bus.poll(remaining)
+                self._poll_started = 0.0
                 poll_elapsed = time.perf_counter()-poll_started
                 with self._lock:
                     self._max_poll_s = max(self._max_poll_s, poll_elapsed)
@@ -326,6 +356,9 @@ class ControlRuntime:
                 if state is not None:
                     with self._lock:
                         channel = self._by_id[state.node_id]
+                        received = time.perf_counter()
+                        if channel._stats.rx_count:
+                            channel._stats.max_rx_gap_s = max(channel._stats.max_rx_gap_s, received-channel._last_rx)
                         channel._stats.rx_count += 1
                         channel._inflight = max(0, channel._inflight-1)
                         channel._last_rx = time.perf_counter()

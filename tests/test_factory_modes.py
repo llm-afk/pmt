@@ -67,6 +67,9 @@ def window():
     host.adapter_devices=[]
     host.device_health=Mock()
     host.device_health.printer.thread=None
+    host.device_health.owns_serial=False
+    host.device_health.release_error=''
+    host.device_health.power_port=host.device_health.dyno_port=None
     host.device_health.check.return_value={}
     return host
 

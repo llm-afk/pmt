@@ -2,7 +2,7 @@
 import time
 import threading
 from .integrations import json_http, PrinterClient, PRINTER_STATUS_TIMEOUT
-from .diagnostics import current_log, log_scope
+from .diagnostics import current_log, log_scope, log_event
 
 
 def status(state, detail):
@@ -144,18 +144,77 @@ class PrinterMonitor:
                 self.result, self.sample_at, self.next_check = info, now-age_s, now+3
 
 
+class PowerStateUnstable(RuntimeError):
+    diagnostic_code = 'POWER_STATE_UNSTABLE'
+    diagnostic_hint = '连续两次电源输出/设定回读不一致；本轮不就绪，请核对原始回包及串口释放结果。不会自动重发输出命令。'
+
+    def __init__(self, snapshot):
+        super().__init__('电源状态回读不稳定，正在重新确认')
+        self.diagnostic_context = snapshot
+
+
 class DeviceHealth:
     def __init__(self):
         self.power_port = self.dyno_port = None
         self.printer = PrinterMonitor()
+        self._power = self._power_route = self._power_reading = None
+        self.release_error = ''
+
+    @property
+    def owns_serial(self):
+        return self._power is not None
+
+    def release(self, reason):
+        """Called by the controller owner before tests, page handoff and exit."""
+        if self._power is not None:
+            if not self.release_error:
+                log_event('hardware.release.request', device='power', owner='idle_monitor', reason=reason)
+            try:
+                self._power.close()
+            except Exception as exc:
+                if self.release_error != str(exc):
+                    log_event('hardware.release.failed', level='ERROR', error=exc, device='power', reason=reason)
+                self.release_error = str(exc)
+                raise
+            self._power = self._power_route = self._power_reading = None
+            self.power_port = None
+            self.release_error = ''
+            log_event('hardware.release.confirmed', device='power', owner='idle_monitor', reason=reason)
+
+    @staticmethod
+    def _power_values(reading):
+        return {key:getattr(reading,key,None) for key in
+                ('voltage_set','current_set','output','mode','voltage','current')}
+
+    def _read_power(self):
+        reading = self._power.read_state()
+        values = self._power_values(reading)
+        keys = ('output','voltage_set','current_set')
+        changed = self._power_reading is None or any(values[k] != self._power_reading[k] for k in keys)
+        if changed:
+            confirmed = self._power.read_state()
+            next_values = self._power_values(confirmed)
+            if any(values[k] != next_values[k] for k in keys):
+                raise PowerStateUnstable(dict(first=values, second=next_values,
+                                               wire=self._power.diagnostic_snapshot()))
+            if self._power_reading is not None:
+                log_event('power.state.changed', '空闲只读检测发现电源输出或设定变化，连续两次回读一致',
+                          level='WARNING', owner='idle_monitor', output_commands_sent=False,
+                          before=self._power_reading, after=next_values,
+                          snapshot=self._power.diagnostic_snapshot())
+            reading, values = confirmed, next_values
+        self._power_reading = values
+        return reading
 
     def check(self, config, *, emit=None, cancelled=None, generation=None, inventory_emit=None):
         def check_stop():
             if cancelled is not None and cancelled():
+                self.release('probe_cancelled')
                 raise InterruptedError('设备检查已取消，正在释放连接')
 
         check_stop()
         if config.simulation:
+            self.release('simulation')
             result = dict(can=status('SIMULATED', '模拟适配器'),
                         dyno=status('SIMULATED', '模拟测功机 · 反馈正常'),
                         power=status('SIMULATED', '模拟电源 · 输出关闭'),
@@ -240,28 +299,42 @@ class DeviceHealth:
         observed = []
         evidence = dict(configured_port=config.power_port, excluded_dyno_port=self.dyno_port,
                         candidates=candidates, observations=observed, query_timeout_s=.2)
-        self.power_port, error = None, None
+        error = None
         if not self.dyno_port and config.power_port == 'auto':
+            self.release('dyno_not_identified')
             info, code = status('WAITING', '等待测功机串口识别'), 'POWER_WAIT_DYNO'
             evidence.update(candidates=[],query_attempted=False)
         else:
             try:
                 evidence['query_attempted'] = bool(candidates)
-                matches = detect_power_supplies(ports=candidates, timeout=.2, observations=observed)
-                evidence['matches'] = matches
+                route = (config.power_port, tuple(sorted(candidates)), self.dyno_port)
+                if self._power is not None and route != self._power_route:
+                    self.release('serial_route_changed')
+                reused = self._power is not None
+                matches = ({self.power_port:self._power.identity} if reused else
+                           detect_power_supplies(ports=candidates, timeout=.2, observations=observed))
+                evidence.update(matches=matches, connection_reused=reused)
                 if len(matches) == 1:
                     port = next(iter(matches))
-                    with PowerSupply(port=port) as power:
-                        reading = power.read_state()
-                    self.power_port = port
-                    evidence['reading'] = reading
+                    if not reused:
+                        self._power = PowerSupply(port=port, observer=log_event)
+                        self._power.open()
+                        self._power_route, self.power_port = route, port
+                    reading = self._read_power()
+                    evidence.update(reading=reading, session=self._power.diagnostic_snapshot())
                     info, code = status('READY', f'{port} · {reading.voltage:.1f} V · 输出'+('开启' if reading.output else '关闭')), 'POWER_READY'
                 elif matches:
                     info, code = status('OFFLINE','发现多台电源，请指定串口'), 'POWER_MULTIPLE'
                 else:
                     info, code = status('OFFLINE','未识别到 UDP6721 电源'), 'POWER_NO_REPLY' if candidates else 'POWER_PORT_ABSENT'
             except Exception as exc:
-                info, code, error = status('ERROR',str(exc)), 'POWER_PROBE_FAILED', exc
+                if self._power is not None:
+                    evidence['session'] = self._power.diagnostic_snapshot()
+                try:
+                    self.release('power_probe_failed')
+                except Exception as cleanup:
+                    exc.add_note('电源串口释放未确认：'+str(cleanup))
+                info, code, error = status('ERROR',str(exc)), getattr(exc,'diagnostic_code','POWER_PROBE_FAILED'), exc
         record_probe('power',info,code,started,evidence,route=(tuple(evidence['candidates']),self.power_port),error=error)
         report('power', info)
         report('printer', self.printer.poll(config,generation) if generation is not None else check_printer(config)[0])

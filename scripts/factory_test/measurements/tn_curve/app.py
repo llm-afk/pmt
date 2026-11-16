@@ -10,7 +10,8 @@ import time
 from motor_platform import Bench, MitCommand, Dynamometer, PowerSupply, Canable
 from motor_platform.components.dynamometer import detect_dynamometers
 from motor_platform.components.power_supply.discovery import resolve_power_port
-from .. import power_off, record_shutdown_failure
+from .. import (power_off, record_shutdown_failure, power_observer,
+                device_snapshot, log_measurement_snapshot)
 from ..console import WindowConsole as TerminalConsole
 from scripts.factory_test.measurements.tn_curve.recording import CurveRecorder, event_row
 from scripts.factory_test.measurements.smoothing import append_smoothed_columns
@@ -237,6 +238,8 @@ def run(motor, dyno, power, pool, ui, writer, summary, *, torque=None):
             time.sleep(0.001)
     finally:
         active_error = sys.exception()
+        summary['runtime_snapshot'] = device_snapshot(motor,dyno,target=applied_torque,
+                                                     loop_at=locals().get('now',time.perf_counter()))
         record_cutoff = time.perf_counter()
         try:
             if motor_started and (active_error is None or isinstance(active_error, KeyboardInterrupt)):
@@ -294,7 +297,7 @@ def main(argv=None, *, output_dir, quiet=False):
             dyno.receive_state(timeout=1)
             port = resolve_power_port(POWER_PORT)
             summary.update(power_port=port, dynamometer_port=matches[0])
-            with PowerSupply(port=port) as power:
+            with PowerSupply(port=port, observer=power_observer()) as power:
                 try:
                     power.disable()
                     power.set_current(0)
@@ -317,6 +320,7 @@ def main(argv=None, *, output_dir, quiet=False):
         summary['reason'] = 'operator_stop' if isinstance(exc, KeyboardInterrupt) else 'error'
         raise
     finally:
+        log_measurement_snapshot('tn',summary)
         # 设备与文件上下文均已退出；离线平滑不会阻塞电机控制或延误停机。
         csv_path = directory/'curve.csv'
         if csv_path.exists():

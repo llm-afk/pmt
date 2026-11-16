@@ -147,3 +147,41 @@ class PowerSupplyTests(unittest.TestCase):
             parse_output('unknown')
         with self.assertRaises(PowerSupplyError):
             parse_mode('??')
+
+
+class PowerTraceTests(unittest.TestCase):
+    setUp = PowerSupplyTests.setUp
+
+    def test_trace_is_bounded_and_retains_exact_reply(self):
+        self.power.open()
+        for _ in range(50):self.power.measure()
+        trace=self.transport.diagnostic_snapshot()
+        self.assertEqual(len(trace['exchanges']),24)
+        self.assertTrue(trace['session_id'])
+        self.assertEqual(trace['exchanges'][-1]['command'],'MEAS:CURR?')
+        self.assertEqual(trace['exchanges'][-1]['reply_hex'],b'0.5\n'.hex())
+        self.assertNotIn(b'OUTP ON\n',self.stream.writes)
+
+    def test_failed_close_retains_ownership_until_successful_retry(self):
+        self.power.open()
+        close=self.stream.close
+        self.stream.close=lambda:(_ for _ in ()).throw(OSError('close failed'))
+        try:
+            with self.assertRaises(OSError):self.power.close()
+            self.assertTrue(self.power._opened)
+            self.assertTrue(self.transport.diagnostic_snapshot()['opened'])
+        finally:self.stream.close=close
+        self.power.close()
+        self.assertFalse(self.power._opened)
+        self.assertFalse(self.transport.diagnostic_snapshot()['opened'])
+
+    def test_output_command_failure_records_raw_reply_without_false_confirmation(self):
+        calls=[];self.power._observer=lambda event,**details:calls.append((event,details))
+        self.power.open()
+        with self.assertRaises(PowerSupplyError):self.power.enable()
+        events=[event for event,details in calls]
+        self.assertIn('power.command.request',events)
+        self.assertIn('power.command.failed',events)
+        self.assertNotIn('power.command.confirmed',events)
+        failure=next(d for e,d in calls if e=='power.command.failed')
+        self.assertEqual(failure['snapshot']['transport']['exchanges'][-1]['reply'],'OFF\n')

@@ -18,6 +18,35 @@ def record_shutdown_failure(action):
             target.add_note(note)
 
 
+def power_observer():
+    # Capture the workpiece context before a load-control executor changes threads.
+    from ..diagnostics import current_log
+    target = current_log()
+    return target.event if target is not None else None
+
+
+def device_snapshot(motor, dyno, *, target, loop_at):
+    """Memory reads only; never query USB/serial or write a log before emergency stop."""
+    import time
+    result = dict(applied_target=target, loop_age_ms=(time.perf_counter()-loop_at)*1000)
+    for name, device in (('motor',motor),('dynamometer',dyno)):
+        try:
+            snapshot = getattr(device, 'diagnostic_snapshot', None)
+            result[name] = snapshot() if callable(snapshot) else dict(statistics=device.stats())
+        except Exception as exc:
+            result[name] = dict(snapshot_error=repr(exc))
+    return result
+
+
+def log_measurement_snapshot(stage, summary):
+    from ..diagnostics import log_event
+    snapshot = summary.get('runtime_snapshot')
+    if snapshot:
+        log_event('test.runtime.summary', '采集运行统计，故障快照在停机前取自内存',
+                  level='WARNING' if summary.get('reason') == 'error' else 'INFO',
+                  stage=stage, reason=summary.get('reason'), snapshot=snapshot)
+
+
 def power_off(power, summary=None):
     with record_shutdown_failure('负载电源关闭'):
         try:

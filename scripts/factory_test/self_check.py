@@ -467,7 +467,9 @@ def run(destination):
             assert tuple(window.devices.cget('values')) == ('self-check-can-a','self-check-can-b')
             assert window.vars['adapter_sn'].get() == '' and window.config.adapter_sn == ''
             window.vars['adapter_sn'].set('self-check-can-b')
-            assert window.apply_config() is True
+            window.selection_changed('adapter_sn')
+            assert window.config.adapter_sn == ''
+            assert window.apply_config(commit_services=True) is True
             window.update_adapters(dict(devices=adapters,error=None))
             assert window.vars['adapter_sn'].get() == 'self-check-can-b'
             saved_project = window.vars['project'].get()
@@ -509,6 +511,14 @@ def run(destination):
             with patch.object(window.settings_window,'deiconify') as show_dialog:
                 window.show_settings()
                 show_dialog.assert_called_once()
+            window.vars['mes_url'].set('https://settings.example.test')
+            window.finish_settings()
+            assert not window.settings_save_pending and window.config.mes_url=='https://settings.example.test'
+            debug.disconnect.assert_not_called()
+            previous_hardware=window.config.hardware_version
+            window.hardware_vars['D'].set('2' if previous_hardware[-1]!='2' else '1')
+            window.hardware_changed('D')
+            assert window.config.hardware_version==previous_hardware
             window.finish_settings()
             assert window.settings_save_pending
             debug.disconnect.assert_called_once()
@@ -612,52 +622,61 @@ def run(destination):
             window.hardware_vars['B'].set('1')
             window.hardware_vars['C'].set('3')
             window.hardware_vars['D'].set('2')
+            previous_hardware=window.config.hardware_version
             window.hardware_changed('D')
+            assert window.config.hardware_version==previous_hardware
+            assert window.apply_config(commit_services=True) is True
             assert window.config.hardware_version == '0132' and window.config.torque == 50
             assert window.hardware_vars['B'].get() == '1'
             assert load_config(config_path).hardware_version == '0132'
             previous = asdict(window.config)
             window.hardware_vars['B'].set('12')
-            assert window.apply_config() is False
+            assert window.apply_config(commit_services=True) is False
             assert window.config_error and window.settings_error.get()
             assert asdict(window.config) == previous and asdict(load_config(config_path)) == previous
             assert window.auto.get() is True
             window.hardware_vars['B'].set('1')
-            assert window.apply_config() is True and not window.config_error
+            assert window.apply_config(commit_services=True) is True and not window.config_error
             window.vars['project'].set('unknown')
-            assert window.selection_changed('project') is False  # Editable input must never cause a dictionary KeyError.
+            window.selection_changed('project')
+            assert window.apply_config(commit_services=True) is False  # Defined length check; no dictionary KeyError.
             window.vars['project'].set('x2')
             window.vars['category'].set('abcd')
             window.vars['subcategory'].set('xy12')
             window.vars['factory'].set('z9')
-            assert window.selection_changed('project') is True
+            window.selection_changed('project')
+            assert window.apply_config(commit_services=True) is True
             assert window.config.target_id is None
             assert (window.config.project,window.config.category,window.config.subcategory,window.config.factory) == (
                 'X2','ABCD','XY12','Z9')
             window.hardware_vars['A'].set('1')
             window.hardware_vars['D'].set('3')
-            assert window.apply_config() is True and window.config.hardware_version == '1133'
+            assert window.apply_config(commit_services=True) is True and window.config.hardware_version == '1133'
             assert window.config.test_profile_available and window.config.torque==50  # A/D are revisions, not a whitelist.
             window.vars['project'].set('c2')
             window.vars['category'].set(config.category)
             window.vars['subcategory'].set(config.subcategory)
-            assert window.selection_changed('project') is True
+            window.selection_changed('project')
+            assert window.apply_config(commit_services=True) is True
             for category, expected in (('hipx',1),('hipy',2),('knee',3)):
                 window.vars['category'].set(category)
-                assert window.selection_changed('category') is True
+                window.selection_changed('category')
+                assert window.apply_config(commit_services=True) is True
                 assert window.config.target_id == load_config(config_path).target_id == expected
             window.vars['factory'].set('js')
-            assert window.selection_changed('factory') is True and window.config.factory == 'JS'
+            window.selection_changed('factory')
+            assert window.apply_config(commit_services=True) is True and window.config.factory == 'JS'
             window.vars['production_date'].set('260230')
-            assert window.apply_config() is False
+            assert window.apply_config(commit_services=True) is False
             window.vars['production_date'].set('auto')
-            assert window.apply_config() is True and window.config.production_date == ''
+            assert window.apply_config(commit_services=True) is True and window.config.production_date == ''
             for part,code in zip('ABCD','0221'):
                 from .station_config import HARDWARE_FIELDS
                 window.hardware_vars[part].set(code if part in ('A','D') else code+' · '+HARDWARE_FIELDS[part][code])
             window.auto.set(config.automatic)
             window.vars['factory'].set(config.factory)
             window.hardware_changed('B')
+            assert window.apply_config(commit_services=True) is True
             assert window.config.hardware_version == '0221'
             for part,widget in window.hardware_widgets.items():
                 before=widget.get()
@@ -674,7 +693,8 @@ def run(destination):
             hardware_input.insert(0,'22')
             assert hardware_input.get() == ''
             hardware_input.insert(0,'2')
-            assert window.hardware_changed('B') is True
+            window.hardware_changed('B')
+            assert window.apply_config(commit_services=True) is True
             style = ttk.Style(root)
             for name in ('TFrame', 'TLabel', 'TLabelframe', 'TLabelframe.Label', 'TNotebook', 'TNotebook.Tab'):
                 for state in ((), ('active',), ('disabled',), ('selected',)):

@@ -8,11 +8,20 @@ from .protocol import (PowerMeasurement, PowerState, PowerSupplyError,
 
 
 class PowerSupply:
-    def __init__(self, *, port, baudrate=9600, timeout=0.3, transport=None):
+    def __init__(self, *, port, baudrate=9600, timeout=0.3, transport=None, observer=None):
         self._transport = transport if transport is not None else SerialScpi(port, baudrate=baudrate, timeout=timeout)
         self._lock = threading.RLock()
         self._opened = False
         self.identity = None
+        self._observer = observer
+
+    def diagnostic_snapshot(self):
+        snapshot = getattr(self._transport, 'diagnostic_snapshot', None)
+        return dict(identity=self.identity, transport=snapshot() if snapshot else None)
+
+    def _notify(self, event, **details):
+        if self._observer is not None:
+            self._observer(event, **details)
 
     def open(self):
         with self._lock:
@@ -28,6 +37,7 @@ class PowerSupply:
                 raise
             self.identity = identity
             self._opened = True
+            self._notify('power.connection.opened', snapshot=self.diagnostic_snapshot())
         return self
 
     def _check(self):
@@ -38,10 +48,16 @@ class PowerSupply:
         text = f'{number(value):.{digits}f}'
         with self._lock:
             self._check()
-            self._transport.write(f'{command} {text}')
-            actual = parse_number(self._transport.query(query))
-            if abs(actual - float(text)) > 0.5 * 10**(-digits) + 1e-9:
-                raise PowerSupplyError(f'{query} readback {actual} differs from requested {text}')
+            self._notify('power.command.request', command=f'{command} {text}')
+            try:
+                self._transport.write(f'{command} {text}')
+                actual = parse_number(self._transport.query(query))
+                if abs(actual - float(text)) > 0.5 * 10**(-digits) + 1e-9:
+                    raise PowerSupplyError(f'{query} readback {actual} differs from requested {text}')
+            except BaseException as exc:
+                self._notify('power.command.failed', level='ERROR', error=exc, snapshot=self.diagnostic_snapshot())
+                raise
+            self._notify('power.command.confirmed', command=f'{command} {text}', readback=actual)
             return actual
 
     def set_voltage(self, voltage):
@@ -56,10 +72,18 @@ class PowerSupply:
             raise ValueError('enabled must be bool')
         with self._lock:
             self._check()
-            self._transport.write('OUTP ON' if enabled else 'OUTP OFF')
-            actual = parse_output(self._transport.query('OUTP?'))
-            if actual != enabled:
-                raise PowerSupplyError('output readback differs from requested state')
+            command = 'OUTP ON' if enabled else 'OUTP OFF'
+            self._notify('power.command.request', command=command)
+            try:
+                self._transport.write(command)
+                actual = parse_output(self._transport.query('OUTP?'))
+                if actual != enabled:
+                    raise PowerSupplyError('output readback differs from requested state')
+            except BaseException as exc:
+                self._notify('power.command.failed', level='ERROR', error=exc, snapshot=self.diagnostic_snapshot())
+                raise
+            self._notify('power.command.confirmed', command=command, readback=actual,
+                         snapshot=self.diagnostic_snapshot())
             return actual
 
     def enable(self):
@@ -70,7 +94,10 @@ class PowerSupply:
             return self.set_output(False)
         with self._lock:
             self._check()
+            self._notify('power.command.request', command='OUTP OFF', verify=False)
             self._transport.write('OUTP OFF', allow_uncertain=True)
+            self._notify('power.command.unconfirmed', level='WARNING', command='OUTP OFF', verify=False,
+                         snapshot=self.diagnostic_snapshot())
         # No ACK/readback: completion only means bytes were written.
         return None
 
@@ -117,9 +144,10 @@ class PowerSupply:
         """Close the serial connection. Does not switch the power output."""
         with self._lock:
             if self._opened:
-                self._opened = False
-                self.identity = None
                 self._transport.close()
+                self._opened = False
+                self._notify('power.connection.closed', identity=self.identity)
+                self.identity = None
 
     def __enter__(self):
         return self.open()

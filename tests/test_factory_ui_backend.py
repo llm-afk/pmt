@@ -379,3 +379,81 @@ class ManualTests(unittest.TestCase):
             self.assertEqual(session.target,MitCommand())
         finally:
             session.disconnect();session.thread.join(2)
+
+
+class IdleHardwareOwnershipTests(unittest.TestCase):
+    def setUp(self):
+        from contextlib import ExitStack
+        self.stack=ExitStack();self.addCleanup(self.stack.close)
+        self.health=DeviceHealth();self.addCleanup(lambda:self.health.release('test_finished'))
+        self.config=StationConfig(simulation=False,adapter_sn='adapter')
+        self.ports=[NS(device='COM1'),NS(device='COM2')]
+        self.power=Mock(identity='Uni-Trend,UDP6721,SN,V1.11')
+        self.power.read_state.return_value=self.reading(False)
+        self.power.diagnostic_snapshot.return_value=dict(port='COM2',exchanges=[dict(command='OUTP?',reply='OFF')])
+        dyno=Mock();dyno.__enter__=Mock(return_value=dyno);dyno.__exit__=Mock(return_value=False)
+        dyno.receive_state.return_value=NS(torque=0,speed=0)
+        self.detect=Mock(return_value={'COM2':'UDP6721'})
+        patches=[patch('motor_platform.Canable.detect',return_value=[dict(serial_number='adapter')]),
+            patch('serial.tools.list_ports.comports',side_effect=lambda:list(self.ports)),
+            patch('motor_platform.components.dynamometer.detect_dynamometers',
+                  side_effect=lambda **k:['COM1'] if 'COM1' in k['ports'] else []),
+            patch('motor_platform.components.power_supply.discovery.detect_power_supplies',self.detect),
+            patch('motor_platform.PowerSupply',return_value=self.power),
+            patch('motor_platform.Dynamometer',return_value=dyno),
+            patch('scripts.factory_test.device_status.json_http',return_value=dict(data=dict(online=True)))]
+        for item in patches:self.stack.enter_context(item)
+
+    @staticmethod
+    def reading(output):
+        return NS(voltage=0,current=0,voltage_set=24,current_set=3,output=output,mode='CV')
+
+    def test_idle_checks_reuse_one_session_and_never_switch_output(self):
+        for _ in range(3):self.assertEqual(self.health.check(self.config)['power']['state'],'READY')
+        self.detect.assert_called_once();self.power.open.assert_called_once();self.power.close.assert_not_called()
+        self.assertEqual(self.power.read_state.call_count,4)
+        self.assertTrue(self.health.owns_serial)
+        self.health.release('start_test')
+        self.assertFalse(self.health.owns_serial);self.power.close.assert_called_once()
+        for method in ('enable','disable','set_output','set_voltage','set_current'):
+            getattr(self.power,method).assert_not_called()
+
+    def test_changed_output_is_confirmed_and_preserves_evidence_without_resend(self):
+        self.health.check(self.config)
+        self.power.read_state.return_value=self.reading(True)
+        with patch('scripts.factory_test.device_status.log_event') as log:
+            state=self.health.check(self.config)['power']
+        self.assertEqual(state['state'],'READY')
+        event=next(c for c in log.call_args_list if c.args[0]=='power.state.changed')
+        self.assertFalse(event.kwargs['before']['output']);self.assertTrue(event.kwargs['after']['output'])
+        self.assertFalse(event.kwargs['output_commands_sent']);self.assertIn('snapshot',event.kwargs)
+        self.power.set_output.assert_not_called()
+
+    def test_unstable_readback_blocks_ready_and_releases_then_reidentifies(self):
+        self.power.read_state.side_effect=[self.reading(False),self.reading(True)]
+        state=self.health.check(self.config)['power']
+        self.assertEqual(state['state'],'ERROR');self.assertFalse(self.health.owns_serial)
+        self.power.read_state.side_effect=None
+        self.assertEqual(self.health.check(self.config)['power']['state'],'READY')
+        self.assertEqual(self.power.open.call_count,2)
+        self.power.enable.assert_not_called()
+
+    def test_unplug_or_cancel_releases_cached_session_without_output_commands(self):
+        self.health.check(self.config)
+        self.ports=[]
+        self.assertNotEqual(self.health.check(self.config)['power']['state'],'READY')
+        self.assertFalse(self.health.owns_serial);self.power.close.assert_called_once()
+        self.ports=[NS(device='COM1'),NS(device='COM2')]
+        self.health.check(self.config)
+        with self.assertRaises(InterruptedError):self.health.check(self.config,cancelled=lambda:True)
+        self.assertFalse(self.health.owns_serial);self.assertEqual(self.power.close.call_count,2)
+        self.power.disable.assert_not_called()
+
+    def test_failed_release_retains_ownership_and_can_be_retried(self):
+        self.health.check(self.config)
+        self.power.close.side_effect=OSError('driver refused close')
+        with self.assertRaises(OSError):self.health.release('mode_change')
+        self.assertTrue(self.health.owns_serial);self.assertIn('refused',self.health.release_error)
+        self.power.close.side_effect=None
+        self.health.release('retry_close')
+        self.assertFalse(self.health.owns_serial);self.assertEqual(self.health.release_error,'')

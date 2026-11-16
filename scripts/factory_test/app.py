@@ -53,6 +53,7 @@ def execute(args, directory, *, stages=STAGES, identify=read_motor_sn, pause=tim
         from scripts.factory_test.diagnostics import error_details, log_event
         log_event('test.exception', '性能测试异常', level='ERROR', error=exc, stages=summary['stages'])
         summary['error'] = str(exc) or '用户中止'
+        summary['diagnostic'] = error_details(exc)
         summary['error_notes'] = list(getattr(exc, '__notes__', []))
         # A recorder or context manager can raise while an unconfirmed stop unwinds.
         for cause in error_details(exc)['exception_chain'][1:]:

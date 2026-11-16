@@ -301,3 +301,49 @@ class RuntimeTests(unittest.TestCase):
 
 
 if __name__=='__main__':unittest.main()
+
+
+class FeedbackDiagnosticsTests(unittest.TestCase):
+    def channel(self):
+        from dataclasses import dataclass
+        from motor_platform.runtime import MotorChannel
+        @dataclass
+        class Feedback:
+            node_id: int = 3
+            received_at: float = 0
+            torque: float = 1.0
+        now=time.perf_counter()
+        motor=SimpleNamespace(node_id=3,last_state=Feedback(received_at=now-.22),
+                              enabled=True,recording_dropped=0)
+        runtime=SimpleNamespace(_lock=threading.RLock(),_check=lambda:None,
+            _max_poll_s=.12,_max_poll_overrun_s=.119,_bus=SimpleNamespace(transport=SimpleNamespace()),
+            _thread=SimpleNamespace(is_alive=lambda:True),_error=None,_poll_started=now-.11)
+        channel=MotorChannel(runtime,'joint',motor,1000)
+        channel._active=True;channel._expires=now+.1;channel._inflight=4
+        channel._stats.tx_count=8;channel._stats.rx_count=4
+        channel._stats.first_tx_at=now-.03;channel._stats.last_tx_at=now-.02
+        return channel,runtime
+
+    def test_stale_feedback_retains_fault_instant_without_device_io(self):
+        from motor_platform.runtime import MotorFeedbackTimeout
+        from scripts.factory_test.diagnostics import error_details
+        channel,_=self.channel()
+        with self.assertRaises(MotorFeedbackTimeout) as caught:channel.state()
+        snapshot=caught.exception.diagnostic_context
+        self.assertEqual(snapshot['last_feedback']['node_id'],3)
+        self.assertEqual(snapshot['statistics']['inflight'],4)
+        self.assertGreaterEqual(snapshot['statistics']['feedback_age_ms'],219)
+        self.assertGreaterEqual(snapshot['poll_inflight_ms'],109)
+        self.assertEqual(snapshot['feedback_limit_ms'],100)
+        self.assertEqual(error_details(caught.exception)['code'],'MOTOR_FEEDBACK_STALE')
+        channel._motor.last_state.received_at=time.perf_counter()
+        self.assertGreaterEqual(snapshot['statistics']['feedback_age_ms'],219)
+        self.assertIs(channel.state(),channel._motor.last_state)
+
+    def test_inflight_guard_keeps_same_stale_limit_and_snapshot(self):
+        from motor_platform.runtime import MotorFeedbackTimeout
+        channel,runtime=self.channel();runtime._channels={'joint':channel};runtime.max_inflight=4
+        channel._next=0;channel._last_rx=time.perf_counter()-.2
+        with self.assertRaises(MotorFeedbackTimeout) as caught:ControlRuntime._tick(runtime,time.perf_counter())
+        self.assertEqual(caught.exception.diagnostic_context['feedback_limit_ms'],100)
+        self.assertEqual(channel._stats.feedback_limited_periods,1)

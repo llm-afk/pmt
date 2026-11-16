@@ -21,7 +21,7 @@ from .station import StationRunner, PresenceLatch, STEPS
 from .measurements.console import WindowConsole
 from .maintenance import Maintenance, MotorAbsent, MultipleMotors, MotorIdentityUnreadable
 from .device_status import DeviceHealth, AdapterMonitor, adapter_status
-from .diagnostics import DiagnosticLogs, log_scope, error_details, LOCAL_TIME
+from .diagnostics import DiagnosticLogs, log_scope, log_event, error_details, LOCAL_TIME
 from .service_credentials import CredentialStore, CredentialStoreError, FIELDS as SECRET_FIELDS
 from tkinter.scrolledtext import ScrolledText
 
@@ -359,7 +359,7 @@ class FactoryWindow:
             self.hint.set('任务运行中，结束后可修改工位设置。')
             return
         if self.control_page.active and not self.settings_save_pending:
-            self.settings_error.set('调试连接中；保存后将自动停止电机、释放连接，再按新配置自动连接。')
+            self.settings_error.set('调试连接中；修改 CANable 或硬件版本后保存会先停机重连，云端配置不打断调试。')
         self.show_service_keys.set(False)
         for widget in self.secret_widgets.values():
             widget.configure(show='*')
@@ -451,10 +451,18 @@ class FactoryWindow:
             with self.lock:
                 self.configuring = False
 
+    def debug_settings_require_restart(self):
+        try:
+            hardware = ''.join(hardware_input_value(part,self.hardware_vars[part].get()) for part in 'ABCD')
+            return (self.vars['adapter_sn'].get().strip() != self.config.adapter_sn or
+                    hardware != self.config.hardware_version)
+        except (AttributeError,KeyError,ValueError):
+            return True
+
     def finish_settings(self):
         if self.settings_save_pending:
             return
-        if self.page == 'control' or self.control_page.active:
+        if (self.page == 'control' or self.control_page.active) and self.debug_settings_require_restart():
             self.settings_save_pending=True
             self.control_page.leave()
             self.settings_error.set('正在停止调试并释放连接，完成后保存配置并自动连接…')
@@ -481,8 +489,23 @@ class FactoryWindow:
             if self.page == 'control' and self.pending_page is None and not self.handoff_error:
                 self.control_page.enter()
 
+    def discard_settings_edits(self):
+        for name, variable in self.vars.items():
+            value = getattr(self.config,name)
+            if name == 'adapter_sn' and not any(item.get('serial_number') == value for item in (self.adapter_devices or [])):
+                value = ''
+            variable.set('自动当天' if name == 'production_date' and not value else str(value))
+        for part, variable in self.hardware_vars.items():
+            variable.set(self.config.hardware_version['ABCD'.index(part)])
+        for name, variable in self.secret_vars.items():
+            variable.set(self.saved_credentials.get(name,''))
+        self.category.configure(values=material_options(self.config.project))
+        self.subcategory.configure(values=material_options(self.config.project,self.config.category))
+        self.settings_error.set('')
+
     def close_settings(self):
         if not self.settings_save_pending:
+            self.discard_settings_edits()
             self.settings_window.withdraw()
 
     def show_logs(self):
@@ -527,6 +550,10 @@ class FactoryWindow:
 
     def advance_page_transition(self):
         if self.closing or self.pending_page is None or self.busy or self.scan_in_progress or self.control_page.active:
+            return
+        if self.device_health.owns_serial:
+            self.banner.set('正在释放产测设备连接' if not self.device_health.release_error else '电源串口释放未确认')
+            self.hint.set(self.device_health.release_error or '请稍候，完成后自动切换页面。')
             return
         target, self.pending_page = self.pending_page, None
         session = self.control_page.session
@@ -600,23 +627,29 @@ class FactoryWindow:
         if name in ('project', 'category'):
             self.category['values'] = material_options(self.vars['project'].get())
             self.subcategory['values'] = material_options(self.vars['project'].get(),self.vars['category'].get())
-        return self.apply_config()
+        self.settings_error.set('修改尚未生效；点击“保存并关闭”后统一应用。')
 
     def hardware_changed(self, part):
-        return self.apply_config()
+        self.settings_error.set('修改尚未生效；点击“保存并关闭”后统一应用。')
 
-    def invalidate_readiness(self):
-        self.last_health = 0.0
-        self.health_states = {}
-        self.latch.stable = 0
-        self.latch.absent_since = None
-        self.ready_to_start = self.start_requested = False
+    def invalidate_readiness(self, devices=None):
+        devices = {'can','motor','dyno','power','printer'} if devices is None else set(devices)
+        if devices:
+            self.last_health = 0.0
+            self.health_states = {k:v for k,v in self.health_states.items() if k not in devices}
+        if 'motor' in devices:
+            self.latch.stable = 0
+            self.latch.absent_since = None
+        self.ready_to_start = self.start_requested = self.resume_requested = False
+        self.ready_identity = self.requested_identity = None
         if not self.busy:
             self.stop.config(state='disabled')
             if self.page == 'production':
                 self.show_idle_prompt()
-                for name in ('motor','dyno','power','printer'):
-                    self.device_state(name,'CHECKING','配置已更新，正在重新检查')
+                for name in ('can','motor','dyno','power','printer'):
+                    if name in devices:
+                        self.device_state(name,'CHECKING' if self.config.automatic else 'WAITING',
+                                          '配置已更新，正在重新检查' if self.config.automatic else '设备监视已暂停')
 
     def production_event_current(self, value):
         return (not self.closing and not self.configuring and self.page == 'production'
@@ -625,8 +658,10 @@ class FactoryWindow:
             and value.get('mode_generation',self.mode_generation) == self.mode_generation)
 
     def apply_config(self, *, commit_services=False):
+        persisted = False
         with self.lock:
-            if self.closing or self.configuring or self.busy or self.control_page.active or getattr(self, 'driver_installing', False):
+            blocked_debug = self.control_page.active and (not commit_services or self.debug_settings_require_restart())
+            if self.closing or self.configuring or self.busy or blocked_debug or getattr(self, 'driver_installing', False):
                 if self.control_page.active:
                     self.settings_error.set('调试连接中；修改将在“保存并关闭”后生效。')
                 return False
@@ -634,8 +669,9 @@ class FactoryWindow:
         try:
             values = {k: v.get().strip() for k, v in self.vars.items()}
             if not commit_services:
-                values = {key:value for key,value in values.items() if key not in self.service_fields}
-            hardware = {part:hardware_input_value(part,self.hardware_vars[part].get()) for part in 'ABCD'}
+                values = {key:str(getattr(self.config,key)) for key in values if key not in self.service_fields}
+            hardware = {part:(hardware_input_value(part,self.hardware_vars[part].get()) if commit_services else
+                              self.config.hardware_version[index]) for index,part in enumerate('ABCD')}
             values['hardware_version'] = ''.join(hardware.values())
             for name in ('project','category','subcategory','factory'):
                 values[name] = values[name].upper()
@@ -652,6 +688,7 @@ class FactoryWindow:
             credentials_changed = commit_services and (desired!=self.saved_credentials or bool(self.credential_error and any(desired.values())))
             if config != self.config or credentials_changed or commit_services or not self.config_path.exists():
                 save_config(config, self.config_path,credentials=desired if credentials_changed else None)
+            persisted = True
             with self.lock:
                 previous_config = self.config
                 changed_mode = config.simulation != self.config.simulation
@@ -664,7 +701,20 @@ class FactoryWindow:
                 self.config = config
                 if config != previous_config or credentials_changed:
                     self.config_revision += 1
-                    self.invalidate_readiness()
+                    affected = set()
+                    if changed_mode or reenabled:
+                        affected.update(('can','motor','dyno','power','printer'))
+                    elif config.automatic != previous_config.automatic:
+                        affected.update(('motor','dyno','power','printer'))
+                    if config.adapter_sn != previous_config.adapter_sn:
+                        affected.update(('can','motor'))
+                    if config.dyno_port != previous_config.dyno_port:
+                        affected.update(('dyno','power'))
+                    if config.power_port != previous_config.power_port:
+                        affected.add('power')
+                    if changed_printer:
+                        affected.add('printer')
+                    self.invalidate_readiness(affected)
             if credentials_changed:
                 changed = [key for key in SECRET_FIELDS if desired[key]!=self.saved_credentials[key]]
                 self.saved_credentials = dict(desired)
@@ -683,22 +733,23 @@ class FactoryWindow:
             had_error = bool(self.config_error)
             self.config_error = ''
             self.settings_error.set('')
-            for name in ('project','category','subcategory','factory','hardware_version'):
-                self.vars[name].set(values[name])
-            self.category.configure(values=material_options(config.project))
-            self.subcategory.configure(values=material_options(config.project,config.category))
-            self.vars['production_date'].set(values['production_date'] or '自动当天')
-            self.vars['adapter_sn'].set(values['adapter_sn'])
+            if commit_services:
+                for name in ('project','category','subcategory','factory','hardware_version'):
+                    self.vars[name].set(values[name])
+                self.category.configure(values=material_options(config.project))
+                self.subcategory.configure(values=material_options(config.project,config.category))
+                self.vars['production_date'].set(values['production_date'] or '自动当天')
+                self.vars['adapter_sn'].set(values['adapter_sn'])
             if config.adapter_sn != previous_config.adapter_sn:
                 self.last_health = 0.0
                 self.show_adapter_status()
             if commit_services:
-                self.last_health = 0.0
                 self.show_service_keys.set(False)
                 for widget in self.secret_widgets.values():
                     widget.configure(show='*')
-            for part,code in hardware.items():
-                self.hardware_vars[part].set(code)
+            if commit_services:
+                for part,code in hardware.items():
+                    self.hardware_vars[part].set(code)
             if had_error:
                 self.show_idle_prompt()
             if reenabled:
@@ -720,10 +771,10 @@ class FactoryWindow:
             self.refresh_environment()
             return True
         except Exception as exc:
-            message = '配置未保存：' + str(exc)
+            message = ('配置已保存，但应用时出现异常：' if persisted else '配置未保存：') + str(exc)
             if message != self.config_error:
-                self.diagnostics.current.event('configuration.rejected', '工位配置未保存',
-                                               level='ERROR', error=exc)
+                self.diagnostics.current.event('configuration.apply_failed' if persisted else 'configuration.rejected',
+                                               message,level='ERROR',error=exc,persisted=persisted)
                 self.write_log(message)
             self.config_error = message
             self.settings_error.set(message)
@@ -944,7 +995,18 @@ class FactoryWindow:
         self.printer_check_thread.start()
 
     def controller(self):
-        """单所有者设备检查；每件必须收到工人的开始指令才会写入或使能。"""
+        try:
+            self.run_controller()
+        finally:
+            try:
+                with log_scope(self.diagnostics.current.bind(phase='hardware_handoff')):
+                    self.device_health.release('controller_exit')
+            except Exception as exc:
+                self.handoff_error = '电源串口释放未确认：'+str(exc)
+                self.diagnostics.current.event('hardware.controller.cleanup_failed',level='ERROR',error=exc)
+
+    def run_controller(self):
+        """One owner: idle monitoring -> released -> test -> fresh monitoring."""
         last_message = ''
         last_candidate = last_probe_key = last_station_error = None
         recent_node = None
@@ -959,13 +1021,21 @@ class FactoryWindow:
                 if self.drivers_blocking():
                     # Re-emit the current operator prompt when driver preparation ends.
                     last_candidate = last_probe_key = None
-                if (self.closing or self.shutdown.is_set() or self.configuring
+                paused = (self.closing or self.shutdown.is_set() or self.configuring
                         or not self.dependencies_ready or not config.automatic or self.page != 'production'
-                        or self.production_pause.is_set() or self.control_page.active or self.drivers_blocking()):
-                    continue
-                self.scan_in_progress = True
-                start_before_probe = self.start_requested
-                WindowConsole.cancelled.clear()
+                        or self.production_pause.is_set() or self.control_page.active or self.drivers_blocking())
+                if not paused:
+                    self.scan_in_progress = True
+                    start_before_probe = self.start_requested
+                    WindowConsole.cancelled.clear()
+            if paused:
+                try:
+                    if not self.configuring:
+                        with log_scope(self.diagnostics.current.bind(phase='hardware_handoff')):
+                            self.device_health.release('monitor_paused')
+                except Exception:
+                    pass  # Ownership is retained and page handoff waits; the release logs its failure.
+                continue
             try:
                 probe_latch = self.latch
                 motor_state, detail = 'unavailable', '请连接或选择 CAN 适配器'
@@ -1026,7 +1096,7 @@ class FactoryWindow:
                         health = self.device_health.check(config,
                             emit=lambda name,info:self.events.put(('device_health',dict(name=name,info=info,
                                 config_revision=revision,mode_generation=mode_generation))),cancelled=self.station_cancelled,
-                                generation=(revision,mode_generation),
+                                generation=(mode_generation,),
                                 inventory_emit=lambda info:self.events.put(('serial_inventory',dict(info,
                                     config_revision=revision,mode_generation=mode_generation))))
                     with self.lock:
@@ -1051,7 +1121,7 @@ class FactoryWindow:
                              waiting_removal=probe_latch.wait_removal)
                 if not config.simulation:
                     with log_scope(self.diagnostics.current.bind(phase='printer_health')):
-                        printer_info = self.device_health.printer.poll(config,(revision,mode_generation))
+                        printer_info = self.device_health.printer.poll(config,(mode_generation,))
                     with self.lock:
                         if revision != self.config_revision or mode_generation != self.mode_generation or self.configuring:
                             continue
@@ -1109,6 +1179,12 @@ class FactoryWindow:
                         self.latch.stable = 0
                         continue
                     self.busy = True
+                hardware_ports = {name:port for name in ('power','dyno')
+                    if isinstance(port:=getattr(self.device_health,name+'_port',None),str) and port}
+                with log_scope(self.diagnostics.current.bind(phase='hardware_handoff')):
+                    self.device_health.release('production_started')
+                    log_event('hardware.handoff.confirmed',from_owner='idle_monitor',to_owner='production',
+                              ports=hardware_ports,motor_id=detected_id,config_revision=revision)
                 self.scan_in_progress = False
                 self.events.put(('busy',True))
                 def emit(kind,value):
@@ -1123,7 +1199,7 @@ class FactoryWindow:
                     self.diagnostics.current.event('firmware.start_snapshot', **start_app)
                 runner = StationRunner(config,root=self.storage_root,emit=emit,cancelled=self.station_cancelled,
                                        delivery=self.delivery,log_target=self.diagnostics.current,
-                                       firmware_sha256=firmware_sha256)
+                                       firmware_sha256=firmware_sha256, hardware_ports=hardware_ports)
                 if not resume and runner.already_completed(detected):
                     self.events.put(('failed',dict(message='当前 SN 已完成生产，不能重复取号',notes=[])))
                     self.latch.completed()
@@ -1549,6 +1625,8 @@ class FactoryWindow:
         if step=='print' and (value.get('status')=='UNKNOWN' or code in
                               ('PRINT_OUTCOME_UNKNOWN','PRINT_ACK_INVALID','PRINT_SERVICE_OUTCOME_UNKNOWN','PRINT_ACK_CONFLICT')):
             return '打印结果未确认，请隔离本件','勿补打或贴标。请工程人员核对实体标签和打印记录。'
+        if code == 'MOTOR_FEEDBACK_STALE':
+            return '请取下并隔离本件电机','电机反馈中断，本件测试已停止。请勿贴合格标签，联系工程人员查看日志。'
         stage=value.get('step_label') or dict(STEPS).get(step,'本件测试')
         return '请取下并隔离本件电机',f'{stage}未完成。请勿贴合格标签，详情见日志。'
 
@@ -1562,11 +1640,11 @@ class FactoryWindow:
             self.set_prompt('正在停止，请等待电机停稳','工位正在执行收尾，请等待取件提示。','#B27813')
 
     def resume(self):
-        if self.busy or not self.apply_config():
+        if self.busy:
             return
-        self.resume_requested = True
         self.auto.set(True)
-        self.apply_config()
+        if self.apply_config():
+            self.resume_requested = True
 
     def resolve_pending(self):
         if self.busy:

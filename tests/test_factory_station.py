@@ -829,3 +829,35 @@ class ResetRecoveryTests(unittest.TestCase):
         maintenance,state=self.drive();state.persistent=True;maintenance.progress=Mock()
         with self.assertRaises(ResetReadbackUnconfirmed):maintenance.assign_id(1,SN)
         self.assertFalse(any('完成' in call.args[0] for call in maintenance.progress.call_args_list))
+
+
+class MeasurementFaultPropagationTests(unittest.TestCase):
+    def test_original_feedback_fault_survives_summary_and_stops_later_services(self):
+        import io
+        from motor_platform.runtime import MotorFeedbackTimeout
+        from scripts.factory_test import app
+        from types import SimpleNamespace
+        fault=MotorFeedbackTimeout('3: motor feedback absent or stale',dict(statistics=dict(tx_count=9,rx_count=4)),.1)
+        module=SimpleNamespace(main=Mock(side_effect=fault))
+        args=SimpleNamespace(id=3,serial='offline-adapter',torque=30)
+        with tempfile.TemporaryDirectory() as folder,patch('sys.stdout',io.StringIO()):
+            summary=app.execute(args,Path(folder),stages=(('kt',module,'kt_curve.csv'),),
+                                identify=lambda args:'same',motor_sn='same')
+            self.assertEqual(summary['diagnostic']['code'],'MOTOR_FEEDBACK_STALE')
+            service=DemoServices(StationConfig(simulation=True),lambda:False,lambda *args:None)
+            service.measure=Mock(return_value=summary);service.render=Mock()
+            for name in ('allocate','print_sn','upload'):setattr(service,name,Mock())
+            result=StationRunner(service.config,root=Path(folder)/'station',services=service).begin('same',3)
+            self.assertEqual(result['diagnostic']['code'],'MOTOR_FEEDBACK_STALE')
+            self.assertEqual(result['steps']['measure'],'FAILED')
+            for name in ('allocate','print_sn','upload'):getattr(service,name).assert_not_called()
+
+    def test_load_executor_retains_workpiece_log_context(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from scripts.factory_test.diagnostics import log_scope
+        from scripts.factory_test.measurements import power_observer
+        target=Mock()
+        with log_scope(target):observer=power_observer()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(observer,'power.command.confirmed',command='OUTP OFF').result(timeout=2)
+        target.event.assert_called_once_with('power.command.confirmed',command='OUTP OFF')

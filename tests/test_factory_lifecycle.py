@@ -97,7 +97,7 @@ class ConfigurationRaceTests(unittest.TestCase):
         self.assertFalse(host.ready_to_start)
         host.device_state.assert_called_once_with('printer','OFFLINE','new queue offline')
 
-    def run_scan_with_edit(self, changes=None, *, credentials=False, configuring=False,wrong_connection=False):
+    def run_scan_with_edit(self, changes=None, *, credentials=False, configuring=False,wrong_connection=False,release_error=False):
         host=window(); host.config=StationConfig(simulation=True)
         host.resume_requested=False
         host.start_requested=True  # User clicked on the preceding ready snapshot.
@@ -106,6 +106,7 @@ class ConfigurationRaceTests(unittest.TestCase):
         host.shutdown=Mock(); host.shutdown.is_set.return_value=False
         host.shutdown.wait.side_effect=[False,True]
         host.storage_root=None; host.delivery=None; host.started_sessions=0
+        if release_error: host.device_health.release.side_effect=OSError('cannot release idle serial')
         real_put=host.events.put
         def put(event):
             if event[0]=='candidate':
@@ -124,6 +125,12 @@ class ConfigurationRaceTests(unittest.TestCase):
             runner.return_value.begin.return_value=dict(status='COMPLETE')
             host.controller()
         return runner,host
+
+    def test_failed_idle_release_prevents_any_production_operation(self):
+        runner,host=self.run_scan_with_edit(release_error=True)
+        runner.assert_not_called()
+        self.assertTrue(host.latch.wait_removal)
+        self.assertIn('释放未确认',host.handoff_error)
 
     def test_all_product_printer_and_cloud_changes_invalidate_pre_start_snapshot(self):
         for changes in (dict(factory='JS'),dict(project='A2'),dict(hardware_version='1221'),
@@ -225,3 +232,96 @@ class ShutdownTests(unittest.TestCase):
         self.assertIn('显示数据可能未完整保存',warning.call_args.args[1])
         self.assertNotIn('断开工装电源',warning.call_args.args[1])
         host.root.destroy.assert_called_once()
+
+
+class SettingsTransactionTests(unittest.TestCase):
+    class Value:
+        def __init__(self,value):self.value=value
+        def get(self):return self.value
+        def set(self,value):self.value=value
+
+    def host(self):
+        from scripts.factory_test.service_credentials import FIELDS as SECRET_FIELDS
+        host=window();host.config=StationConfig(adapter_sn='chosen');host.preview_only=False
+        names=('adapter_sn','power_port','dyno_port','project','category','subcategory','factory',
+               'hardware_version','production_date','printer_url','printer_name','printer_status_path',
+               'printer_print_path','mes_url')
+        host.vars={name:self.Value(str(getattr(host.config,name))) for name in names}
+        host.hardware_vars={part:self.Value(host.config.hardware_version[i]) for i,part in enumerate('ABCD')}
+        host.auto=self.Value(host.config.automatic);host.settings_error=self.Value('')
+        host.secret_vars={key:self.Value('') for key in SECRET_FIELDS};host.saved_credentials={key:'' for key in SECRET_FIELDS}
+        host.credential_error=host.config_error='';host.config_path=Path(tempfile.gettempdir())/'pmt-settings-unit-test.json'
+        host.service_fields={'printer_url','printer_name','printer_status_path','printer_print_path','mes_url'}
+        host.category=Mock();host.subcategory=Mock();host.show_service_keys=self.Value(False);host.secret_widgets={}
+        host.show_idle_prompt=Mock();host.device_state=Mock();host.show_adapter_status=Mock()
+        host.configure_delivery=Mock();host.configure_printer_service=Mock();host.refresh_environment=Mock()
+        host.log_configuration=Mock()
+        host.health_states={name:dict(state='READY',detail=name) for name in ('can','dyno','power','printer')}
+        host.last_health=123.;host.latch.stable=3
+        host.settings_window=Mock()
+        return host
+
+    def test_product_edits_stay_draft_and_commit_preserves_hardware_readiness(self):
+        host=self.host();old=dict(host.health_states)
+        host.vars['factory'].set('GF')
+        host.selection_changed('factory')
+        self.assertEqual(host.config.factory,'XC')
+        self.assertEqual(host.config_revision,0)
+        with patch('scripts.factory_test.gui.save_config') as save:
+            self.assertTrue(host.apply_config(commit_services=True))
+        save.assert_called_once();self.assertEqual(host.config.factory,'GF')
+        self.assertEqual(host.health_states,old);self.assertEqual(host.last_health,123.)
+        self.assertEqual(host.latch.stable,3);self.assertFalse(host.ready_to_start)
+        host.device_state.assert_not_called();host.device_health.release.assert_not_called()
+
+    def test_power_port_change_only_invalidates_power(self):
+        host=self.host();host.vars['power_port'].set('COM99')
+        with patch('scripts.factory_test.gui.save_config'):self.assertTrue(host.apply_config(commit_services=True))
+        self.assertNotIn('power',host.health_states);self.assertIn('dyno',host.health_states)
+        self.assertIn('printer',host.health_states);self.assertEqual(host.last_health,0)
+        host.device_state.assert_called_once_with('power','CHECKING','配置已更新，正在重新检查')
+
+    def test_close_discards_unsaved_values_and_monitor_toggle_does_not_commit_drafts(self):
+        host=self.host();host.vars['factory'].set('GF');host.auto.set(False)
+        with patch('scripts.factory_test.gui.save_config'):self.assertTrue(host.apply_config())
+        self.assertEqual(host.config.factory,'XC');self.assertFalse(host.config.automatic)
+        self.assertEqual(host.vars['factory'].get(),'GF')
+        host.close_settings()
+        self.assertEqual(host.vars['factory'].get(),'XC');host.settings_window.withdraw.assert_called_once()
+
+    def test_cloud_settings_save_keeps_active_debug_connection(self):
+        host=self.host();host.page='control';host.control_page.active=True
+        host.vars['mes_url'].set('https://changed.example.test')
+        with patch('scripts.factory_test.gui.save_config'):host.finish_settings()
+        self.assertEqual(host.config.mes_url,'https://changed.example.test')
+        host.control_page.leave.assert_not_called();host.settings_window.withdraw.assert_called_once()
+
+    def test_debug_hardware_change_waits_for_disconnect_before_config_commit(self):
+        host=self.host();host.page='control';host.control_page.active=True
+        host.hardware_vars['D'].set('3')
+        host.finish_settings()
+        self.assertTrue(host.settings_save_pending)
+        self.assertEqual(host.config.hardware_version,'0221')
+        host.control_page.leave.assert_called_once()
+
+    def test_engineer_resume_request_survives_reenabling_monitor(self):
+        host=self.host();host.config=replace(host.config,automatic=False);host.auto.set(False)
+        with patch('scripts.factory_test.gui.save_config'):host.resume()
+        self.assertTrue(host.config.automatic);self.assertTrue(host.resume_requested)
+        self.assertFalse(host.start_requested)
+
+    def test_feedback_worker_prompt_keeps_unconfirmed_stop_priority(self):
+        from scripts.factory_test.gui import FactoryWindow
+        value=dict(step='measure',diagnostic=dict(code='MOTOR_FEEDBACK_STALE'))
+        title,hint=FactoryWindow.failure_prompt(value)
+        self.assertIn('隔离',title);self.assertIn('反馈中断',hint)
+        title,_=FactoryWindow.failure_prompt(dict(value,notes=['工装停机未确认：电机失能']))
+        self.assertIn('断开工装电源',title)
+
+    def test_mode_handoff_waits_for_idle_serial_owner(self):
+        host=window();host.device_health.owns_serial=True
+        host.switch_page('control');host.control_page.enter.assert_not_called()
+        self.assertEqual(host.pending_page,'control')
+        host.device_health.owns_serial=False;host.advance_page_transition()
+        host.control_page.enter.assert_called_once()
+        WindowConsole.cancelled.clear()
