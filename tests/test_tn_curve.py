@@ -60,20 +60,36 @@ class CurveTests(unittest.TestCase):
     def test_stationary_is_not_stable_spin(self):
         p = app.Progress(0)
         self.assertFalse(p.update(state(0, 0)))
-        self.assertFalse(p.update(state(.999, 0)))
+        for i in range(1, 100):
+            self.assertFalse(p.update(state(i * .01, 0)))
         self.assertTrue(p.update(state(1, 0)))
 
     def test_stability_and_continuous_stall(self):
         p = app.Progress(0)
         self.assertFalse(p.update(state(0, -10)))
-        self.assertTrue(p.update(state(1, -10.1)))
-        self.assertTrue(p.update(state(2, -10)))
+        for i in range(1, 100):
+            self.assertFalse(p.update(state(i * .01, -10.1)))
+        self.assertTrue(p.update(state(1, -10)))
         p.loading_at = 2
         self.assertFalse(p.update(state(3, -0.2)))
         self.assertFalse(p.update(state(3.09, -0.2)))
         self.assertFalse(p.update(state(3.10, -1)))
         self.assertFalse(p.update(state(4, 0)))
+        self.assertFalse(p.update(state(4.02, 0)))
         self.assertTrue(p.update(state(4.101, 0)))
+
+    def test_feedback_gap_cannot_complete_settle_or_bridge_a_stall(self):
+        progress = app.Progress(0)
+        for i in range(61):
+            self.assertFalse(progress.update(state(i * .01, 8)))
+        self.assertFalse(progress.update(state(1.2, 8)))
+        for i in range(1, 100):
+            self.assertFalse(progress.update(state(1.2 + i * .01, 8)))
+        self.assertTrue(progress.update(state(2.201, 8)))
+        progress.loading_at = 2.201
+        for t in (2.21, 2.27, 2.8, 2.86):
+            self.assertFalse(progress.update(state(t, 0)))
+        self.assertTrue(progress.update(state(2.91, 0)))
 
     def test_cached_feedback_does_not_advance_hold(self):
         p = app.Progress(0)
@@ -93,6 +109,40 @@ class CurveTests(unittest.TestCase):
     def test_config_requires_explicit_torque(self):
         with patch.object(app, 'TORQUE_FF', None):
             with self.assertRaises(ValueError): app.validate()
+
+    def test_sparse_feedback_bounds_both_preparation_phases(self):
+        for phase, continuous_until in (('扭矩爬升', 0.), ('最大扭矩保持', .1)):
+            with self.subTest(phase=phase):
+                clock, last, summary = [0.], [0.], {}
+                motor, dyno, power, pool, ui = [Mock() for _ in range(5)]
+                motor.stats.return_value = dict(fault=None, actual_tx_hz=5)
+                motor.drain_states.return_value = []
+                def feedback(*, max_age):
+                    self.assertEqual(max_age, 1.)
+                    if clock[0] < continuous_until or clock[0] - last[0] >= .2:
+                        last[0] = clock[0]
+                    return SimpleNamespace(received_at=last[0], velocity=0., torque=0.,
+                                           motor_temperature=25., board_temperature=25., error_code=0)
+                motor.state.side_effect = feedback
+                dyno.stats.return_value = {'dropped_samples': 0}
+                dyno.drain.return_value = []
+                dyno.state.return_value = SimpleNamespace(torque=0., speed=0., power=0.)
+                ui.poll.side_effect = lambda: 'quit' if clock[0] >= 2. else None
+                def sleep(_):
+                    clock[0] += .01
+                with patch.object(app.time, 'perf_counter', lambda: clock[0]), patch.object(app.time, 'sleep', sleep), \
+                     patch.object(app, 'TEST_TIMEOUT_S', 1.), patch.object(app, 'TORQUE_RAMP_S', .03), \
+                     patch.object(app, 'STOP_TORQUE_RAMP_S', .01):
+                    reason = app.run(motor, dyno, power, pool, ui, Mock(), summary)
+                self.assertIn('准备超时', reason)
+                self.assertEqual(summary['reason_code'], 'TN_PREPARE_TIMEOUT')
+                self.assertEqual(summary['prepare_phase'], phase)
+                self.assertIsNone(summary['loading_at'])
+                self.assertTrue(summary['controlled_stop_completed'])
+                self.assertLess(summary['prepare_elapsed_s'], 1.02)
+                pool.submit.assert_not_called()
+                motor.disable.assert_called_once()
+                power.disable.assert_called_once()
 
     def test_full_loop_stall_disables_motor(self):
         motor = Mock(node_id=1)

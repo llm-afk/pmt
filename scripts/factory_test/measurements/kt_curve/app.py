@@ -7,9 +7,10 @@ import sys
 import time
 
 from motor_platform import Bench, Canable, Dynamometer, MitCommand, PowerSupply
+from motor_platform.runtime import MOTOR_FEEDBACK_TIMEOUT_S
 from motor_platform.components.dynamometer import detect_dynamometers
 from motor_platform.components.power_supply.discovery import resolve_power_port
-from .. import (power_off, record_shutdown_failure, power_observer,
+from .. import (FeedbackClock, SAMPLE_MAX_GAP_S, power_off, record_shutdown_failure, power_observer,
                 device_snapshot, log_measurement_snapshot)
 from ..console import WindowConsole as TerminalConsole
 from scripts.factory_test.measurements.smoothing import append_smoothed_columns
@@ -29,7 +30,7 @@ RAMP_DURATION_S = 3.0           # 从开始爬升到结束采集的时间
 MOTOR_HZ = 1000                 # 周期 CAN 发送目标频率；目标值按实际经过时间计算
 TARGET_UPDATE_S = 0.001         # 应用更新目标的间隔；迟到不补发积压命令
 STOP_RAMP_S = 1.0               # 正常结束、用户停止：保持阻尼，线性降扭矩到零
-FEEDBACK_TIMEOUT_S = 0.1
+DYNO_FEEDBACK_TIMEOUT_S = 0.1
 MAX_MOTOR_TEMP_C = 80.0
 MAX_DRIVER_TEMP_C = 80.0
 DYNO_TORQUE_SCALE = 100.0
@@ -57,7 +58,7 @@ def parse_args(argv=None):
     if round(args.voltage, 2) != args.voltage or round(args.current, 3) != args.current:
         parser.error('电压最多两位小数，电流最多三位小数')
     for name in ('LOAD_SETTLE_S', 'RAMP_DURATION_S', 'MOTOR_HZ', 'TARGET_UPDATE_S', 'STOP_RAMP_S',
-                 'FEEDBACK_TIMEOUT_S', 'MAX_MOTOR_TEMP_C', 'MAX_DRIVER_TEMP_C',
+                 'DYNO_FEEDBACK_TIMEOUT_S', 'MAX_MOTOR_TEMP_C', 'MAX_DRIVER_TEMP_C',
                  'DYNO_TORQUE_SCALE', 'DYNO_SPEED_SCALE', 'SMOOTH_WINDOW_S'):
         if not math.isfinite(globals()[name]) or globals()[name] <= 0:
             parser.error(f'{name} must be finite and positive')
@@ -73,7 +74,7 @@ def ramp_torque(elapsed, maximum):
 
 
 def check_motor(motor):
-    state = motor.state(max_age=FEEDBACK_TIMEOUT_S)
+    state = motor.state(max_age=MOTOR_FEEDBACK_TIMEOUT_S)
     stats = motor.stats()
     if state.error_code or stats['fault']:
         raise RuntimeError(f'motor fault: {state.error_code}, {stats["fault"]}')
@@ -117,15 +118,16 @@ def run(motor, dyno, ui, args, result):
         motor.enable()
         enabled = True
         check_motor(motor)
-        dyno.state(max_age=FEEDBACK_TIMEOUT_S)
+        dyno.state(max_age=DYNO_FEEDBACK_TIMEOUT_S)
         collect()
         recorder = Recorder(time.perf_counter(), RAMP_DURATION_S)
         result['recorder'] = recorder
+        ramp = FeedbackClock(recorder.origin)
         next_display = 0.0
         while True:
             now = time.perf_counter()
             state, stats = check_motor(motor)
-            ds = dyno.state(max_age=FEEDBACK_TIMEOUT_S)
+            ds = dyno.state(max_age=DYNO_FEEDBACK_TIMEOUT_S)
             if dyno.stats()['dropped_samples'] != dropped_before:
                 raise RuntimeError('dynamometer sample queue overflow')
             line = ui.poll()
@@ -133,15 +135,21 @@ def run(motor, dyno, ui, args, result):
                 recorder.cutoff = min(recorder.cutoff, time.perf_counter())
                 result['reason'] = 'operator_stop'
                 break
-            applied = ramp_torque(now-recorder.origin, args.torque)
+            new_feedback = ramp.update(state.received_at, now)
+            applied = ramp_torque(ramp.elapsed, args.torque)
+            # 正常截止仍是名义斜坡终点；等回包时保留该段实测数据。
+            complete = new_feedback and ramp.elapsed >= RAMP_DURATION_S
+            recorder.cutoff = recorder.origin + RAMP_DURATION_S + ramp.paused
+            if not complete:
+                recorder.cutoff += max(0.0, now-ramp.last_at)
             motor.set_mit(MitCommand(torque=applied))
             recorder.command(time.perf_counter(), applied)
             collect()
-            if now >= recorder.cutoff:
+            if complete:
                 result['reason'] = 'completed'
                 break
             if now >= next_display:
-                ui._panel = (f'ID={args.id}  扭矩爬升 {now-recorder.origin:.2f}/{RAMP_DURATION_S:g} s\n'
+                ui._panel = (f'ID={args.id}  扭矩爬升 {ramp.elapsed:.2f}/{RAMP_DURATION_S:g} s\n'
                     f'下发目标 {applied:+.4f}/{args.torque:+g}  阻尼电源 {args.voltage:g} V / {args.current:g} A\n'
                     f'电机 {state.torque:+.4f}  {state.velocity:+.3f} rad/s\n'
                     f'测功机 {ds.torque:+.4f} Nm  {ds.speed:.3f} rad/s\n'
@@ -224,7 +232,7 @@ def main(argv=None, *, output_dir, quiet=False):
         try:
             if csv_path.exists():
                 append_smoothed_columns(csv_path, SMOOTH_WINDOW_S, SMOOTH_WINDOW_S,
-                                        FEEDBACK_TIMEOUT_S, SMOOTH_WINDOW_S, SMOOTH_WINDOW_S,
+                                        SAMPLE_MAX_GAP_S, SMOOTH_WINDOW_S, SMOOTH_WINDOW_S,
                                         output_columns=OUTPUT_COLUMNS)
                 pack_streams(csv_path, align_motor=True)
         except Exception as exc:
@@ -234,4 +242,5 @@ def main(argv=None, *, output_dir, quiet=False):
         if not quiet:
             print(f'Test result: {result["reason"]}\nCSV: {csv_path}')
     return {'reason': result['reason'], 'csv': str(csv_path),
+            'capture_duration_s': recorder.cutoff - recorder.origin,
             'config': {k: v for k, v in globals().items() if k.isupper()}, 'arguments': vars(args)}

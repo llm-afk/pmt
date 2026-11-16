@@ -397,7 +397,7 @@ class Canable:
 
     def _record_transient(self, frame, now):
         # Low-counter form/stuff/CRC reports are not feedback or ACKs. During
-        # periodic operation, the real 100 ms feedback guard decides continuity.
+        # periodic operation, the runtime's per-node feedback deadline decides continuity.
         # The firmware-specific CRC ID comes from Elmue candlelight_def.h and
         # buf_store_error(), where ERID_CRC_Error is 0x200 in legacy mode too.
         if not (frame.is_error and not frame.is_fd and not frame.brs

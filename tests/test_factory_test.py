@@ -52,6 +52,16 @@ class FactoryTests(unittest.TestCase):
         self.assertEqual(report.metric('error',5,hi=5)['status'],'PASS')
 
 
+    def test_kt_report_uses_logged_sample_gap_and_actual_capture_window(self):
+        result = dict(config=dict(RAMP_DURATION_S=.2, SAMPLE_MAX_GAP_S=.1,
+                                  MOTOR_FEEDBACK_TIMEOUT_S=1.), capture_duration_s=.8)
+        summary = dict(target_torque=10, stages={'kt': {'result': result}})
+        rows = [dict(time_ms=i*10, motor_torque=i, motor_application_target_torque=i/8,
+                     dyno_torque_smooth_nm=i/8) for i in range(81)]
+        self.assertEqual(len(report.kt_target_curve(rows, summary)[0]), 81)
+        with self.assertRaisesRegex(ValueError, '覆盖不足'):
+            report.kt_target_curve(rows[:10] + rows[-10:], summary)
+
     def args(self): return NS(id=1,serial='adapter',torque=30)
 
     def stages(self):

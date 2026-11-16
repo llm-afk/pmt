@@ -93,7 +93,8 @@ def metric(label, value, unit='', lo=None, hi=None, precision=3):
 def kt_target_curve(rows, summary):
     """新CSV用实际下发目标；旧数据只能按已保存的斜坡参数重建理论目标。"""
     # 旧格式确实没有这一列；新格式的空列意味着记录缺失，不能用理论值代替。
-    config = summary['stages']['kt'].get('result', {}).get('config', {})
+    result = summary['stages']['kt'].get('result', {})
+    config = result.get('config', {})
     estimated = 'motor_application_target_torque' not in rows[0]
     if estimated and 'motor_application_target_torque' in config.get('OUTPUT_COLUMNS', ()):
         raise ValueError('KT采集配置要求记录实际下发目标，CSV缺少该列')
@@ -135,11 +136,14 @@ def kt_target_curve(rows, summary):
     if all(x == points[0][0] for x, _ in points):
         raise ValueError('KT有效数据中目标扭矩未变化，无法评价扭矩斜坡')
     # 只用本件采集时保存的时间参数检查覆盖，不给历史文件套用推测的采样率。
-    if 'RAMP_DURATION_S' in config and 'FEEDBACK_TIMEOUT_S' in config:
-        allowed_ms = 1000 * config['FEEDBACK_TIMEOUT_S']
-        end_ms = 1000 * duration
+    max_gap = config.get('SAMPLE_MAX_GAP_S', config.get('FEEDBACK_TIMEOUT_S'))
+    if 'RAMP_DURATION_S' in config and max_gap is not None:
+        allowed_ms = 1000 * max_gap
+        end_ms = 1000 * result.get('capture_duration_s', duration)
+        if not math.isfinite(end_ms) or end_ms <= 0:
+            raise ValueError('KT实际采集时长记录无效')
         if not math.isfinite(allowed_ms) or allowed_ms <= 0:
-            raise ValueError('KT反馈时限记录无效')
+            raise ValueError('KT采样间隔上限记录无效')
         if min(times) < 0 or max(times) > end_ms + 1e-6:
             raise ValueError('KT有效样本超出本次记录的斜坡时间范围')
         times.extend((0.0, end_ms))
@@ -147,7 +151,7 @@ def kt_target_curve(rows, summary):
         left, right = max(pairwise(times), key=lambda interval: interval[1] - interval[0])
         if right - left > allowed_ms + 1e-6:
             raise ValueError(f'KT斜坡配对数据覆盖不足：{left:.1f}～{right:.1f} ms 无样本'
-                             f'（本次反馈时限 {allowed_ms:g} ms）')
+                             f'（本次采样间隔上限 {allowed_ms:g} ms）')
     return points, estimated
 
 

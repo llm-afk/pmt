@@ -40,9 +40,9 @@ class RecordingTests(unittest.TestCase):
         progress.loading_at = 10
         frames = CurveRecorder(csv.writer(output), progress, .1)
         frames.add_dyno([SimpleNamespace(received_at=10, torque=1, speed=2, power=2)])
-        frames.record([feedback(10.001, 1), feedback(10.002, 2), feedback(10.003, 3)])
+        frames.record([feedback(10.001, 1), feedback(10.002, 2), feedback(10.003, 3)], now=10.003)
         frames.add_dyno([SimpleNamespace(received_at=10.004, torque=4, speed=2, power=8)])
-        frames.record([])
+        frames.record([], now=10.004)
         frames.finish(10.004)
         rows = list(csv.reader(io.StringIO(output.getvalue())))
         self.assertEqual([float(row[0]) for row in rows], [0, 1, 2, 3, 4])
@@ -58,11 +58,21 @@ class RecordingTests(unittest.TestCase):
         states = [feedback(t, i) for i, t in enumerate([9.9, 10.01, 10.05, 10.111, 10.12])]
         frames.add_dyno([SimpleNamespace(received_at=s.received_at-.001, torque=0, speed=0, power=0)
                         for s in states])
-        self.assertTrue(frames.record(states))
+        self.assertTrue(frames.record(states, now=10.12))
         self.assertEqual(frames.count, 6)
         self.assertAlmostEqual(float(writer.writerow.call_args.args[0][0]), 111)
-        frames.record([feedback(10.2, 99)])
+        frames.record([feedback(10.2, 99)], now=10.2)
         self.assertEqual(frames.count, 6)
+
+    def test_stale_batch_is_recorded_but_cannot_confirm_stall(self):
+        progress = app.Progress(0)
+        progress.loading_at = 10.
+        frames = CurveRecorder(Mock(), progress, .1)
+        old = [feedback(10 + i * .01, 0) for i in range(16)]
+        self.assertFalse(frames.record(old, now=10.5))
+        self.assertFalse(frames.record([feedback(10.5, 0)], now=10.5))
+        self.assertTrue(frames.record([feedback(10.55, 0), feedback(10.601, 0)], now=10.602))
+        self.assertEqual(frames.motor_count, len(old) + 3)
 
     def test_usb_batch_preserves_all_dyno_points_at_same_time(self):
         writer = Mock()
@@ -71,7 +81,7 @@ class RecordingTests(unittest.TestCase):
         frames = CurveRecorder(writer, progress, .1)
         frames.add_dyno([SimpleNamespace(received_at=10.01, torque=i, speed=2, power=2*i)
                         for i in range(5)])
-        frames.record([feedback(10.02, 20)])
+        frames.record([feedback(10.02, 20)], now=10.02)
         frames.finish(10.02)
         rows = [call.args[0] for call in writer.writerow.call_args_list]
         self.assertEqual([row[1] for row in rows[:5]], list(range(5)))

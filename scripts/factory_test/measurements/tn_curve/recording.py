@@ -51,7 +51,7 @@ class CurveRecorder:
             else:
                 self.dyno_count += 1
 
-    def record(self, motor_states):
+    def record(self, motor_states, *, now):
         """每路实际帧均保留；等待两路时间进度，防止跨批次排序倒退。"""
         if self.finished:
             return True
@@ -60,7 +60,7 @@ class CurveRecorder:
             origin = self.progress.loading_at
             if origin is None or motor.received_at < origin:
                 continue
-            if self.progress.update(motor):
+            if self.progress.update(motor) and now - motor.received_at <= self.max_age:
                 self.finish(motor.received_at)
                 return True
         self._flush(min(self.latest.values()))

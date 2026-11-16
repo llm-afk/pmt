@@ -36,7 +36,7 @@ with Bench(transport=Canable(CANABLE_SERIAL), motor_ids=[1]) as bench:
         for _ in range(100):
             j1.set_mit(MitCommand(position=0, velocity=0, torque=0, kp=0, kd=0))
             time.sleep(0.01)    # 应用 100 Hz 更新，通信目标 1000 Hz
-        print(j1.state(max_age=0.1))  # 返回新鲜缓存；无反馈/过期则抛错
+        print(j1.state())  # 返回新鲜缓存；无反馈/过期则抛错
         print(j1.stats())
         j1.disable()            # 停止本电机周期发送，再发 SDO 并等待 ACK
 ```
@@ -52,8 +52,10 @@ with Bench(transport=Canable(CANABLE_SERIAL), motor_ids=[1]) as bench:
 - 上层只更新完整 `MitCommand`，不会排队堆积过期目标。默认每 250 ms 内需调用一次 `set_mit()`。
 - 目标租约到期，停止该电机周期发送并尝试发送不等 ACK 的失能。再次更新不会偷偷重新使能。
 - 调度落后时跳过已错过周期，不以补发突发流量追赶。每个电机默认最多保留 4 个未收到反馈的请求额度。
-  此额度是基于接收计数的流量限制，不是协议事务号；TPDO5 无序号，不能严格匹配单条请求。
-- 连续反馈跟不上 100 ms、CAN 错误或 USB 异常会停止运行时，尝试失能已操作的电机并将异常暴露给上层。
+  每收到本节点一帧真实 TPDO5，先归还一个占用额度，最低减至零。TPDO5 没有事务序号，因此这个计数只能估算在途数量。
+  如果本节点连续 4 帧反馈均无电机错误，且每次归还后仍有欠额，则额外释放一个额度，让此前零散漏收的反馈逐步退出计数。
+  这次额外释放只影响发送额度。无新反馈时最多用完现有额度（默认 4 次），上位机随后等候反馈，不通过超时探发或重放旧目标补额度。
+- 等待电机回包期间，自该节点最后一帧有效 TPDO5 起满 1 秒仍无新状态，运行时报告通信中断，并尝试失能。USB 发送回显、其他节点的回包和总线诊断帧均不会延后该截止时间。明确的严重总线或 USB 故障单独处理。
 - 使能/失能为低频同步操作，由同一 I/O 线程执行；使能等待 TPDO5，失能等待 SDO ACK，期间其他周期发送暂缓。
   不要把使能/失能放在 1 kHz 控制循环里。需要无扰动并发 SDO 时应另行扩展非阻塞事务状态机。
 - 运行时退出会尝试失能本运行时操作过的电机，再归还总线。确认失败会出现在统计的 fault 中；
@@ -78,7 +80,8 @@ with Bench(transport=Canable(CANABLE_SERIAL), motor_ids=[1]) as bench:
 ## 可观察指标
 
 `stats()` 包括 `target_hz`、`actual_tx_hz`、`tx_count`、`rx_count`、`enabled`、`skipped_periods`、
-`max_lateness_s`、`feedback_limited_periods`、`periodic_active`、`fault`。
+`max_lateness_s`、`feedback_limited_periods`、`feedback_credit_reconciliations`、`periodic_active`、`fault`。
+`feedback_credit_reconciliations` 统计额外释放额度的次数。定位故障时结合 `inflight`、`rx_count` 和最后反馈时间查看。
 实际频率由首末周期 USB 写完成时间估算，不是 CAN 分析仪的线上位级测量。
 `rx_count` 统计运行时常规接收路径的状态；SDO 等待期间分发的状态不计入该计数。
 `periodic_active` 仅指主机发送状态，不代表电机功率级状态。

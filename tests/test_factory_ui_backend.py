@@ -298,6 +298,7 @@ class ManualTests(unittest.TestCase):
         config=StationConfig(adapter_sn='adapter')
         session=ManualSession(config,None,lambda *_:None)
         bench=Mock()
+        bench.start.return_value.motor.return_value.state.side_effect=lambda **_:NS(received_at=time.perf_counter())
         bench.motor.return_value.read_serial_bytes.return_value=b'C2KNEE0STDXC01112610280001\0\0'
         with patch('scripts.factory_test.manual_control.Canable'), \
              patch('scripts.factory_test.manual_control.Bench',return_value=bench) as factory, \
@@ -317,6 +318,37 @@ class ManualTests(unittest.TestCase):
         channel.enable.assert_not_called()
         self.assertEqual(config.model,'221')  # 不修改固定工位的产品选择。
 
+    def test_debug_monitor_waits_for_first_new_frame_for_one_second(self):
+        for delay in (.6, 1.1):
+            with self.subTest(delay=delay):
+                clock = [0.]
+                bench = Mock()
+                channel = bench.start.return_value.motor.return_value
+                session = ManualSession(StationConfig(adapter_sn='adapter'), 1, lambda *_: None)
+                bench.motor.return_value.read_serial_bytes.return_value = b''
+                def state(*, max_age):
+                    self.assertEqual(max_age, 1.)
+                    if clock[0] < delay:
+                        return NS(received_at=-.01)  # 监视前留下的帧不能建立连接
+                    return NS(received_at=clock[0])
+                channel.state.side_effect = state
+                def wait(dt):
+                    clock[0] += dt
+                    return False
+                with patch('scripts.factory_test.manual_control.Canable'), \
+                     patch('scripts.factory_test.manual_control.Bench', return_value=bench), \
+                     patch('scripts.factory_test.manual_control.Maintenance.read', return_value=245), \
+                     patch('scripts.factory_test.manual_control.time.perf_counter', lambda: clock[0]), \
+                     patch.object(session.stop, 'wait', wait):
+                    if delay < 1:
+                        self.assertIs(session._open_hardware()[1], channel)
+                        self.assertLess(clock[0], 1.)
+                    else:
+                        with self.assertRaisesRegex(TimeoutError, '1 s'):
+                            session._open_hardware()
+                        bench.close.assert_called_once()
+                channel.enable.assert_not_called()
+
     def test_unknown_hardware_blocks_zero_and_calibration(self):
         session=ManualSession(StationConfig(),1,lambda *_:None)
         session.connected=True
@@ -329,6 +361,7 @@ class ManualTests(unittest.TestCase):
         for hardware in ('0223','1229','0220'):
             session=ManualSession(StationConfig(adapter_sn='adapter'),7,lambda *_:None)
             bench=Mock()
+            bench.start.return_value.motor.return_value.state.side_effect=lambda **_:NS(received_at=time.perf_counter())
             bench.motor.return_value.read_serial_bytes.return_value=('0'*12+hardware+'0'*10).encode()+b'\0\0'
             with patch('scripts.factory_test.manual_control.Canable'), \
                  patch('scripts.factory_test.manual_control.Bench',return_value=bench), \

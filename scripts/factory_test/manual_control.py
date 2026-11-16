@@ -10,7 +10,7 @@ import tkinter as tk
 from tkinter import ttk
 
 from motor_platform import Bench, Canable, MitCommand
-from motor_platform.runtime import RuntimeShutdownError
+from motor_platform.runtime import MOTOR_FEEDBACK_TIMEOUT_S, RuntimeShutdownError
 from .version import VERSION_LABEL
 from .maintenance import Maintenance
 from .station_config import hardware_parts, hardware_torque_limit
@@ -27,6 +27,7 @@ class ManualSession:
         self.connected = self.enabled = False
         self.target = MitCommand()
         self._pending_target = MitCommand()
+        self._pending_at = 0.0
         self._target_lock = threading.Lock()
         self.maintenance_busy = False
         self.firmware = '模拟' if config.simulation else '—'
@@ -88,7 +89,9 @@ class ManualSession:
         if self.stop.is_set():
             raise RuntimeError('调试连接正在退出')
         with self._target_lock:
-            self._pending_target=command
+            if self._pending_target != command:
+                self._pending_target = command
+                self._pending_at = time.perf_counter()
 
     def disconnect(self):
         self.stop.set()
@@ -131,17 +134,20 @@ class ManualSession:
                     self.profile_known=sn[13] in ('1','2')  # Only the chip platform selects maintenance protocol.
             self.firmware=str(Maintenance.read(bench,self.node,0x2100,2))
             channel=bench.start(rate_hz=1000,command_timeout=.25).motor(self.node)
+            monitor_start = time.perf_counter()
             channel.monitor()
-            deadline=time.perf_counter()+.25
+            deadline = monitor_start + MOTOR_FEEDBACK_TIMEOUT_S
             while True:
                 try:
-                    channel.state(max_age=.2)
-                    break
+                    if channel.state(max_age=MOTOR_FEEDBACK_TIMEOUT_S).received_at >= monitor_start:
+                        break
                 except TimeoutError:
                     if time.perf_counter() >= deadline:
                         raise
-                    if self.stop.wait(.005):
-                        raise InterruptedError('调试连接已取消')
+                if time.perf_counter() >= deadline:
+                    raise TimeoutError(f'调试连接在 {MOTOR_FEEDBACK_TIMEOUT_S:g} s 内未收到电机新反馈')
+                if self.stop.wait(.005):
+                    raise InterruptedError('调试连接已取消')
             log_event('debug.monitor.started',node_id=self.node,target_hz=1000,
                       request_can_id=hex(0x100+self.node),feedback_can_id=hex(0x190+self.node),
                       neutral_target=asdict(MitCommand()),statistics=channel.stats())
@@ -262,16 +268,14 @@ class ManualSession:
                 dt, previous = min(.05, now-previous), now
                 if self.stop.is_set():
                     break
-                requested=self.pending_target
+                with self._target_lock:
+                    requested, requested_at = self._pending_target, self._pending_at
                 if requested!=last_pending:
                     requested_fields = asdict(requested)
                     log_event('debug.target.pending',target=requested_fields,enabled=self.enabled)
                     last_pending=requested
-                self.target=requested if self.enabled else neutral
                 if channel is not None:
-                    if self.enabled:
-                        channel.set_mit(self.target)
-                    state = channel.state(max_age=.2)
+                    state = channel.state(max_age=MOTOR_FEEDBACK_TIMEOUT_S)
                     statistics=channel.stats()
                     if statistics['fault']:
                         raise RuntimeError(statistics['fault'])
@@ -283,7 +287,11 @@ class ManualSession:
                         last_error=state.error_code
                     if state.error_code and self.enabled:
                         raise RuntimeError(f'驱动器错误 0x{state.error_code:04X}')
-                    if state.received_at == last_rx:
+                    if self.enabled:
+                        if state.received_at > last_rx and state.received_at >= requested_at:
+                            self.target = requested
+                        channel.set_mit(self.target)  # 即使没有新帧，也要刷新当前指令的租约。
+                    if state.received_at <= last_rx:
                         continue
                     last_rx = state.received_at
                     sample = dict(at=state.received_at, position=state.position,
@@ -291,6 +299,7 @@ class ManualSession:
                                   motor_temperature=state.motor_temperature,board_temperature=state.board_temperature,
                                   error_code=state.error_code)
                 else:
+                    self.target = requested if self.enabled else neutral
                     force = ((self.target.torque + self.target.kp*(self.target.position-p)
                               + self.target.kd*(self.target.velocity-v)) if self.enabled else 0.0)
                     v += (force*4-.8*v)*dt
@@ -298,7 +307,8 @@ class ManualSession:
                     p += v*dt
                     sample = dict(at=now, position=p, velocity=v, torque=force,motor_temperature=25.0,board_temperature=26.0)
                 sample['target'] = requested_fields
-                sample['sent_target'] = requested_fields if self.enabled else neutral_fields
+                sample['sent_target'] = (neutral_fields if not self.enabled else
+                                         requested_fields if self.target == requested else asdict(self.target))
                 sample['enabled'] = self.enabled
                 last_sample = sample
                 if not recent or sample['at']-recent[-1]['at']>=.1:

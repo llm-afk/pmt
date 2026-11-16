@@ -3,6 +3,28 @@ from contextlib import contextmanager
 import sys
 
 
+SAMPLE_MAX_GAP_S = 0.1  # 采集连续性和平滑分段阈值，独立于电机断线时间。
+
+
+class FeedbackClock:
+    """Advance a load ramp only across observed, continuous motor feedback."""
+    def __init__(self, start):
+        self.last_at = start
+        self.elapsed = 0.0
+        self.paused = 0.0
+
+    def update(self, received_at, now):
+        if received_at <= self.last_at or now - received_at > SAMPLE_MAX_GAP_S:
+            return False
+        gap = received_at - self.last_at
+        self.last_at = received_at
+        if gap <= SAMPLE_MAX_GAP_S:
+            self.elapsed += gap
+        else:
+            self.paused += gap
+        return True
+
+
 @contextmanager
 def record_shutdown_failure(action):
     """Attach an unconfirmed stop to the error that will actually reach the station."""

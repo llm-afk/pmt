@@ -24,6 +24,7 @@ class Stats:
     rx_count: int = 0
     skipped_periods: int = 0
     feedback_limited_periods: int = 0
+    feedback_credit_reconciliations: int = 0
     max_lateness_s: float = 0.0
     max_tx_gap_s: float = 0.0
     max_rx_gap_s: float = 0.0
@@ -54,6 +55,12 @@ class MotorFeedbackTimeout(TimeoutError):
         self.diagnostic_context = dict(snapshot, feedback_limit_ms=limit*1000)
 
 
+# TPDO5 has no request sequence number. Allow at most one extra send credit per
+# four healthy replies while the window has stayed occupied throughout.
+CREDIT_RECONCILE_REPLIES = 4
+MOTOR_FEEDBACK_TIMEOUT_S = 1.0
+
+
 class MotorChannel:
     """One named motor instance. Targets are immutable and replaced atomically."""
     def __init__(self, runtime, name, motor, rate_hz):
@@ -66,7 +73,9 @@ class MotorChannel:
         self._monitoring = False
         self._expires = self._next = 0.0
         self._inflight = 0
+        self._replies_with_debt = 0
         self._last_rx = 0.0
+        self._idle_request_at = 0.0
         self._gap_anchor = None
         self._stats = Stats()
         self._disable_receipt = None
@@ -110,7 +119,7 @@ class MotorChannel:
             self._source, self._on_sent = source, on_sent
             self._expires = time.perf_counter() + self._runtime.command_timeout
 
-    def enable(self, timeout=0.1):
+    def enable(self, timeout=MOTOR_FEEDBACK_TIMEOUT_S):
         """Send the neutral enabling RPDO; start periodic TX after TPDO feedback.
 
         Resets prior target to neutral. Call set_mit after enable, then keep refreshing it.
@@ -157,15 +166,28 @@ class MotorChannel:
         """
         return self._runtime._call(self, 'monitor', 0.1)
 
-    def state(self, max_age=0.1):
+    def state(self, max_age=MOTOR_FEEDBACK_TIMEOUT_S):
         positive(max_age)
         with self._runtime._lock:
             self._runtime._check()
             state = self._motor.last_state
-            if state is None or time.perf_counter() - state.received_at > max_age:
+            if state is None or time.perf_counter() - state.received_at >= max_age:
                 raise MotorFeedbackTimeout(f"{self.name}: motor feedback absent or stale",
                                            self.diagnostic_snapshot(), max_age)
             return state
+
+    def _account_feedback(self, state):
+        # Called only for a decoded TPDO5 for this channel, under the worker lock.
+        # A missing historical reply otherwise occupies a slot for the entire run.
+        self._inflight = max(0, self._inflight - 1)
+        if not self._inflight or state.error_code or not (self._active or self._monitoring):
+            self._replies_with_debt = 0
+            return
+        self._replies_with_debt += 1
+        if self._replies_with_debt == CREDIT_RECONCILE_REPLIES:
+            self._inflight -= 1
+            self._stats.feedback_credit_reconciliations += 1
+            self._replies_with_debt = 0
 
     def start_recording(self, capacity=8192):
         """应用可选逐帧记录；必须在使能前调用，不改变 CAN 发送频率。"""
@@ -274,6 +296,7 @@ class ControlRuntime:
                 if not channel._monitoring and not channel._active:
                     channel._next = channel._last_rx = time.perf_counter()
                     channel._inflight = 0
+                    channel._replies_with_debt = 0
                     channel._gap_anchor = None
                 channel._monitoring = True
             return
@@ -289,6 +312,7 @@ class ControlRuntime:
                     channel._expires = time.perf_counter() + self.command_timeout
                     channel._next = time.perf_counter()
                     channel._inflight = 0
+                    channel._replies_with_debt = 0
                     channel._gap_anchor = None
                     channel._last_rx = time.perf_counter()
                     channel._active = True
@@ -301,6 +325,7 @@ class ControlRuntime:
                     channel._source = channel._on_sent = None
                     channel._next = channel._last_rx = time.perf_counter()
                     channel._inflight = 0
+                    channel._replies_with_debt = 0
         except BaseException as exc:
             with self._lock: channel._stats.fault = repr(exc)
             channel._motor.disable(wait_ack=False)
@@ -317,13 +342,16 @@ class ControlRuntime:
                     expired = True
                 else:
                     expired = False
-                    if now < channel._next: continue
-                    if channel._inflight >= self.max_inflight:
+                    full = channel._inflight >= self.max_inflight
+                    if full and now >= channel._next:
                         channel._stats.feedback_limited_periods += 1
+                    waiting_since = max(channel._last_rx, channel._idle_request_at)
+                    if channel._inflight and now - waiting_since >= MOTOR_FEEDBACK_TIMEOUT_S:
+                        raise MotorFeedbackTimeout(f"{channel.name}: no valid motor feedback for 1 s",
+                                                   channel.diagnostic_snapshot(), MOTOR_FEEDBACK_TIMEOUT_S)
+                    if now < channel._next: continue
+                    if full:
                         channel._next = now + 1/channel._rate_hz
-                        if now-channel._last_rx > 0.1:
-                            raise MotorFeedbackTimeout(f"{channel.name}: feedback not keeping up for 100 ms",
-                                                       channel.diagnostic_snapshot(), 0.1)
                         continue
                     target, due, period = channel._target, channel._next, 1/channel._rate_hz
                     source, on_sent = (channel._source, channel._on_sent) if controlling else (None, None)
@@ -356,6 +384,10 @@ class ControlRuntime:
                 stats.max_source_s = max(stats.max_source_s, write_started-generated)
                 stats.max_usb_write_s = max(stats.max_usb_write_s, sent-write_started)
                 stats.tx_count += 1
+                # At intentionally slow poll rates, time spent idle before a request
+                # is not time spent waiting for its response.
+                if not channel._inflight and (not channel._last_rx or period >= MOTOR_FEEDBACK_TIMEOUT_S):
+                    channel._idle_request_at = sent
                 channel._inflight += 1
                 stats.skipped_periods += elapsed_periods-1
                 stats.max_lateness_s = max(stats.max_lateness_s, sent-due)
@@ -392,12 +424,12 @@ class ControlRuntime:
                 if state is not None:
                     with self._lock:
                         channel = self._by_id[state.node_id]
-                        received = time.perf_counter()
+                        received = state.received_at
                         if channel._stats.rx_count:
                             channel._stats.max_rx_gap_s = max(channel._stats.max_rx_gap_s, received-channel._last_rx)
                         channel._stats.rx_count += 1
-                        channel._inflight = max(0, channel._inflight-1)
-                        channel._last_rx = time.perf_counter()
+                        channel._account_feedback(state)
+                        channel._last_rx = received
         except BaseException as exc:
             self._error = exc
         finally:

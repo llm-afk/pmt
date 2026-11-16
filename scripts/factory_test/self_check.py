@@ -443,7 +443,9 @@ def run(destination):
             control.samples.clear();control.plot.reset()
             bench=Mock()
             bench.motor.return_value.read_serial_bytes.return_value=b'C2KNEE0STDXC02232609260065\0\0'
-            bench.start.return_value.motor.return_value.stats.return_value={}
+            debug_channel = bench.start.return_value.motor.return_value
+            debug_channel.stats.return_value = {}
+            debug_channel.state.side_effect = lambda **_: SimpleNamespace(received_at=time.perf_counter())
             manual=ManualSession(StationConfig(adapter_sn='self-check-no-usb'),3,lambda *_:None)
             with patch('scripts.factory_test.manual_control.Bench',return_value=bench), \
                  patch('scripts.factory_test.manual_control.Maintenance.read',return_value=245):

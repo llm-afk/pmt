@@ -99,6 +99,34 @@ class ConsistencyTests(unittest.TestCase):
         self.assertEqual(motor.commands[-1][1], 0)
         self.assertLess(clock[0], 100.08)
 
+    def test_short_feedback_loss_holds_torque_and_extends_capture_without_replay(self):
+        clock, events, result = [100.], [], {}
+        motor, dyno = FakeMotor(clock, events), FakeDyno(clock)
+        last = [clock[0]]
+        def feedback(*, max_age):
+            self.assertEqual(max_age, 1.)
+            if not 100.1 < clock[0] < 100.7:
+                last[0] = clock[0]
+            return state(last[0])
+        motor.state = feedback
+        motor.drain_states = lambda: [] if last[0] < clock[0] else [state(last[0])]
+        ui = NS(app=NS(invalidate=lambda: None), poll=lambda: None)
+        def sleep(dt):
+            clock[0] += dt
+        dyno.state = Mock(wraps=dyno.state)
+        with patch.object(app.time, 'perf_counter', lambda: clock[0]), patch.object(app.time, 'sleep', sleep), \
+             patch.object(app, 'RAMP_DURATION_S', .2), patch.object(app, 'STOP_RAMP_S', .01), \
+             patch.object(app, 'TARGET_UPDATE_S', .02):
+            app.run(motor, dyno, ui, self.args(), result)
+        self.assertEqual(result['reason'], 'completed')
+        self.assertGreater(result['recorder'].cutoff, 100.7)
+        held = [torque for at, torque in motor.commands if 100.1 < at < 100.7]
+        self.assertGreater(len(held), 20)  # 应用仍在持续刷新租约
+        self.assertEqual(len(set(held)), 1)
+        first_after = next(torque for at, torque in motor.commands if at >= 100.7)
+        self.assertEqual(first_after, held[-1])
+        self.assertTrue(all(c.kwargs['max_age'] == .1 for c in dyno.state.call_args_list))
+
     def test_motor_disable_loss_marks_failure_even_if_ramp_succeeded(self):
         motor=Mock()
         failure=TimeoutError('SDO timed out')

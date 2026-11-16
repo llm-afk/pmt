@@ -337,6 +337,45 @@ class DebugMonitoringTests(unittest.TestCase):
         bench.close.assert_called_once()
         bench.start.assert_called_once()
 
+    def test_debug_gap_renews_only_previous_target_until_new_feedback(self):
+        session, bench, channel = self.make_session()
+        session.set_target(MitCommand(torque=2))
+        held, frozen_at = threading.Event(), [0.]
+        def state(*, max_age):
+            self.assertEqual(max_age, 1.)
+            return NS(received_at=frozen_at[0] if held.is_set() else time.perf_counter(),
+                      error_code=0, position=0, velocity=0, torque=0,
+                      motor_temperature=25, board_temperature=25)
+        channel.state.side_effect = state
+        samples = []
+        session.emit = lambda k, v: samples.append(v) if k == 'control_sample' else None
+        with patch.object(session, '_open_hardware', return_value=(bench, channel)):
+            session.start()
+            try:
+                wait_for(lambda: session.connected)
+                session.command('enable')
+                wait_for(lambda: channel.set_mit.called)
+                frozen_at[0] = time.perf_counter()
+                held.set()
+                wait_for(lambda: samples and samples[-1]['at'] == frozen_at[0])
+                before = channel.set_mit.call_count
+                sample_count = len(samples)
+                session.set_target(MitCommand(torque=3))
+                wait_for(lambda: channel.set_mit.call_count >= before + 3)
+                self.assertEqual(len(samples), sample_count)
+                self.assertTrue(all(c.args[0].torque == 2 for c in channel.set_mit.call_args_list[before:]))
+                # 此帧虽晚于上帧且尚未被 UI 消费，却早于滑块改动。
+                frozen_at[0] = (frozen_at[0] + session._pending_at) / 2
+                wait_for(lambda: samples[-1]['at'] == frozen_at[0])
+                self.assertEqual(samples[-1]['target']['torque'], 3)
+                self.assertEqual(samples[-1]['sent_target']['torque'], 2)
+                self.assertEqual(channel.set_mit.call_args.args[0].torque, 2)
+                held.clear()
+                wait_for(lambda: channel.set_mit.call_args.args[0].torque == 3)
+            finally:
+                session.disconnect()
+                session.thread.join(2)
+
     def test_idle_motor_loss_allows_readonly_automatic_reconnection(self):
         session,bench,channel=self.make_session()
         channel.state.side_effect=TimeoutError('motor feedback stale')
@@ -409,3 +448,108 @@ class DebugMonitoringTests(unittest.TestCase):
             session.start(); session.thread.join(2)
         self.assertFalse(session.cleanup_confirmed)
         self.assertFalse(session.reconnect_allowed)
+
+
+class IdleMotorConfirmationTests(unittest.TestCase):
+    def scan(self, samples, *, wait_removal=False):
+        from scripts.factory_test.maintenance import MotorAbsent
+        host = window()
+        host.credential_error = ''
+        host.saved_credentials = dict(sn_api_key='offline-only')
+        host.start_requested = host.resume_requested = False
+        host.diagnostics.current.context = dict(connection_id='same-connection')
+        host.diagnostics.observe.return_value = host.diagnostics.current
+        host.adapter_devices = [dict(serial_number='chosen', path='usb-path')]
+        ready = {name: dict(state='READY', detail='ready') for name in ('can','dyno','power','printer')}
+        host.health_states = ready
+        host.device_health.check.return_value = ready
+        host.device_health.printer.poll.return_value = ready['printer']
+        if wait_removal:
+            host.latch.completed()
+        remaining = iter(samples)
+        now = [0]
+        response = [None]
+        def wait(_):
+            item = next(remaining, None)
+            if item is None:
+                return True
+            now[0], response[0], change = item
+            if change:
+                change(host)
+            return False
+        def discover(**kwargs):
+            if response[0] is False:
+                raise MotorAbsent('short probe timed out')
+            if isinstance(response[0], Exception):
+                raise response[0]
+            return dict(node_id=1, sn=host.config.base_sn)
+        host.shutdown = Mock()
+        host.shutdown.is_set.return_value = False
+        host.shutdown.wait.side_effect = wait
+        with patch('scripts.factory_test.gui.time.monotonic', side_effect=lambda:now[0]), \
+             patch('scripts.factory_test.gui.Maintenance') as maintenance, \
+             patch('scripts.factory_test.firmware_library.load_target', return_value=(None,dict(file='APP_245.bin',sha256='offline'))), \
+             patch('scripts.factory_test.gui.StationRunner') as runner:
+            maintenance.return_value.discover.side_effect = discover
+            host.controller()
+            runner.assert_not_called()
+        candidates = [value for kind,value in host.events.queue if kind == 'candidate']
+        self.assertFalse(any(call.args[0]=='controller.exception' for call in host.diagnostics.current.event.call_args_list))
+        return host, candidates
+
+    def test_short_timeout_is_confirming_and_does_not_start_the_removal_timer(self):
+        host, candidates = self.scan([(100,True,None),(100.6,False,None),
+                                     (101.2,False,None),(103.3,False,None)], wait_removal=True)
+        self.assertEqual([item['motor_probe'] for item in candidates], ['present','confirming','absent','absent'])
+        self.assertFalse(candidates[1]['present'])
+        self.assertFalse(candidates[1]['ready'])
+        self.assertTrue(candidates[2]['waiting_removal'])
+        self.assertFalse(candidates[3]['waiting_removal'])
+        self.assertEqual(host.latch.absence_seconds, 2)
+        observed = [call.args[0] for call in host.diagnostics.observe.call_args_list]
+        self.assertEqual(observed, [True,None,False,False])
+        title, hint = FactoryWindow.candidate_prompt(candidates[1])
+        self.assertIn('确认', title)
+        self.assertNotIn('检查接线', title + hint)
+
+    def test_first_probe_and_changed_context_never_reuse_presence(self):
+        changes = (
+            lambda host:setattr(host,'config_revision',host.config_revision+1),
+            lambda host:setattr(host,'mode_generation',host.mode_generation+1),
+            lambda host:setattr(host,'adapter_devices',[dict(serial_number='chosen',path='different-usb-path')]),
+        )
+        _, first = self.scan([(100,False,None)])
+        self.assertEqual(first[0]['motor_probe'], 'absent')
+        for change in changes:
+            with self.subTest(change=change):
+                _, candidates = self.scan([(100,True,None),(100.6,False,change)])
+                self.assertEqual(candidates[-1]['motor_probe'], 'absent')
+        _, paused = self.scan([(100,True,None),(100.3,None,lambda host:setattr(host,'page','control')),
+                              (100.6,False,lambda host:setattr(host,'page','production'))])
+        self.assertEqual(paused[-1]['motor_probe'], 'absent')
+
+    def test_valid_response_restores_presence_but_real_errors_bypass_the_grace(self):
+        _, recovered = self.scan([(100,True,None),(100.6,False,None),(100.8,True,None)])
+        self.assertEqual([item['motor_probe'] for item in recovered], ['present','confirming','present'])
+        _, failed = self.scan([(100,True,None),(100.3,OSError('USB failed'),None),(100.6,False,None)])
+        self.assertEqual([item['motor_probe'] for item in failed], ['present','error','absent'])
+
+    def test_confirming_candidate_disables_a_previously_enabled_start_button(self):
+        host, candidates = self.scan([(100,True,None),(100.6,False,None)])
+        value = candidates[-1]
+        host.events = queue.Queue()
+        host.events.put(('candidate', value))
+        host.device_state = Mock()
+        host.show_idle_prompt = Mock()
+        host.advance_page_transition = host.advance_settings_save = host.advance_driver_install = Mock()
+        host.select_single_adapter = Mock()
+        host.ready_to_start = True
+        host.ready_identity = 'old-ready'
+        host.config_error = ''
+        host.terminal_prompt = None
+        host.next_motor = False
+        host.process_events()
+        self.assertFalse(host.ready_to_start)
+        self.assertIsNone(host.ready_identity)
+        host.stop.config.assert_called_with(text='开始测试', state='disabled')
+        host.device_state.assert_called_with('motor','CHECKING',value['motor_detail'])

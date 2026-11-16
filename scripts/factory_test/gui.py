@@ -26,6 +26,7 @@ from .service_credentials import CredentialStore, CredentialStoreError, FIELDS a
 from tkinter.scrolledtext import ScrolledText
 
 from motor_platform import Canable
+from motor_platform.runtime import MOTOR_FEEDBACK_TIMEOUT_S
 
 ROOT = Path(__file__).resolve().parents[2]
 PYTHON_DEPENDENCIES = {
@@ -1010,6 +1011,7 @@ class FactoryWindow:
         last_message = ''
         last_candidate = last_probe_key = last_station_error = None
         recent_node = None
+        last_motor_response = None
         firmware_check_at = 0
         firmware_revision = None
         firmware_issue = firmware_file = firmware_sha256 = ''
@@ -1029,6 +1031,7 @@ class FactoryWindow:
                     start_before_probe = self.start_requested
                     WindowConsole.cancelled.clear()
             if paused:
+                last_motor_response = None
                 try:
                     if not self.configuring:
                         with log_scope(self.diagnostics.current.bind(phase='hardware_handoff')):
@@ -1107,6 +1110,22 @@ class FactoryWindow:
                     if (self.configuring or revision != self.config_revision or config != self.config
                             or mode_generation != self.mode_generation or probe_latch is not self.latch):
                         continue
+                adapter_paths = tuple(item.get('path') for item in (getattr(self,'adapter_devices',None) or ())
+                                      if item.get('serial_number') == config.adapter_sn)
+                response_key = (revision, mode_generation, config.adapter_sn, adapter_paths,
+                                bool(getattr(self,'adapter_error',None)), id(probe_latch))
+                if last_motor_response and last_motor_response[0] != response_key:
+                    last_motor_response = None
+                observed_at = time.monotonic()
+                if motor_state == 'present' and not config.simulation:
+                    last_motor_response = (response_key, observed_at, detected_id)
+                elif (motor_state == 'absent' and last_motor_response
+                        and 0 <= observed_at-last_motor_response[1] < MOTOR_FEEDBACK_TIMEOUT_S):
+                    motor_state = 'confirming'
+                    detected_id = last_motor_response[2]
+                    detail = f'正在重新确认电机 ID {detected_id} 通信'
+                elif motor_state != 'absent':
+                    last_motor_response = None
                 present = motor_state == 'present'
                 if present:
                     recent_node = detected_id
@@ -1187,6 +1206,7 @@ class FactoryWindow:
                         self.latch.stable = 0
                         continue
                     self.busy = True
+                    last_motor_response = None
                 hardware_ports = {name:port for name in ('power','dyno')
                     if isinstance(port:=getattr(self.device_health,name+'_port',None),str) and port}
                 with log_scope(self.diagnostics.current.bind(phase='hardware_handoff')):
@@ -1233,6 +1253,7 @@ class FactoryWindow:
                 self.started_sessions += 1
             except BaseException as exc:
                 last_candidate = None
+                last_motor_response = None
                 changed = self.busy or str(exc) != last_message
                 if changed:
                     expected = self.station_cancelled() and isinstance(exc,InterruptedError)
@@ -1316,6 +1337,8 @@ class FactoryWindow:
             return '请检查 CAN 适配器','确认 USB 已接好。接有多只适配器时，请在工位设备中选择本工位的 CANable。'
         if probe=='multiple':
             return '请只连接一台待测电机','当前有多个节点应答，请核对工装接线。'
+        if probe=='confirming':
+            return '正在确认电机通信，请稍候','暂未收到本轮应答，正在重新识别。确认完成后可开始测试。'
         if probe=='identity_error':
             return '请检查电机连接，身份读取未完成','已收到节点应答，请检查电源和 CAN 线，等待读取电机身份。'
         if probe=='error':
@@ -1489,7 +1512,7 @@ class FactoryWindow:
                 probe=value.get('motor_probe') or ('present' if value['present'] else 'absent')
                 if probe!='station_error':
                     motor_states={'present':'SIMULATED' if self.config.simulation else 'READY','absent':'OFFLINE',
-                                  'multiple':'ERROR','identity_error':'ERROR','error':'ERROR','unavailable':'WAITING'}
+                                  'multiple':'ERROR','identity_error':'ERROR','error':'ERROR','unavailable':'WAITING','confirming':'CHECKING'}
                     detail=f'来料 ID {value["node_id"]}' if value['present'] else value.get('motor_detail') or '等待电机反馈'
                     self.device_state('motor',motor_states.get(probe,'CHECKING'),detail)
                 if kind=='motor_probe':
