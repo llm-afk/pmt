@@ -12,6 +12,7 @@ class PowerSupply:
         self._transport = transport if transport is not None else SerialScpi(port, baudrate=baudrate, timeout=timeout)
         self._lock = threading.RLock()
         self._opened = False
+        self._transport_open = False
         self.identity = None
         self._observer = observer
 
@@ -25,15 +26,16 @@ class PowerSupply:
 
     def open(self):
         with self._lock:
-            if self._opened:
-                raise RuntimeError('power supply already open')
-            self._transport.open()
+            if self._opened or self._transport_open:
+                raise RuntimeError('close the existing power supply session before opening')
+            self._transport_open = True
             try:
+                self._transport.open()
                 identity = self._transport.query('*IDN?')
                 if 'UDP6721' not in identity.upper():
                     raise PowerSupplyError(f'expected UDP6721, received {identity!r}')
             except BaseException:
-                self._transport.close()
+                self.close()
                 raise
             self.identity = identity
             self._opened = True
@@ -143,8 +145,12 @@ class PowerSupply:
     def close(self):
         """Close the serial connection. Does not switch the power output."""
         with self._lock:
-            if self._opened:
+            # Identification may have failed after the transport opened. Retain
+            # and retry that partial session too until its handle is released.
+            if self._transport_open:
                 self._transport.close()
+                self._transport_open = False
+            if self._opened:
                 self._opened = False
                 self._notify('power.connection.closed', identity=self.identity)
                 self.identity = None

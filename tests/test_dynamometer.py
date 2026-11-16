@@ -153,3 +153,106 @@ class DynamometerTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 Dynamometer(port='COM_TEST', torque_scale=scale)
         self.assertEqual(parse_frame(frame(1000, 1000), torque_scale=1000, speed_scale=10).rpm, 100)
+
+
+class DynamometerOwnershipTests(unittest.TestCase):
+    def test_serial_close_failure_retains_handle_and_blocks_reopen_until_retry(self):
+        from unittest.mock import Mock
+        stream = Mock()
+        stream.close.side_effect = OSError('USB close failed')
+        factory = Mock(return_value=stream)
+        transport = SerialStream('COM_TEST', serial_factory=factory).open()
+        with self.assertRaises(OSError):
+            transport.close()
+        self.assertIs(transport._serial, stream)
+        with self.assertRaises(RuntimeError):
+            transport.open()
+        factory.assert_called_once()
+        stream.close.side_effect = None
+        transport.close()
+        self.assertIsNone(transport._serial)
+        transport.open()
+        self.assertEqual(factory.call_count, 2)
+        transport.close()
+
+    def test_failed_worker_cleanup_blocks_new_session_and_preserves_receive_fault(self):
+        from motor_platform.components.dynamometer.client import DynamometerReleasePending
+
+        class FailingClose(Transport):
+            fail_close = True
+            def close(self):
+                if self.fail_close:
+                    raise OSError('simulated driver close failure')
+                super().close()
+
+        transport = FailingClose()
+        device = Dynamometer(port='COM_TEST', transport=transport).open()
+        replacement_transport = Transport()
+        replacement = Dynamometer(port='com_test', transport=replacement_transport)
+        try:
+            transport.incoming.put(OSError('original USB receive failure'))
+            wait_for(lambda: not device._thread.is_alive())
+            with self.assertRaises(DynamometerReleasePending):
+                device.close()
+            with self.assertRaises(RuntimeError):
+                device.open()
+            with self.assertRaises(DynamometerReleasePending):
+                replacement.open()
+            self.assertFalse(replacement_transport.opened)
+            snapshot = device.stats()
+            self.assertEqual(snapshot['receive_fault'], 'original USB receive failure')
+            self.assertEqual(snapshot['cleanup_fault'], 'simulated driver close failure')
+            self.assertTrue(snapshot['transport_open'])
+            transport.fail_close = False
+            # The new caller recovers the retained old owner before opening itself.
+            replacement.open()
+            self.assertFalse(transport.opened)
+            self.assertFalse(device.stats()['transport_open'])
+            self.assertEqual(device.stats()['receive_fault'], 'original USB receive failure')
+            self.assertIsNone(device.stats()['cleanup_fault'])
+            self.assertTrue(replacement_transport.opened)
+        finally:
+            transport.fail_close = False
+            replacement.close()
+            try:
+                device.close()
+            except RuntimeError:
+                pass  # The original receive fault remains available after release.
+
+    def test_live_reader_never_closes_concurrently_or_permits_a_second_owner(self):
+        import threading
+        from unittest.mock import patch
+        from motor_platform.components.dynamometer.client import DynamometerReleasePending
+
+        class BlockedReader(Transport):
+            def __init__(self):
+                super().__init__()
+                self.reading = threading.Event()
+                self.release = threading.Event()
+                self.closed = threading.Event()
+            def read(self):
+                self.reading.set()
+                self.release.wait(3)
+                return b''
+            def close(self):
+                self.closed.set()
+                super().close()
+
+        transport = BlockedReader()
+        device = Dynamometer(port='COM_TEST', transport=transport).open()
+        replacement_transport = Transport()
+        replacement = Dynamometer(port='COM_TEST', transport=replacement_transport)
+        try:
+            self.assertTrue(transport.reading.wait(1))
+            with patch.object(device._thread, 'join'), self.assertRaises(DynamometerReleasePending):
+                device.close()
+            self.assertFalse(transport.closed.is_set())
+            with self.assertRaises(DynamometerReleasePending):
+                replacement.open()
+            self.assertFalse(replacement_transport.opened)
+        finally:
+            transport.release.set()
+            device.close()
+        replacement.open()
+        replacement.close()
+        self.assertTrue(transport.closed.is_set())

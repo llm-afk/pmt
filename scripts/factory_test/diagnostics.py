@@ -36,6 +36,16 @@ _secret_key = re.compile(r'(?i)^(?:x[-_]?api[-_]?key|(?:(?:mes|sn|report)[-_])?a
 BODY_PREVIEW_CHARS = 16384
 
 
+def unconfirmed_cleanup_notes(notes):
+    """Select explicit stop/release failures while retaining ordinary notes in logs."""
+    markers = ('停机未确认', '失能未', '失能回执未确认', '校准停止未', '切断工装电源', '释放未确认',
+               'cleanup failed:', 'motor shutdown failed:', 'power shutdown failed:',
+               'load shutdown failed:', 'best-effort off failed:', 'power supply close failed:',
+               'disable failed', 'disable ack missing', 'disable not confirmed',
+               'serial reader did not stop', 'serial release unconfirmed')
+    return [note for note in notes if any(marker in str(note).lower() for marker in markers)]
+
+
 def response_evidence(body, headers=None):
     """Keep non-JSON/HTTP-error evidence too; bound previews, never silently truncate."""
     raw = body if isinstance(body, bytes) else str(body).encode('utf-8', errors='replace')

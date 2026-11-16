@@ -14,7 +14,7 @@ from motor_platform.runtime import RuntimeShutdownError
 from .version import VERSION_LABEL
 from .maintenance import Maintenance
 from .station_config import hardware_parts, hardware_torque_limit
-from .diagnostics import current_log, log_event, log_scope
+from .diagnostics import current_log, log_event, log_scope, unconfirmed_cleanup_notes
 from .waveform import WaveformPlot, FRAME_INTERVAL, FEEDBACK_COLOR, TARGET_COLOR
 
 
@@ -321,7 +321,7 @@ class ManualSession:
                     requested_target=asdict(self.pending_target),last_sample=last_sample,
                     recent_display_samples=list(recent),statistics=final_statistics())
             notes=list(getattr(exc,'__notes__',[]))
-            if notes:
+            if unconfirmed_cleanup_notes(notes):
                 self.cleanup_confirmed=False
             failed = '' if cancelled else '；'.join([str(exc),*notes])
         finally:

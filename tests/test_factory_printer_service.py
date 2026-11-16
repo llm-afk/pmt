@@ -231,3 +231,113 @@ class PrinterServiceTests(unittest.TestCase):
                 else: http.return_value=response
                 self.assertEqual(check_printer(self.config)[0]['state'],expected)
                 http.assert_called_once()
+
+
+class PrinterRecoveryTests(unittest.TestCase):
+    setUp=PrinterServiceTests.setUp
+
+    def exited_process(self, pid):
+        process=FakeProcess()
+        process.pid=pid
+        process.returncode=7
+        process.wait=Mock(return_value=7)
+        return process
+
+    def service(self, processes, http, notify=lambda value:None):
+        manager=LocalPrinterService(self.config,self.root,http=http,popen=Mock(side_effect=processes),
+                                    notify=notify,paths=(self.source,self.runtime))
+        manager.RESTART_DELAYS=(.001,.002,.003)
+        return manager
+
+    @staticmethod
+    def refused():
+        return URLError(ConnectionRefusedError(errno.ECONNREFUSED,'refused'))
+
+    def test_exited_owned_child_is_reaped_before_replacement_and_only_health_is_queried(self):
+        first=self.exited_process(111)
+        replacement=FakeProcess();replacement.pid=222
+        events=queue.Queue()
+        http=Mock(side_effect=[self.refused(),self.refused(),
+                              dict(data=dict(service='tsc-print-service',pid=222))])
+        manager=self.service([first,replacement],http,events.put)
+        manager.start()
+        try:
+            while events.get(timeout=3)['state']!='RUNNING': pass
+            self.assertEqual(manager.popen.call_count,2)
+            first.wait.assert_called_once()
+            self.assertTrue(first.stdout.closed)
+            self.assertIsNone(manager.error)
+            self.assertFalse(manager.stop_event.is_set())
+            self.assertTrue(all(len(call.args)==1 and call.args[0].endswith('/api/health')
+                                for call in http.call_args_list))
+        finally:
+            manager.stop();manager.thread.join(3)
+        self.assertFalse(manager.thread.is_alive())
+        self.assertTrue(replacement.closed.is_set())
+
+    def test_crash_loop_has_a_finite_restart_budget(self):
+        processes=[self.exited_process(pid) for pid in range(4)]
+        manager=self.service(processes,Mock(side_effect=self.refused()))
+        manager.run()
+        self.assertEqual(manager.popen.call_count,4)
+        self.assertIn('自动重启次数已用完',manager.error)
+        self.assertTrue(all(process.stdout.closed for process in processes))
+        self.assertIsNone(manager.process)
+
+    def test_stop_during_backoff_prevents_replacement(self):
+        events=[]
+        def notify(value):
+            events.append(value)
+            if value['state']=='RESTARTING': manager.stop()
+        manager=self.service([self.exited_process(1)],Mock(side_effect=self.refused()),notify)
+        manager.run()
+        self.assertEqual(manager.popen.call_count,1)
+        self.assertTrue(manager.stop_event.is_set())
+        self.assertTrue(any(event['state']=='RESTARTING' for event in events))
+
+    def test_external_service_or_uncertain_port_after_crash_prevents_replacement(self):
+        for answer in (dict(data=dict(service='other',pid=999)),URLError(TimeoutError('busy'))):
+            with self.subTest(answer=answer):
+                manager=self.service([self.exited_process(1)],Mock(side_effect=[self.refused(),answer]))
+                manager.run()
+                self.assertEqual(manager.popen.call_count,1)
+                if isinstance(answer,dict): self.assertTrue(manager.external)
+                else: self.assertIsNotNone(manager.error)
+
+    def test_live_child_with_wrong_health_identity_is_closed_without_restart(self):
+        process=FakeProcess()
+        http=Mock(side_effect=[self.refused(),dict(data=dict(service='tsc-print-service',pid=999))])
+        manager=self.service([process],http)
+        manager.run()
+        self.assertEqual(manager.popen.call_count,1)
+        self.assertTrue(process.closed.is_set())
+        self.assertIn('其他进程',manager.error)
+
+    def test_running_child_crash_recovers_without_resubmitting_any_print_job(self):
+        first=FakeProcess();first.pid=111
+        first.wait=Mock(return_value=7)
+        replacement=FakeProcess();replacement.pid=222
+        events=queue.Queue()
+        def first_health(*args,**kwargs):
+            first.returncode=7
+            return dict(data=dict(service='tsc-print-service',pid=111))
+        answers=iter((self.refused(),first_health,self.refused(),
+                      dict(data=dict(service='tsc-print-service',pid=222))))
+        def http(*args,**kwargs):
+            answer=next(answers)
+            if isinstance(answer,Exception): raise answer
+            return answer(*args,**kwargs) if callable(answer) else answer
+        request=Mock(side_effect=http)
+        manager=self.service([first,replacement],request,events.put)
+        manager.start()
+        states=[]
+        try:
+            while states.count('RUNNING')<2:
+                states.append(events.get(timeout=3)['state'])
+            self.assertIn('RESTARTING',states)
+            self.assertEqual(manager.popen.call_count,2)
+            self.assertTrue(all(len(call.args)==1 and call.args[0].endswith('/api/health')
+                                for call in request.call_args_list))
+        finally:
+            manager.stop();manager.thread.join(3)
+        self.assertFalse(manager.thread.is_alive())

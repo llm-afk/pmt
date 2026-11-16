@@ -353,6 +353,20 @@ class DebugMonitoringTests(unittest.TestCase):
         bench.start.assert_not_called()
         bench.close.assert_called_once()
 
+    def test_confirmed_runtime_cleanup_note_allows_safe_readonly_reconnect(self):
+        session,bench,channel=self.make_session()
+        error=TimeoutError('motor feedback stale')
+        error.add_note('CAN 运行异常已保留；工作线程收尾已确认。')
+        channel.state.side_effect=error
+        bench.close.side_effect=RuntimeShutdownError('motor feedback stale',cleanup_confirmed=True)
+        with patch.object(session,'_open_hardware',return_value=(bench,channel)):
+            session.start();session.thread.join(2)
+        self.assertFalse(session.active)
+        self.assertTrue(session.cleanup_confirmed)
+        self.assertTrue(session.reconnect_allowed)
+        self.assertIn('收尾已确认',session.failure)
+        channel.enable.assert_not_called()
+
     def test_failed_state_changing_command_is_not_automatically_replayed(self):
         session,bench,channel=self.make_session()
         channel.enable.side_effect=TimeoutError('enable outcome unknown')

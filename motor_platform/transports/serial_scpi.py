@@ -34,13 +34,13 @@ class SerialScpi:
                              bytesize=8, parity='N', stopbits=1,
                              timeout=self.timeout, write_timeout=self.timeout,
                              xonxoff=False, rtscts=False, dsrdtr=False)
+            self._serial = stream
             try:
                 time.sleep(0.3)  # Preserve the known-working device startup delay.
                 stream.reset_input_buffer()
             except BaseException:
-                stream.close()
+                self.close()
                 raise
-            self._serial = stream
             self._uncertain = False
             self._history.clear()
             self._session_id = uuid.uuid4().hex

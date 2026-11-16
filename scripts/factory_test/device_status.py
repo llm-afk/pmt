@@ -162,24 +162,38 @@ class DeviceHealth:
 
     @property
     def owns_serial(self):
-        return self._power is not None
+        from motor_platform.components.dynamometer.client import Dynamometer
+        return self._power is not None or bool(Dynamometer.pending_sessions())
 
     def release(self, reason):
         """Called by the controller owner before tests, page handoff and exit."""
+        from motor_platform.components.dynamometer.client import Dynamometer
+        errors = []
+        owners = [('dyno', item) for item in Dynamometer.pending_sessions()]
         if self._power is not None:
+            owners.append(('power', self._power))
+        for device, owner in owners:
             if not self.release_error:
-                log_event('hardware.release.request', device='power', owner='idle_monitor', reason=reason)
+                log_event('hardware.release.request', device=device, owner='idle_monitor', reason=reason)
             try:
-                self._power.close()
+                owner.close()
             except Exception as exc:
-                if self.release_error != str(exc):
-                    log_event('hardware.release.failed', level='ERROR', error=exc, device='power', reason=reason)
-                self.release_error = str(exc)
-                raise
-            self._power = self._power_route = self._power_reading = None
-            self.power_port = None
-            self.release_error = ''
-            log_event('hardware.release.confirmed', device='power', owner='idle_monitor', reason=reason)
+                # A fully released reader can still report the original receive
+                # fault. Preserve it without retaining a false ownership block.
+                released = device == 'dyno' and owner not in Dynamometer.pending_sessions()
+                if not released:
+                    errors.append(exc)
+                    if self.release_error != str(exc):
+                        log_event('hardware.release.failed', level='ERROR', error=exc, device=device, reason=reason)
+                    continue
+                log_event('hardware.release.receive_fault', level='WARNING', error=exc, device=device, reason=reason)
+            if device == 'power':
+                self._power = self._power_route = self._power_reading = None
+                self.power_port = None
+            log_event('hardware.release.confirmed', device=device, owner='idle_monitor', reason=reason)
+        self.release_error = '；'.join(str(exc) for exc in errors)
+        if errors:
+            raise errors[0]
 
     @staticmethod
     def _power_values(reading):
@@ -312,7 +326,7 @@ class DeviceHealth:
                     self.release('serial_route_changed')
                 reused = self._power is not None
                 matches = ({self.power_port:self._power.identity} if reused else
-                           detect_power_supplies(ports=candidates, timeout=.2, observations=observed))
+                           detect_power_supplies(ports=candidates, timeout=.2, observations=observed, cancelled=cancelled))
                 evidence.update(matches=matches, connection_reused=reused)
                 if len(matches) == 1:
                     port = next(iter(matches))
@@ -328,6 +342,9 @@ class DeviceHealth:
                 else:
                     info, code = status('OFFLINE','未识别到 UDP6721 电源'), 'POWER_NO_REPLY' if candidates else 'POWER_PORT_ABSENT'
             except Exception as exc:
+                if getattr(exc, 'probe_owner', None) is not None:
+                    self._power = exc.probe_owner
+                    self.power_port = exc.probe_port
                 if self._power is not None:
                     evidence['session'] = self._power.diagnostic_snapshot()
                 try:

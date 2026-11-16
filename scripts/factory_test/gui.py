@@ -21,7 +21,7 @@ from .station import StationRunner, PresenceLatch, STEPS
 from .measurements.console import WindowConsole
 from .maintenance import Maintenance, MotorAbsent, MultipleMotors, MotorIdentityUnreadable
 from .device_status import DeviceHealth, AdapterMonitor, adapter_status
-from .diagnostics import DiagnosticLogs, log_scope, log_event, error_details, LOCAL_TIME
+from .diagnostics import DiagnosticLogs, log_scope, log_event, error_details, LOCAL_TIME, unconfirmed_cleanup_notes
 from .service_credentials import CredentialStore, CredentialStoreError, FIELDS as SECRET_FIELDS
 from tkinter.scrolledtext import ScrolledText
 
@@ -552,7 +552,7 @@ class FactoryWindow:
         if self.closing or self.pending_page is None or self.busy or self.scan_in_progress or self.control_page.active:
             return
         if self.device_health.owns_serial:
-            self.banner.set('正在释放产测设备连接' if not self.device_health.release_error else '电源串口释放未确认')
+            self.banner.set('正在释放产测设备连接' if not self.device_health.release_error else '设备连接释放未确认')
             self.hint.set(self.device_health.release_error or '请稍候，完成后自动切换页面。')
             return
         target, self.pending_page = self.pending_page, None
@@ -1002,7 +1002,7 @@ class FactoryWindow:
                 with log_scope(self.diagnostics.current.bind(phase='hardware_handoff')):
                     self.device_health.release('controller_exit')
             except Exception as exc:
-                self.handoff_error = '电源串口释放未确认：'+str(exc)
+                self.handoff_error = '设备连接释放未确认：'+str(exc)
                 self.diagnostics.current.event('hardware.controller.cleanup_failed',level='ERROR',error=exc)
 
     def run_controller(self):
@@ -1216,8 +1216,10 @@ class FactoryWindow:
                     writer.finish()
                     errors.finish()
                 self.latch.completed()
-                if self.production_pause.is_set() and record.get('error_notes'):
-                    self.handoff_error='；'.join(record['error_notes'])
+                if self.production_pause.is_set():
+                    unsafe_notes = unconfirmed_cleanup_notes(record.get('error_notes', ()))
+                    if unsafe_notes:
+                        self.handoff_error='；'.join(unsafe_notes)
                 if record['status'] != 'COMPLETE':
                     runner.close_pending('工位异常自动归档，保留原 SN、requestId、打印状态和错误日志；禁止盲重试')
                 self.started_sessions += 1
@@ -1230,8 +1232,10 @@ class FactoryWindow:
                                                    '产测暂停并交接连接' if expected else '工位控制线程异常',
                                                    level='INFO' if expected else 'ERROR', error=None if expected else exc,
                                                    busy=self.busy, config=config)
-                if self.production_pause.is_set() and getattr(exc,'__notes__',None):
-                    self.handoff_error='；'.join(exc.__notes__)
+                if self.production_pause.is_set():
+                    unsafe_notes = unconfirmed_cleanup_notes(getattr(exc,'__notes__', ()))
+                    if unsafe_notes:
+                        self.handoff_error='；'.join(unsafe_notes)
                 with self.lock:
                     current_scan = not self.station_cancelled() and not self.configuring and (
                         revision, mode_generation) == (self.config_revision, self.mode_generation)
@@ -1616,9 +1620,7 @@ class FactoryWindow:
     @staticmethod
     def failure_prompt(value):
         diagnostic=value.get('diagnostic') or {}
-        notes=' '.join(value.get('notes',[])).lower()
-        if any(marker in notes for marker in ('校准停止','失能','停机未确认','切断工装电源','disable','motor shutdown',
-                                               'power shutdown','load shutdown','best-effort off')):
+        if unconfirmed_cleanup_notes(value.get('notes', ())):
             return '请先断开工装电源','停机未确认。确认电机和负载停止后再取下隔离，联系工程人员。'
         code=diagnostic.get('code','')
         step=value.get('step')
@@ -1723,6 +1725,8 @@ class FactoryWindow:
     def owned_threads(self):
         session = self.control_page.session
         candidates = [self.worker,session.thread if session is not None else None]
+        from motor_platform.components.dynamometer.client import Dynamometer
+        candidates.extend(item._thread for item in Dynamometer.pending_sessions())
         candidates.append(self.printer_check_thread)
         candidates.append(getattr(self,'export_thread',None))
         candidates.append(getattr(self,'bootstrap_thread',None))

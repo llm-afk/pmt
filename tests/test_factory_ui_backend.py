@@ -457,3 +457,40 @@ class IdleHardwareOwnershipTests(unittest.TestCase):
         self.power.close.side_effect=None
         self.health.release('retry_close')
         self.assertFalse(self.health.owns_serial);self.assertEqual(self.health.release_error,'')
+
+
+    def test_unreleased_probe_session_is_retained_and_blocks_new_identification(self):
+        error = OSError('probe close failed')
+        error.probe_owner, error.probe_port = self.power, 'COM2'
+        error.diagnostic_code = 'POWER_PROBE_RELEASE_UNCONFIRMED'
+        self.detect.side_effect = error
+        self.power.close.side_effect = OSError('driver refused close')
+        try:
+            self.assertEqual(self.health.check(self.config)['power']['state'], 'ERROR')
+            self.assertTrue(self.health.owns_serial)
+            self.assertIs(self.health._power, self.power)
+            self.assertEqual(self.health.check(self.config)['power']['state'], 'ERROR')
+            self.detect.assert_called_once()
+        finally:
+            self.power.close.side_effect = None
+            self.health.release('retry')
+        self.assertFalse(self.health.owns_serial)
+        self.detect.side_effect = None
+        self.assertEqual(self.health.check(self.config)['power']['state'], 'READY')
+
+    def test_pending_dynamometer_blocks_handoff_until_release_confirmation(self):
+        owner = Mock()
+        sessions = [owner]
+        owner.close.side_effect = OSError('dyno close failed')
+        with patch('motor_platform.components.dynamometer.client.Dynamometer.pending_sessions', side_effect=lambda:list(sessions)):
+            self.assertTrue(self.health.owns_serial)
+            with self.assertRaises(OSError): self.health.release('mode_change')
+            self.assertTrue(self.health.owns_serial)
+            self.assertIn('dyno close failed', self.health.release_error)
+            def release():
+                sessions.clear()
+                raise RuntimeError('original receive fault')
+            owner.close.side_effect = release
+            self.health.release('retry')
+            self.assertFalse(self.health.owns_serial)
+            self.assertEqual(self.health.release_error, '')

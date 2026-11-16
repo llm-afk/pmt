@@ -185,3 +185,115 @@ class PowerTraceTests(unittest.TestCase):
         self.assertNotIn('power.command.confirmed',events)
         failure=next(d for e,d in calls if e=='power.command.failed')
         self.assertEqual(failure['snapshot']['transport']['exchanges'][-1]['reply'],'OFF\n')
+
+
+class PowerDiscoveryOwnershipTests(unittest.TestCase):
+    def test_identification_and_release_use_the_callers_device_owner(self):
+        from unittest.mock import Mock
+        from motor_platform.components.power_supply.discovery import detect_power_supplies
+        caller = threading.get_ident()
+        calls = []
+        power = Mock(identity='UDP6721')
+        power.open.side_effect = lambda: calls.append(('open', threading.get_ident()))
+        power.close.side_effect = lambda: calls.append(('close', threading.get_ident()))
+        observed = []
+        with patch('motor_platform.components.power_supply.discovery.PowerSupply', return_value=power):
+            self.assertEqual(detect_power_supplies(ports=['COM8'], observations=observed), {'COM8':'UDP6721'})
+        self.assertEqual(calls, [('open', caller), ('close', caller)])
+        self.assertEqual(observed[0]['identity'], 'UDP6721')
+        power.enable.assert_not_called()
+        power.disable.assert_not_called()
+
+    def test_cancel_during_open_waits_for_owner_release_and_skips_next_port(self):
+        from unittest.mock import Mock
+        from motor_platform.components.power_supply.discovery import detect_power_supplies
+        entered, release, cancelled = threading.Event(), threading.Event(), threading.Event()
+        power = Mock(identity='UDP6721')
+        def opening():
+            entered.set()
+            if not release.wait(2):
+                raise AssertionError('test did not release driver')
+        power.open.side_effect = opening
+        errors = []
+        def run():
+            try:
+                detect_power_supplies(ports=['COM8','COM9'], cancelled=cancelled.is_set)
+            except Exception as exc:
+                errors.append(exc)
+        with patch('motor_platform.components.power_supply.discovery.PowerSupply', return_value=power) as factory:
+            worker = threading.Thread(target=run)
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(1))
+                cancelled.set()
+                self.assertTrue(worker.is_alive())
+                power.close.assert_not_called()
+                self.assertEqual(factory.call_count, 1)
+            finally:
+                release.set()
+                worker.join(2)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(factory.call_count, 1)
+        power.close.assert_called_once()
+        self.assertIsInstance(errors[0], InterruptedError)
+
+    def test_failed_probe_release_keeps_the_owner_and_never_reports_a_match(self):
+        from unittest.mock import Mock
+        from motor_platform.components.power_supply.discovery import detect_power_supplies
+        power = Mock(identity='UDP6721')
+        probe_error = TimeoutError('original IDN read timeout')
+        power.open.side_effect = probe_error
+        power.close.side_effect = OSError('driver close failed')
+        observed = []
+        with patch('motor_platform.components.power_supply.discovery.PowerSupply', return_value=power):
+            with self.assertRaises(OSError) as caught:
+                detect_power_supplies(ports=['COM8'], observations=observed)
+        self.assertIs(caught.exception.probe_owner, power)
+        self.assertEqual(caught.exception.probe_port, 'COM8')
+        self.assertEqual(caught.exception.diagnostic_code, 'POWER_PROBE_RELEASE_UNCONFIRMED')
+        self.assertFalse(observed[0]['release_confirmed'])
+        self.assertIs(caught.exception.__cause__, probe_error)
+        self.assertEqual(observed[0]['error'], str(probe_error))
+        self.assertEqual(observed[0]['cleanup_error'], 'driver close failed')
+        power.close.side_effect = None
+        caught.exception.probe_owner.close()
+        self.assertEqual(power.close.call_count, 2)
+
+
+class PartialPowerOpenTests(unittest.TestCase):
+    setUp = PowerSupplyTests.setUp
+
+    def test_failed_identification_close_can_be_retried_before_reopening(self):
+        self.stream.replies[b'*IDN?\n'] = b'OTHER DEVICE\n'
+        original_close = self.stream.close
+        self.stream.close = lambda: (_ for _ in ()).throw(OSError('close failed'))
+        try:
+            with self.assertRaises(OSError): self.power.open()
+            self.assertFalse(self.power._opened)
+            self.assertTrue(self.transport.diagnostic_snapshot()['opened'])
+            with self.assertRaises(RuntimeError): self.power.open()
+        finally:
+            self.stream.close = original_close
+        self.power.close()
+        self.assertFalse(self.transport.diagnostic_snapshot()['opened'])
+
+    def test_initialization_close_failure_retains_transport_until_retry(self):
+        original_close = self.stream.close
+        self.stream.reset_input_buffer = lambda: (_ for _ in ()).throw(OSError('reset failed'))
+        self.stream.close = lambda: (_ for _ in ()).throw(OSError('close failed'))
+        try:
+            with self.assertRaises(OSError): self.power.open()
+            self.assertTrue(self.transport.diagnostic_snapshot()['opened'])
+            with self.assertRaises(RuntimeError): self.power.open()
+        finally:
+            self.stream.close = original_close
+        self.power.close()
+        self.assertFalse(self.transport.diagnostic_snapshot()['opened'])
+
+
+    def test_successful_close_remains_idempotent(self):
+        self.power.open()
+        with patch.object(self.stream, 'close', wraps=self.stream.close) as close:
+            self.power.close()
+            self.power.close()
+            close.assert_called_once()

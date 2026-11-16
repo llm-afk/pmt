@@ -7,13 +7,41 @@ from ...transports.serial_stream import SerialStream
 from .protocol import FrameParser, parse_frame, positive
 
 
+_port_owners = {}
+_port_owners_lock = threading.Lock()
+
+
+class DynamometerReleasePending(RuntimeError):
+    diagnostic_code = 'DYNO_RELEASE_UNCONFIRMED'
+    diagnostic_hint = '旧测功机会话尚未确认释放；等待读线程结束并重试关闭后，才可重新打开串口。'
+
+    def __init__(self, device):
+        super().__init__(f'dynamometer serial release unconfirmed: {device.port}')
+        self.diagnostic_context = dict(port=device.port, opening=device._opening,
+            reader_alive=bool(device._thread and device._thread.is_alive()),
+            transport_open=device._transport_open,
+            receive_fault=str(device._error) if device._error else None,
+            cleanup_fault=str(device._close_error) if device._close_error else None)
+
+
 class Dynamometer:
+    @classmethod
+    def pending_sessions(cls):
+        """Memory-only snapshot of sessions whose serial ownership is retained."""
+        with _port_owners_lock:
+            return list(_port_owners.values())
+
     def __init__(self, *, port, baudrate=115200, torque_scale=100.0,
                  speed_scale=100.0, capacity=4096, transport=None):
         self.torque_scale, self.speed_scale = positive(torque_scale), positive(speed_scale)
         if type(capacity) is not int or capacity <= 0:
             raise ValueError('capacity must be a positive integer')
+        self.port = port
+        self._port_key = port.strip().casefold()
         self._transport = transport if transport is not None else SerialStream(port, baudrate=baudrate)
+        self._transport_open = self._opening = False
+        self._close_error = None
+        self._close_lock = threading.Lock()
         self._samples = deque(maxlen=capacity)
         self._condition = threading.Condition()
         self._stop = threading.Event()
@@ -23,23 +51,71 @@ class Dynamometer:
         self._count = self._dropped = self._bytes = self._discarded = 0
         self._started = self._ended = 0.0
 
+    def _claim_port(self):
+        with _port_owners_lock:
+            previous = _port_owners.get(self._port_key)
+        if previous is not None:
+            if previous is self or previous._opening or previous._thread and previous._thread.is_alive():
+                raise DynamometerReleasePending(previous)
+            try:
+                previous.close()
+            except Exception:
+                # A released session may still report its original receive fault.
+                if previous._transport_open:
+                    raise
+        with _port_owners_lock:
+            previous = _port_owners.get(self._port_key)
+            if previous is not None:
+                raise DynamometerReleasePending(previous)
+            _port_owners[self._port_key] = self
+            self._opening = True
+
+    def _release_port(self):
+        with _port_owners_lock:
+            if _port_owners.get(self._port_key) is self:
+                del _port_owners[self._port_key]
+
+    def _close_transport(self):
+        with self._close_lock:
+            if not self._transport_open:
+                return
+            try:
+                self._transport.close()
+            except BaseException as exc:
+                with self._condition:
+                    self._close_error = exc
+                raise
+            with self._condition:
+                self._transport_open = False
+                self._close_error = None
+            self._release_port()
+
     def open(self):
         with self._condition:
-            if self._thread is not None:
+            if self._thread is not None or self._transport_open or self._opening:
                 raise RuntimeError('close the existing session before opening')
-            self._transport.open()
-            self._stop.clear()
-            self._samples.clear()
-            self._latest = self._error = None
-            self._count = self._dropped = self._bytes = self._discarded = 0
-            self._started, self._ended = time.perf_counter(), 0.0
-            self._thread = threading.Thread(target=self._run, daemon=True, name='dynamometer-rx')
+            self._claim_port()
             try:
+                self._transport_open = True
+                self._transport.open()
+                self._stop.clear()
+                self._samples.clear()
+                self._latest = self._error = None
+                self._close_error = None
+                self._count = self._dropped = self._bytes = self._discarded = 0
+                self._started, self._ended = time.perf_counter(), 0.0
+                self._thread = threading.Thread(target=self._run, daemon=True, name='dynamometer-rx')
                 self._thread.start()
-            except BaseException:
+            except BaseException as exc:
                 self._thread = None
-                self._transport.close()
+                self._stop.set()
+                try:
+                    self._close_transport()
+                except BaseException as cleanup:
+                    exc.add_note(f'dynamometer serial release unconfirmed: {cleanup}')
                 raise
+            finally:
+                self._opening = False
         return self
 
     def _run(self):
@@ -68,18 +144,18 @@ class Dynamometer:
                 self._error = exc
         finally:
             try:
-                self._transport.close()  # Reader owns close: no concurrent read/free.
-            except BaseException as exc:
-                with self._condition:
-                    self._error = self._error or exc
+                self._close_transport()  # Reader owns close: no concurrent read/free.
+            except BaseException:
+                pass  # Retain the handle and cleanup fault for the owner's retry.
             with self._condition:
                 self._ended = time.perf_counter()
                 self._stop.set()
                 self._condition.notify_all()
 
     def _check(self):
-        if self._error is not None:
-            raise RuntimeError(f'dynamometer receive failed: {self._error}') from self._error
+        error = self._error or self._close_error
+        if error is not None:
+            raise RuntimeError(f'dynamometer session failed: {error}') from error
         if self._thread is None or self._stop.is_set():
             raise RuntimeError('dynamometer session is closed')
 
@@ -119,16 +195,26 @@ class Dynamometer:
                         discarded_bytes=self._discarded, dropped_samples=self._dropped,
                         buffered_samples=len(self._samples),
                         actual_rx_hz=self._count/elapsed if elapsed > 0 else 0,
-                        fault=str(self._error) if self._error is not None else None)
+                        fault=str(self._error or self._close_error) if self._error or self._close_error else None,
+                        receive_fault=str(self._error) if self._error else None,
+                        cleanup_fault=str(self._close_error) if self._close_error else None,
+                        transport_open=self._transport_open)
 
     def close(self):
+        if self._opening:
+            raise DynamometerReleasePending(self)
         self._stop.set()
         thread = self._thread
         if thread is not None:
             thread.join(timeout=2)
             if thread.is_alive():
-                raise RuntimeError('serial reader did not stop; transport not closed concurrently')
-            self._thread = None
+                raise DynamometerReleasePending(self)
+        if self._transport_open:
+            try:
+                self._close_transport()
+            except Exception as exc:
+                raise DynamometerReleasePending(self) from exc
+        self._thread = None
         if self._error is not None:
             raise RuntimeError(f'dynamometer closed after receive failure: {self._error}') from self._error
 

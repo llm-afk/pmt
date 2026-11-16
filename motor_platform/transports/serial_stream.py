@@ -37,6 +37,7 @@ class SerialStream:
         return self._serial.read(min(4096, max(1, waiting)))
 
     def close(self):
-        stream, self._serial = self._serial, None
-        if stream is not None:
-            stream.close()
+        if self._serial is not None:
+            # Keep the handle until its owner has confirmed release.
+            self._serial.close()
+            self._serial = None

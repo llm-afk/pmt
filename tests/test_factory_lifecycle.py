@@ -93,11 +93,16 @@ class ConfigurationRaceTests(unittest.TestCase):
             ('candidate',dict(config_revision=2,mode_generation=2,ready=True)),
             ('device_health',dict(config_revision=2,mode_generation=3,name='printer',info=dict(state='OFFLINE',detail='new queue offline')))):
             host.events.put((kind,value))
-        host.process_events()
+        # The GUI intentionally yields when a frame's event budget expires.
+        for _ in range(4):
+            host.process_events()
+            if host.events.empty():
+                break
+        self.assertTrue(host.events.empty())
         self.assertFalse(host.ready_to_start)
         host.device_state.assert_called_once_with('printer','OFFLINE','new queue offline')
 
-    def run_scan_with_edit(self, changes=None, *, credentials=False, configuring=False,wrong_connection=False,release_error=False):
+    def run_scan_with_edit(self, changes=None, *, credentials=False, configuring=False,wrong_connection=False,release_error=False, cleanup_notes=None, outer_error=False):
         host=window(); host.config=StationConfig(simulation=True)
         host.resume_requested=False
         host.start_requested=True  # User clicked on the preceding ready snapshot.
@@ -122,9 +127,36 @@ class ConfigurationRaceTests(unittest.TestCase):
         with patch('scripts.factory_test.gui.StationRunner') as runner:
             runner.return_value.already_completed.return_value=False
             runner.return_value.pending.return_value=False
-            runner.return_value.begin.return_value=dict(status='COMPLETE')
+            def begin(*args):
+                if cleanup_notes is not None:
+                    host.production_pause.set()
+                    if outer_error:
+                        error=RuntimeError('CAN worker failed')
+                        for note in cleanup_notes: error.add_note(note)
+                        raise error
+                    return dict(status='FAILED',error_notes=cleanup_notes)
+                return dict(status='COMPLETE')
+            runner.return_value.begin.side_effect=begin
             host.controller()
         return runner,host
+
+    def test_confirmed_cleanup_notes_do_not_block_mode_handoff_in_either_result_path(self):
+        note='CAN 运行异常已保留；工作线程收尾已确认。'
+        for outer_error in (False,True):
+            with self.subTest(outer_error=outer_error):
+                _,host=self.run_scan_with_edit(cleanup_notes=[note],outer_error=outer_error)
+                self.assertEqual(host.handoff_error,'')
+                host.switch_page('control')
+                host.control_page.enter.assert_called_once()
+
+    def test_unconfirmed_cleanup_notes_block_handoff_in_both_result_paths(self):
+        note='工装停机未确认：电机失能未获确认，请切断工装电源。'
+        for outer_error in (False,True):
+            with self.subTest(outer_error=outer_error):
+                _,host=self.run_scan_with_edit(cleanup_notes=[note],outer_error=outer_error)
+                self.assertIn('停机未确认',host.handoff_error)
+                host.switch_page('control')
+                host.control_page.enter.assert_not_called()
 
     def test_failed_idle_release_prevents_any_production_operation(self):
         runner,host=self.run_scan_with_edit(release_error=True)
@@ -310,12 +342,24 @@ class SettingsTransactionTests(unittest.TestCase):
         self.assertTrue(host.config.automatic);self.assertTrue(host.resume_requested)
         self.assertFalse(host.start_requested)
 
+    def test_successful_disable_note_cannot_trigger_unconfirmed_stop_prompt(self):
+        from scripts.factory_test.gui import FactoryWindow
+        title,_=FactoryWindow.failure_prompt(dict(step='measure',notes=['电机失能已确认；CSV smoothing failed: disk full']))
+        self.assertIn('隔离',title)
+        self.assertNotIn('断开工装电源',title)
+        for note in ('Power supply close failed: close busy',
+                     'Motor shutdown failed: no ACK',
+                     '校准停止未得到固件状态证明，请切断工装电源后处理'):
+            with self.subTest(note=note):
+                title,_=FactoryWindow.failure_prompt(dict(step='measure',notes=[note]))
+                self.assertIn('断开工装电源',title)
+
     def test_feedback_worker_prompt_keeps_unconfirmed_stop_priority(self):
         from scripts.factory_test.gui import FactoryWindow
         value=dict(step='measure',diagnostic=dict(code='MOTOR_FEEDBACK_STALE'))
         title,hint=FactoryWindow.failure_prompt(value)
         self.assertIn('隔离',title);self.assertIn('反馈中断',hint)
-        title,_=FactoryWindow.failure_prompt(dict(value,notes=['工装停机未确认：电机失能']))
+        title,_=FactoryWindow.failure_prompt(dict(value,notes=['电机失能回执未确认']))
         self.assertIn('断开工装电源',title)
 
     def test_mode_handoff_waits_for_idle_serial_owner(self):

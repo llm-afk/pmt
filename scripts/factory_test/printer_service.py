@@ -64,6 +64,8 @@ def prepare_config(config, root, source=None):
 
 
 class LocalPrinterService:
+    RESTART_DELAYS = (1, 3, 10)
+
     def __init__(self, config, root, *, diagnostics=None, notify=lambda value:None,
                  previous=None, http=json_http, popen=None, paths=None):
         self.config,self.root=config,Path(root)
@@ -157,43 +159,77 @@ class LocalPrinterService:
             env=child_environment(self.runtime)
             arguments=[str(node),str(script),'--config',str(config_path),'--port',str(parts.port or 80),
                 '--host','::1' if parts.hostname=='::1' else '127.0.0.1','--managed']
-            with self.process_lock:
+            for attempt in range(len(self.RESTART_DELAYS)+1):
                 if self.stop_event.is_set(): return
-                self.process=self.popen(arguments,cwd=self.source,env=env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,text=True,encoding='utf-8',errors='replace',
-                    creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
-                process=self.process
-            self.event('spawned',pid=process.pid,arguments=arguments,config_path=str(config_path),owned=True)
-            self.reader=threading.Thread(target=self._read_output,args=(process,),name='printer-service-output',daemon=True)
-            self.reader.start()
-            deadline=time.monotonic()+15
-            while not self.stop_event.is_set():
-                if process.poll() is not None:
-                    raise RuntimeError(f'打印服务提前退出，代码 {process.returncode}；请查看 printer_service.output 日志')
-                try:
-                    reply=self.http(health_url,timeout=.6)
-                    data=reply.get('data',{})
-                    if data.get('service')!='tsc-print-service' or data.get('pid')!=process.pid:
-                        raise RuntimeError('打印端口由其他进程响应，未取得该进程的所有权')
-                    self.publish('RUNNING','本机打印服务已启动，正在确认打印机队列')
-                    self.event('ready',pid=process.pid,url=origin,physical_printer_checked=False)
-                    break
-                except (URLError,OSError):
-                    if time.monotonic()>=deadline: raise TimeoutError('本机打印服务启动等待超时')
-                    self.stop_event.wait(.15)
-            while not self.stop_event.wait(.5):
-                if process.poll() is not None:
-                    raise RuntimeError(f'打印服务异常退出，代码 {process.returncode}')
+                if attempt and self._existing(health_url):
+                    self.external=True
+                    self.publish('EXTERNAL','使用外部打印服务（由外部进程管理）')
+                    self.event('reused',url=origin,owned=False,after_restart_attempt=attempt)
+                    return
+                exit_code=self._run_process(arguments,env,config_path,health_url,origin)
+                self._finish_process()
+                if self.stop_event.is_set(): return
+                self.error=f'打印服务异常退出，代码 {exit_code}'
+                self.event('child_exited',self.error,level='WARNING',exit_code=exit_code,
+                           restart_attempt=attempt,owned=True)
+                if attempt==len(self.RESTART_DELAYS):
+                    raise RuntimeError(self.error+'；自动重启次数已用完，请联系工程人员查看日志')
+                delay=self.RESTART_DELAYS[attempt]
+                self.publish('RESTARTING',f'打印服务已退出，{delay} 秒后自动重启（{attempt+1}/{len(self.RESTART_DELAYS)}）')
+                self.event('restart_scheduled',delay_s=delay,restart_attempt=attempt+1,owned=True)
+                if self.stop_event.wait(delay): return
         except Exception as exc:
             self.error=str(exc)
             self.event('failed',error=exc,level='ERROR',url=self.config.printer_url)
             if not self.stop_event.is_set(): self.publish('ERROR',self.error)
         finally:
             self.stop()
-            if self.process is not None:
-                # Allow pending RAW jobs/HTTP replies to settle; no force kill
-                # or replay. The GUI remains responsive while waiting for us.
-                self.process.wait()
-                if self.reader is not None: self.reader.join()
-                self.process.stdout.close()
-                self.event('stopped',pid=self.process.pid,exit_code=self.process.returncode,owned=True)
+            self._finish_process()
+
+    def _run_process(self, arguments, env, config_path, health_url, origin):
+        with self.process_lock:
+            if self.stop_event.is_set(): return None
+            self.process=self.popen(arguments,cwd=self.source,env=env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,text=True,encoding='utf-8',errors='replace',
+                creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+            process=self.process
+        self.event('spawned',pid=process.pid,arguments=arguments,config_path=str(config_path),owned=True)
+        self.reader=threading.Thread(target=self._read_output,args=(process,),name='printer-service-output',daemon=True)
+        self.reader.start()
+        deadline=time.monotonic()+15
+        while not self.stop_event.is_set():
+            if process.poll() is not None:
+                return process.returncode
+            try:
+                reply=self.http(health_url,timeout=.6)
+                data=reply.get('data',{})
+                if data.get('service')!='tsc-print-service' or data.get('pid')!=process.pid:
+                    raise RuntimeError('打印端口由其他进程响应，未取得该进程的所有权')
+                self.error=None
+                self.publish('RUNNING','本机打印服务已启动，正在确认打印机队列')
+                self.event('ready',pid=process.pid,url=origin,physical_printer_checked=False)
+                break
+            except (URLError,OSError):
+                if time.monotonic()>=deadline: raise TimeoutError('本机打印服务启动等待超时')
+                self.stop_event.wait(.15)
+        while not self.stop_event.wait(.5):
+            if process.poll() is not None:
+                return process.returncode
+        return None
+
+    def _finish_process(self):
+        # An owned child must be reaped and its output drained before a new
+        # launch. Closing stdin asks a live child to settle pending jobs first.
+        with self.process_lock:
+            process=self.process
+            if process is None: return
+            if process.stdin is not None:
+                try: process.stdin.close()
+                except (OSError,ValueError): pass
+        process.wait()
+        if self.reader is not None: self.reader.join()
+        process.stdout.close()
+        self.event('stopped',pid=process.pid,exit_code=process.returncode,owned=True)
+        with self.process_lock:
+            self.process=None
+            self.reader=None
