@@ -486,4 +486,96 @@ class ClosedRuntimeReceiptTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):ch.disable()
 
 
+class RuntimeCounterUsbTests(unittest.TestCase):
+    def create(self, *, stop_ack=True):
+        from motor_platform.transports.canable import Canable, DLC_LENGTHS
+
+        class Peer(Canable):
+            def __init__(self):
+                super().__init__('in-memory-usb')
+                self.peer = Transport()
+                self.drop_feedback = False
+                self._started = True
+                self._usb = SimpleNamespace(input=0x81, transfer=self.read)
+
+            def send(self, frame):
+                counter = CanFrame(0x200, bytes.fromhex('0000000000000001'),
+                                   is_fd=False, brs=False, is_error=True)
+                if frame.can_id < 0x600:
+                    self.peer.rx.put(counter)
+                    if self.drop_feedback:
+                        return
+                if (not stop_ack and frame.can_id >= 0x600 and
+                        frame.data[1:3] == b'\x02\x20' and frame.data[4] == 2):
+                    self.peer.rx.put(counter)
+                    return
+                self.peer.send(frame)
+
+            def read(self, pipe, *, timeout):
+                frame = self.peer.recv(timeout)
+                if frame is None:
+                    return None
+                can_id = frame.can_id | (0x20000000 if frame.is_error else 0)
+                flags = (2 if frame.is_fd else 0) | (4 if frame.brs else 0)
+                return (struct.pack('<IIBBBB', 0xffffffff, can_id,
+                                    DLC_LENGTHS.index(len(frame.data)), 0, flags, 0) +
+                        frame.data.ljust(64 if frame.is_fd else 8, b'\0'))
+
+            def close(self):
+                self._started = False
+
+        peer = Peer()
+        bus = MotorBus(peer)
+        runtime = ControlRuntime(bus, {1: bus.motor(1)}, command_timeout=1).start()
+        channel = runtime.motor(1)
+        channel.enable()
+        self.addCleanup(bus.close)
+        return peer, runtime, channel
+
+    def test_standard_counter_packets_with_real_feedback_keep_runtime_active(self):
+        peer, runtime, channel = self.create()
+        try:
+            time.sleep(.03)
+            self.assertTrue(runtime._thread.is_alive())
+            self.assertIsNone(runtime._error)
+            self.assertGreater(channel.stats()['rx_count'], 0)
+            self.assertGreater(channel.stats()['can_counter_reports'], 0)
+            report = channel.stats()['can_last_counter_report']
+            self.assertEqual(report['can_id'], 0x200)
+            self.assertEqual(report['data'], '0000000000000001')
+            self.assertEqual(channel.state().node_id, 1)
+            channel.disable()
+        finally:
+            runtime.close()
+
+    def test_counter_packets_cannot_refresh_feedback_and_stop_uses_real_ack(self):
+        peer, runtime, channel = self.create()
+        peer.drop_feedback = True
+        runtime._thread.join(1)
+        self.assertFalse(runtime._thread.is_alive())
+        self.assertEqual(runtime._error.diagnostic_code, 'MOTOR_FEEDBACK_STALE')
+        self.assertGreater(peer.counter_reports, 0)
+        channel.disable()
+        self.assertTrue(channel.stop_status()['worker_cleanup']['confirmed'])
+        self.assertEqual(channel.stop_status()['disable_receipt']['via'], 'worker_cleanup')
+        self.assertFalse(peer.peer.enabled[1])
+        with self.assertRaises(RuntimeShutdownError) as caught:
+            runtime.close()
+        self.assertTrue(caught.exception.cleanup_confirmed)
+
+    def test_counter_packets_cannot_substitute_for_stop_ack(self):
+        peer, runtime, channel = self.create(stop_ack=False)
+        peer.drop_feedback = True
+        runtime._thread.join(1)
+        self.assertFalse(runtime._thread.is_alive())
+        self.assertEqual(runtime._error.diagnostic_code, 'MOTOR_FEEDBACK_STALE')
+        with self.assertRaises(RuntimeError):
+            channel.disable()
+        self.assertFalse(channel.stop_status()['worker_cleanup']['confirmed'])
+        self.assertFalse(channel.stop_status()['disable_receipt']['confirmed'])
+        with self.assertRaises(RuntimeShutdownError) as caught:
+            runtime.close()
+        self.assertFalse(caught.exception.cleanup_confirmed)
+
+
 if __name__=='__main__':unittest.main()

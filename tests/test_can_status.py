@@ -55,3 +55,72 @@ class SupervisedProtocolTests(unittest.TestCase):
             self.assertIsNone(can.recv(.001))
         self.assertEqual(can.protocol_reports,1);self.assertEqual(len(can._rx),len(packet)*99)
         can._usb.transfer.assert_not_called()
+
+
+class CounterReportUsbTests(unittest.TestCase):
+    @staticmethod
+    def packet(can_id, data, *, flags=0):
+        import struct
+        payload_size = 64 if flags & 2 else 8
+        return struct.pack('<IIBBBB', 0xffffffff, can_id, len(data), 0, flags, 0) + data.ljust(payload_size, b'\0')
+
+    def receiver(self, packets):
+        from unittest.mock import Mock
+        can = Canable('in-memory')
+        can._started = True
+        can._usb = Mock()
+        can._usb.transfer.return_value = packets
+        return can
+
+    def test_legacy_and_standard_counter_notifications_preserve_next_feedback(self):
+        feedback = CanFrame(0x123, b'feedback', is_fd=False, brs=False)
+        for can_id in (0, 0x200):
+            for tx_errors, rx_errors in ((0, 1), (95, 95)):
+                with self.subTest(can_id=can_id, tx=tx_errors, rx=rx_errors):
+                    data = bytes(6) + bytes((tx_errors, rx_errors))
+                    can = self.receiver(self.packet(0x20000000 | can_id, data) +
+                                        self.packet(feedback.can_id, feedback.data))
+                    self.assertEqual(can.recv(.1), feedback)
+                    self.assertEqual(can.counter_reports, 1)
+                    self.assertEqual(can.last_counter_report['can_id'], can_id)
+                    self.assertEqual(can.last_counter_report['data'], data.hex())
+                    self.assertEqual(can.last_counter_report['tx_errors'], tx_errors)
+                    self.assertEqual(can.last_counter_report['rx_errors'], rx_errors)
+                    self.assertGreater(can.last_counter_report['received_at'], 0)
+                    can._usb.transfer.assert_called_once()
+
+    def test_severe_or_malformed_counter_frames_remain_errors(self):
+        data = bytes.fromhex('0000000000000001')
+        cases = [
+            (0x204, data, 0),  # Controller state combined with counter class.
+            (0x240, data, 0),  # Bus-off combined with counter class.
+            (0x208, data, 0),  # Protocol error combined with counter class.
+            (0x200, bytes.fromhex('0000000000000060'), 0),
+            (0x200, bytes.fromhex('000000000000ff00'), 0),
+            (0x200, bytes.fromhex('0000000000010001'), 0),
+            (0x200, data[:7], 0),
+            (0x200, data, 2),  # FD error report.
+            (0x200, data, 4),  # BRS on a classic error report.
+            (0x80000200, data, 0),  # Extended identifier.
+            (0x40000200, data, 0),  # Remote frame.
+        ]
+        for can_id, payload, flags in cases:
+            with self.subTest(can_id=can_id, data=payload.hex(), flags=flags):
+                can = self.receiver(self.packet(0x20000000 | can_id, payload, flags=flags))
+                can.set_feedback_supervision(True)
+                frame = can.recv(.1)
+                self.assertTrue(frame.is_error)
+                self.assertEqual(frame.can_id, can_id & 0x1fffffff)
+                self.assertEqual(frame.data, payload)
+                self.assertEqual(can.counter_reports, 0)
+
+    def test_counter_only_batch_yields_at_deadline_without_losing_packets(self):
+        from unittest.mock import patch
+        packet = self.packet(0x20000200, bytes.fromhex('0000000000000001'))
+        can = self.receiver(b'')
+        can._rx.extend(packet * 100)
+        with patch('motor_platform.transports.canable.time.perf_counter', side_effect=[0, .01, .02]):
+            self.assertIsNone(can.recv(.001))
+        self.assertEqual(can.counter_reports, 1)
+        self.assertEqual(bytes(can._rx), packet * 99)
+        can._usb.transfer.assert_not_called()

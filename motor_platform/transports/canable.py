@@ -358,12 +358,12 @@ class Canable:
                     del self._rx[:size]
                     frame = decode_usb(packet)
                     if frame is not None:
-                        # Elmue legacy reports counter changes with CAN_ERR_FLAG even
-                        # when no error class is set (Firmware/Candlelight/buffer.c,
-                        # buf_store_error). Keep diagnostics; this is not motor data.
+                        # Standard CAN_ERR_CNT and class-free legacy notifications
+                        # carry counter diagnostics, never motor feedback or ACKs.
                         if is_counter_report(frame):
                             self.counter_reports += 1
                             self.last_counter_report = {
+                                'can_id': frame.can_id, 'data': frame.data.hex(),
                                 'tx_errors': frame.data[6], 'rx_errors': frame.data[7],
                                 'received_at': time.perf_counter()}
                             if time.perf_counter() >= deadline:
@@ -428,12 +428,13 @@ class Canable:
 
 
 def is_counter_report(frame):
-    """Only class-free Elmue counter reports below warning level are nonfatal.
+    """Consume pure counter notifications below the CAN warning threshold.
 
-    Byte 5 contains firmware application faults: never discard a nonzero value.
-    Actual protocol errors, warning/passive/bus-off and malformed frames pass on.
+    CAN_ERR_CNT (0x200) uses data[6:8] for TX/RX counts. Legacy firmware may
+    omit that class bit. Any combined class or nonzero detail byte stays fatal,
+    including firmware application faults in byte 5.
     """
-    return (frame.is_error and frame.can_id == 0 and not frame.is_fd
+    return (frame.is_error and frame.can_id in (0, 0x200) and not frame.is_fd and not frame.brs
             and not frame.is_extended and not frame.is_remote
             and len(frame.data) == 8 and frame.data[:6] == bytes(6)
             and max(frame.data[6:]) < 96)
