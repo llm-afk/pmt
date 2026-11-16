@@ -240,9 +240,10 @@ class PrinterClient:
                 raise IntegrationError(f'打印服务检查的队列与配置不一致：{actual_name}', code='PRINTER_TARGET_MISMATCH',
                     hint='核对服务默认打印机及 printerName 参数支持，状态查询与标签提交必须使用同一台打印机。',
                     context=dict(url=url, expected_printer=printer_name, actual_printer=actual_name, response=reply))
-            if reply.get('success') is False:
-                raise IntegrationError('打印服务返回失败状态', code='PRINTER_STATUS_REJECTED',
-                    hint='检查打印服务状态应答和服务日志；online=true 不能覆盖明确的失败状态。',
+            if (('success' in reply and reply['success'] is not True)
+                    or ('code' in reply and reply['code'] != 200)):
+                raise IntegrationError('打印服务返回的顶层状态未确认成功', code='PRINTER_STATUS_REJECTED',
+                    hint='检查打印服务状态应答和服务日志；online=true 不能覆盖顶层失败或无效状态。',
                     context=dict(url=url, response=reply))
         except Exception as exc:
             failure = self.status_error(exc, url)
@@ -324,23 +325,62 @@ class PrinterClient:
                 code='PRINT_SERVICE_OUTCOME_UNKNOWN',context=dict(**context,response=reply))
             log_event('printer.item.unknown',level='ERROR',error=exc,outcome='UNKNOWN',**context)
             raise exc
+        if self._receipt_conflict(reply,data,item,copies,job_id):
+            exc = PrintUnknown('打印回执的请求、份数或状态不一致，部分标签可能已提交，请核对实体标签',
+                code='PRINT_ACK_CONFLICT', context=dict(**context, response=reply))
+            log_event('printer.ack.conflict', level='ERROR', error=exc, **context)
+            raise exc
         if item['success'] is False:
             exc = IntegrationError('标签打印失败：' + str(item.get('message', '服务未说明原因')),
                 code='PRINT_ITEM_FAILED', hint='服务明确报告本条 SN 失败；按原始 message 检查打印机/服务，不重新申请 SN。',
                 context=dict(**context, response=reply))
             log_event('printer.item.failed', level='ERROR', error=exc, outcome='FAILED', **context)
             raise exc
-        # Optional counters/copies may be omitted; contradictory receipts cannot prove success.
-        inconsistent = any(key in data and (type(data[key]) is not int or data[key] not in (1,copies))
-                           for key in ('total', 'success'))
-        inconsistent |= all(key in data for key in ('total','success')) and data['total']!=data['success']
-        inconsistent |= 'copies' in item and (type(item['copies']) is not int or item['copies'] != copies)
-        inconsistent |= 'success' in reply and reply['success'] is not True
-        if inconsistent:
-            exc = PrintUnknown('打印成功条目与总数、份数或顶层状态矛盾，请核对实体标签',
-                code='PRINT_ACK_CONFLICT', context=dict(**context, response=reply))
-            log_event('printer.ack.conflict', level='ERROR', error=exc, **context)
-            raise exc
         log_event('printer.confirmed', '本条 SN 的打印服务应答已确认', outcome='API_CONFIRMED',
                   physical_label_checked=False, elapsed_s=round(time.perf_counter()-started, 4), **context)
         return item
+
+
+    @staticmethod
+    def _receipt_conflict(reply,data,item,copies,job_id):
+        """Validate declared Node evidence while accepting the older minimal reply."""
+        if 'requestId' in data and data['requestId'] != job_id:
+            return True
+        if 'copies' in item and (type(item['copies']) is not int or item['copies'] != copies):
+            return True
+        submitted=item.get('submittedCopies')
+        if 'submittedCopies' in item:
+            if type(submitted) is not int or not 0 <= submitted <= copies:
+                return True
+            if submitted != (copies if item['success'] else 0):
+                return True  # A partial submission requires physical label reconciliation.
+        if 'jobs' in item:
+            jobs=item['jobs']
+            if (not isinstance(jobs,list) or len(jobs)>copies or any(
+                    not isinstance(job,dict) or not isinstance(job.get('success'),bool) for job in jobs)):
+                return True
+            submitted_jobs=sum(job['success'] for job in jobs)
+            if any(job.get('outcome')=='UNKNOWN' or
+                   (job['success'] and job.get('outcome')=='FAILED') or
+                   (not job['success'] and job.get('outcome')=='SUBMITTED') for job in jobs):
+                return True
+            if 'submittedCopies' in item and submitted != submitted_jobs:
+                return True
+            if item['success'] and (len(jobs)!=copies or submitted_jobs!=copies):
+                return True
+            if not item['success'] and submitted_jobs:
+                return True
+        if not item['success']:
+            # Node's top-level success can be true after only some copies.
+            return (item.get('outcome')=='SUBMITTED' or
+                    'success' in data and (type(data['success']) is not int or data['success']!=0))
+        if item.get('outcome')=='FAILED':
+            return True
+        if 'success' in reply and reply['success'] is not True:
+            return True
+        if 'code' in reply and reply['code'] != 200:
+            return True
+        if any(key in data and (type(data[key]) is not int or data[key] not in (1,copies))
+               for key in ('total','success')):
+            return True
+        return all(key in data for key in ('total','success')) and data['total']!=data['success']

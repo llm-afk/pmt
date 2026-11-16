@@ -358,8 +358,9 @@ class Canable:
                     del self._rx[:size]
                     frame = decode_usb(packet)
                     if frame is not None:
-                        # Standard CAN_ERR_CNT and class-free legacy notifications
-                        # carry counter diagnostics, never motor feedback or ACKs.
+                        # Class-free Elmue notifications carry only counters.
+                        # Elmue assigns 0x200 to CRC errors, so it follows the
+                        # protocol-error policy below instead of this path.
                         if is_counter_report(frame):
                             self.counter_reports += 1
                             self.last_counter_report = {
@@ -395,18 +396,24 @@ class Canable:
         self._feedback_supervised = enabled
 
     def _record_transient(self, frame, now):
-        # Low-counter form/stuff reports are not feedback or ACKs. During periodic
-        # operation, the real 100 ms feedback guard decides continuity; severe
-        # error classes/counters still pass through immediately. SDO/OTA remains strict.
-        if not (frame.is_error and frame.can_id == 0x8 and not frame.is_fd
+        # Low-counter form/stuff/CRC reports are not feedback or ACKs. During
+        # periodic operation, the real 100 ms feedback guard decides continuity.
+        # The firmware-specific CRC ID comes from Elmue candlelight_def.h and
+        # buf_store_error(), where ERID_CRC_Error is 0x200 in legacy mode too.
+        if not (frame.is_error and not frame.is_fd and not frame.brs
                 and not frame.is_extended and not frame.is_remote
-                and len(frame.data) == 8 and frame.data[:2] == bytes(2)
-                and frame.data[2] in (2, 4) and frame.data[4:6] == bytes(2)
-                and max(frame.data[6:]) <= 8):
+                and len(frame.data) == 8 and max(frame.data[6:]) <= 8):
+            return False
+        if frame.can_id == 0x200 and frame.data[:6] == bytes(6):
+            kind = 'crc'
+        elif (frame.can_id == 0x8 and frame.data[:2] == bytes(2)
+                and frame.data[2] in (2, 4) and frame.data[4:6] == bytes(2)):
+            kind = 'form' if frame.data[2] == 2 else 'stuff'
+        else:
             return False
         self.protocol_reports += 1
         self.last_protocol_report = dict(can_id=frame.can_id, data=frame.data.hex(), received_at=now,
-            kind='form' if frame.data[2] == 2 else 'stuff', location=frame.data[3],
+            kind=kind, location=frame.data[3],
             tx_errors=frame.data[6], rx_errors=frame.data[7], feedback_supervised=self._feedback_supervised)
         self.protocol_history.append(self.last_protocol_report)
         while self._recent_protocol_reports and now-self._recent_protocol_reports[0] >= 1:
@@ -428,13 +435,13 @@ class Canable:
 
 
 def is_counter_report(frame):
-    """Consume pure counter notifications below the CAN warning threshold.
+    """Consume class-free Elmue counter notifications below warning level.
 
-    CAN_ERR_CNT (0x200) uses data[6:8] for TX/RX counts. Legacy firmware may
-    omit that class bit. Any combined class or nonzero detail byte stays fatal,
-    including firmware application faults in byte 5.
+    This backend requires Elmue firmware. Its error ID 0x200 means CRC error
+    (ERID_CRC_Error), including legacy mode. Nonzero IDs and detail bytes must
+    remain available to the protocol-error policy or the caller's fault path.
     """
-    return (frame.is_error and frame.can_id in (0, 0x200) and not frame.is_fd and not frame.brs
+    return (frame.is_error and frame.can_id == 0 and not frame.is_fd and not frame.brs
             and not frame.is_extended and not frame.is_remote
             and len(frame.data) == 8 and frame.data[:6] == bytes(6)
             and max(frame.data[6:]) < 96)

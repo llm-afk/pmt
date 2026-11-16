@@ -197,6 +197,75 @@ class ConfigurationRaceTests(unittest.TestCase):
         host.write_log.assert_not_called()
 
 
+class ReadinessSamplingTests(unittest.TestCase):
+    def tearDown(self):
+        WindowConsole.cancelled.clear()
+
+    def scan(self, after_health, *, wait_removal=False, config_changed=False):
+        from scripts.factory_test.maintenance import MotorAbsent
+        host=window();host.start_requested=True;host.resume_requested=False
+        host.config=StationConfig(adapter_sn='chosen')
+        host.credential_error='';host.saved_credentials={'sn_api_key':'offline'}
+        host.storage_root=None;host.delivery=None;host.started_sessions=0;host.last_health=0
+        host.shutdown=Mock();host.shutdown.is_set.return_value=False
+        host.shutdown.wait.side_effect=[False,True]
+        host.diagnostics.current.context={'connection_id':'current'}
+        host.diagnostics.observe.return_value=host.diagnostics.current
+        host.requested_identity=(0,0,'current',1,'before')
+        host.latch.identity=('chosen',1,'before');host.latch.stable=3
+        if wait_removal:
+            host.latch.completed();host.latch.absent_since=time.monotonic()-3
+        live=[None if wait_removal else dict(node_id=1,sn='before')]
+        order=[]
+        ready={name:dict(state='READY',detail='ready') for name in ('can','dyno','power','printer')}
+        def health(*args,**kwargs):
+            order.append('health')
+            live[0]=after_health
+            if config_changed:host.config_revision+=1
+            return ready
+        def discover(*args,**kwargs):
+            order.append('motor')
+            if live[0] is None:raise MotorAbsent('no response')
+            return live[0]
+        host.device_health.check.side_effect=health
+        host.device_health.printer.poll.return_value=ready['printer']
+        with patch('scripts.factory_test.gui.Maintenance') as maintenance, \
+             patch('scripts.factory_test.firmware_library.load_target',return_value=(None,dict(file='APP_245.bin',sha256='offline'))), \
+             patch('scripts.factory_test.gui.StationRunner') as runner:
+            maintenance.return_value.discover.side_effect=discover
+            host.controller()
+            runner.assert_not_called()
+            self.assertEqual(maintenance.return_value.discover.call_count,0 if config_changed else 1)
+        return host,order
+
+    def test_motor_removed_during_slow_health_never_publishes_ready_or_starts(self):
+        host,order=self.scan(None)
+        self.assertEqual(order,['health','motor'])
+        candidate=next(value for kind,value in host.events.queue if kind=='candidate')
+        self.assertFalse(candidate['present']);self.assertFalse(candidate['ready'])
+        self.assertIn('motor',candidate['blockers'])
+
+    def test_changed_id_and_sn_after_health_cancel_old_start_identity(self):
+        host,order=self.scan(dict(node_id=2,sn='replacement'))
+        self.assertEqual(order,['health','motor'])
+        candidate=next(value for kind,value in host.events.queue if kind=='candidate')
+        self.assertEqual((candidate['node_id'],candidate['sn']),(2,'replacement'))
+        self.assertFalse(candidate['ready']);self.assertIn('stabilizing',candidate['blockers'])
+        self.assertIn('operator.start_cancelled',[call.args[0] for call in host.diagnostics.current.event.call_args_list])
+
+    def test_reconnection_during_health_cannot_unlock_waiting_removal(self):
+        host,_=self.scan(dict(node_id=1,sn='before'),wait_removal=True)
+        candidate=next(value for kind,value in host.events.queue if kind=='candidate')
+        self.assertTrue(candidate['waiting_removal']);self.assertIn('remove',candidate['blockers'])
+        self.assertFalse(candidate['ready']);self.assertIsNone(host.latch.absent_since)
+        self.assertFalse(any(kind=='removed' for kind,_ in host.events.queue))
+
+    def test_configuration_changed_during_health_discards_scan_before_can_probe(self):
+        host,order=self.scan(dict(node_id=1,sn='before'),config_changed=True)
+        self.assertEqual(order,['health'])
+        self.assertFalse(any(kind in ('candidate','motor_probe','removed') for kind,_ in host.events.queue))
+
+
 class ShutdownTests(unittest.TestCase):
     def tearDown(self):
         WindowConsole.cancelled.clear()

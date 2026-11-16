@@ -24,6 +24,38 @@ STEPS = (
 )
 
 
+def measurement_evidence(summary):
+    """Read the saved KT/TN evidence once, including absent or conflicting reports."""
+    summary = summary if isinstance(summary, dict) else {}
+    stage_records = summary.get('stages')
+    stage_records = stage_records if isinstance(stage_records, dict) else {}
+    reports = {'kt':[], 'tn':[]}
+    for item in summary.get('sections') or ():
+        if isinstance(item, dict) and item.get('name') in reports:
+            reports[item['name']].append(item.get('status'))
+    stages, sections, states = {}, {}, {}
+    for name, values in reports.items():
+        stage = stage_records.get(name)
+        captured = stage.get('status') if isinstance(stage, dict) else None
+        verdict = values[0] if values and all(value == values[0] for value in values) else None
+        stages[name], sections[name] = captured, verdict
+        if captured in (None, 'SKIPPED'):
+            state = 'WAITING'
+        elif captured != 'COMPLETED':
+            state = 'INCOMPLETE'
+        else:
+            state = {'PASS':'DONE', 'FAIL':'FAILED', 'PENDING':'PENDING'}.get(verdict, 'INCOMPLETE')
+        states[name] = state
+    return dict(summary_status=summary.get('status'), stages=stages, sections=sections,
+                section_reports=reports, step_states=states)
+
+
+def emit_measurement_steps(emit, summary):
+    """A completed capture becomes green only after its own report passes."""
+    for name, state in measurement_evidence(summary)['step_states'].items():
+        emit('step', dict(name=name, status=state))
+
+
 class MeasurementFailed(RuntimeError):
     def __init__(self, summary):
         super().__init__(summary.get('error') or '测试未通过或未完成；不会申请正式 SN')
@@ -96,7 +128,7 @@ class Services:
                 complete = result.get('reason') == ('completed' if _name == 'kt' else 'stall_confirmed')
                 log_event('test.stage.end', stage=_name, result=result, complete=complete,
                           elapsed_s=round(time.perf_counter()-started, 4))
-                self.emit('step', dict(name=_name, status='DONE' if complete else 'FAILED'))
+                self.emit('step', dict(name=_name, status='COLLECTED' if complete else 'INCOMPLETE'))
                 return result
             stages.append((name, SimpleNamespace(main=run), csv))
         summary = app.execute(args, directory, stages=stages, motor_sn=base_sn)
@@ -161,7 +193,7 @@ class DemoServices(Services):
         for name in ('kt', 'tn'):
             self.emit('step', dict(name=name, status='RUNNING'))
             self.check_stop()
-            self.emit('step', dict(name=name, status='DONE'))
+            self.emit('step', dict(name=name, status='COLLECTED'))
         summary['sections'] = report.analyze(directory, summary)
         summary['status'] = report.overall(summary['sections'], summary['stages'])
         return summary
@@ -269,6 +301,14 @@ class StationRunner:
         current.pop('credentials_file',None)
         if restored != current:
             raise RecoveryRequired('当前配置与未完成工件不一致，请恢复原工位配置后再继续')
+        if (not self.config.simulation and record['steps'].get('base_sn') == 'DONE'
+                and record['steps'].get('write_sn') != 'DONE'):
+            error = RecoveryRequired('临时 SN 可重复，无法确认是原工件。请隔离并核对本件和原取号记录，勿直接重测或贴标')
+            error.diagnostic_code = 'RECOVERY_IDENTITY_UNVERIFIED'
+            error.diagnostic_hint = '共享临时 SN 和相同 ID 无法证明仍是原工件。原测试数据、取号请求和已分配正式 SN 保留在记录中。'
+            error.diagnostic_context = dict(session=record['session'], base_sn=record['base_sn'],
+                module_sn=record.get('module_sn'), request_id=record.get('request_id'), steps=record['steps'])
+            raise error
         self.record = record
         record['config']=dict(asdict(self.config), target_id=target_id)
         if self.log:
@@ -369,10 +409,20 @@ class StationRunner:
             if state == 'DONE':
                 self.emit('step', dict(name=name, status=state))
                 if name == 'measure':
-                    for part in ('kt', 'tn'):
-                        self.emit('step', dict(name=part, status=state))
+                    emit_measurement_steps(self.emit, record.get('summary', {}))
         try:
             record['status'] = 'RUNNING'
+            if record['steps'].get('measure') == 'DONE':
+                # A saved completion flag cannot authorize new side effects alone.
+                evidence = measurement_evidence(record.get('summary'))
+                if (evidence['summary_status'] != 'PASS'
+                        or any(state != 'DONE' for state in evidence['step_states'].values())):
+                    record['current_step'] = 'measure'
+                    error = RecoveryRequired('保存的测量完成标记与报告证据不一致，请工程人员核对本件记录；不会继续取号、写号或打印')
+                    error.diagnostic_code = 'MEASUREMENT_RECOVERY_UNCONFIRMED'
+                    error.diagnostic_hint = '核对保存的 KT/TN 采集状态、各自报告判定与整件结果；保留原始数据，勿重新执行副作用。'
+                    error.diagnostic_context = dict(directory=str(directory), saved_measure='DONE', **evidence)
+                    raise error
             if 'firmware' in record or not record['steps']:
                 def firmware():
                     record['firmware'] = self.services.firmware(record['detected_id'],record['detected_sn'])
@@ -392,6 +442,7 @@ class StationRunner:
                 if record.get('firmware'):
                     summary['firmware'] = record['firmware']
                 record['summary'] = summary
+                emit_measurement_steps(self.emit, summary)
                 log_event('test.analysis', status=summary['status'], sections=summary.get('sections'),
                           limits=summary.get('limits'), stages=summary.get('stages'))
                 self.emit('metrics', summary)

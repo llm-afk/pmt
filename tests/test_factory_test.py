@@ -83,6 +83,31 @@ class FactoryTests(unittest.TestCase):
             self.assertEqual(result['stages']['kt']['status'],'ERROR')
             stages[1][1].main.assert_not_called()
 
+    def test_field_crc_diagnostic_names_the_error_without_claiming_a_wiring_fault(self):
+        from motor_platform.components.motor.client import CanBusError
+        from scripts.factory_test.diagnostics import error_details
+        for frame_id in (0x200,0x20):
+            frame=CanFrame(frame_id,bytes.fromhex('0000000000000001'),is_error=True)
+            result=error_details(CanBusError(frame))
+            self.assertEqual(result['code'],'CAN_ERROR_FRAME')
+            self.assertEqual('CRC' in result['hint'],frame_id==0x200)
+
+    def test_csv_failure_cannot_hide_unconfirmed_stop_in_exception_chain(self):
+        from scripts.factory_test.gui import FactoryWindow
+        def fail(*args, **kwargs):
+            try:
+                exc=RuntimeError('feedback stale')
+                exc.add_note('Motor shutdown failed: disable ACK missing')
+                exc.add_note('recorded feedback history')
+                raise exc
+            finally:
+                raise OSError('CSV disk full')
+        stages=self.stages(); stages[0][1].main.side_effect=fail
+        summary=app.execute(self.args(),Path('output'),stages=stages,identify=lambda _: 'same')
+        self.assertEqual(summary['error_notes'], ['Motor shutdown failed: disable ACK missing'])
+        self.assertIn('断开工装电源',FactoryWindow.failure_prompt(dict(notes=summary['error_notes']))[0])
+        stages[1][1].main.assert_not_called()
+
     def test_demo_metrics_and_unconfigured_standards(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);summary=create_demo(root)
@@ -98,6 +123,35 @@ class FactoryTests(unittest.TestCase):
             (root/'tn'/'curve.csv').unlink()
             sections=report.analyze(root,summary)
             self.assertEqual(report.overall(sections,summary['stages']),'INCOMPLETE')
+
+    def test_kt_cannot_pass_with_missing_or_flat_commands_or_partial_acquisition(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); summary=create_demo(root); path=root/'kt'/'kt_curve.csv'
+            config=dict(RAMP_DURATION_S=5,FEEDBACK_TIMEOUT_S=.1)
+            summary['stages']['kt']['result']['config']=config
+            with path.open(encoding='utf-8',newline='') as f:
+                source=list(csv.DictReader(f))
+            for case in ('missing','missing_header','flat','only_start','gap','out_of_window','complete','historical'):
+                with self.subTest(case=case):
+                    rows=[row.copy() for row in source]
+                    config['OUTPUT_COLUMNS'] = [] if case=='historical' else ['motor_application_target_torque']
+                    if case=='out_of_window': rows[-1]['time_ms']='7000'
+                    if case=='only_start': rows=rows[:11]
+                    if case=='gap': del rows[50:100]
+                    for row in rows:
+                        if case in ('missing','flat','historical'):
+                            row['dyno_torque_smooth_nm']=row['motor_application_target_torque']
+                        if case=='missing': row['motor_application_target_torque']=''
+                        if case=='flat':
+                            row['motor_application_target_torque']=row['dyno_torque_smooth_nm']='0'
+                        if case in ('missing_header','historical'): del row['motor_application_target_torque']
+                    with path.open('w', encoding='utf-8',newline='') as f:
+                        wr=csv.DictWriter(f,rows[0].keys());wr.writeheader();wr.writerows(rows)
+                    sections=report.analyze(root,summary)
+                    expected='PASS' if case in ('complete','historical') else 'INCOMPLETE'
+                    self.assertEqual(report.overall(sections,summary['stages']),expected)
+                    if expected=='INCOMPLETE': self.assertTrue(sections[0]['note'])
+                    if case=='historical': self.assertEqual(sections[0]['target_source'],'reconstructed_ramp')
 
     def test_zero_output_is_linearity_fail(self):
         with tempfile.TemporaryDirectory() as tmp:

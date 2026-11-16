@@ -270,7 +270,7 @@ class DiagnosticTests(unittest.TestCase):
         probes = [event for kind,event in host.events.queue if kind=='motor_probe']
         self.assertEqual([value['motor_probe'] for value in probes], ['present','absent','present'])
 
-    def test_early_probe_station_fault_and_recovery_publish_current_evidence(self):
+    def test_station_fault_recovers_before_publishing_fresh_motor_evidence(self):
         from scripts.factory_test.station import PresenceLatch
         from tests.test_factory_modes import window
         host=window()
@@ -284,14 +284,15 @@ class DiagnosticTests(unittest.TestCase):
         host.shutdown.wait.side_effect=[False,False,False,True]
         seen_before_health=[]
         def health(*args,**kwargs):
-            seen_before_health.append(host.events.queue[-1][0])
+            seen_before_health.append([item for kind,item in host.events.queue
+                                       if kind=='motor_probe' and item['motor_probe']=='present'])
             if len(seen_before_health)<3: raise OSError('设备状态检查失败')
             return {}
         host.device_health.check.side_effect=health
         host.controller()
-        self.assertEqual(seen_before_health[0],'motor_probe')
+        self.assertEqual(seen_before_health,[[],[],[]])
         outcomes=[item['motor_probe'] for kind,item in host.events.queue if kind=='motor_probe']
-        self.assertEqual(outcomes,['present','station_error'])
+        self.assertEqual(outcomes,['station_error','present'])
         candidate=next(item for kind,item in host.events.queue if kind=='candidate')
         self.assertEqual(candidate['motor_probe'],'present')
         self.assertIn('stabilizing',candidate['blockers'])
@@ -519,8 +520,109 @@ class DiagnosticTests(unittest.TestCase):
 
     def test_printer_minimal_status_remains_compatible_without_optional_queue_metadata(self):
         for data in (dict(online=True),dict(online=True,printerName=self.config.printer_name.lower())):
-            http=Mock(return_value=dict(code=200,data=data))
-            self.assertTrue(PrinterClient(self.config,http).ready()['data']['online'])
+            for status in ({},dict(code=200),dict(success=True),dict(code=200,success=True)):
+                http=Mock(return_value=dict(status,data=data))
+                self.assertTrue(PrinterClient(self.config,http).ready()['data']['online'])
+
+    def test_printer_failed_or_malformed_top_level_status_cannot_mark_online_ready(self):
+        target=self.connect()
+        for status in (dict(code=500),dict(code=401,success=True),
+                       dict(success='false'),dict(success=0),dict(success=None)):
+            http=Mock(return_value=dict(status,data=dict(online=True)))
+            with self.subTest(status=status),log_scope(target),self.assertRaises(IntegrationError) as error:
+                PrinterClient(self.config,http).ready()
+            self.assertEqual(error.exception.diagnostic_code,'PRINTER_STATUS_REJECTED')
+            http.assert_called_once()
+        text=target.path.read_text(encoding='utf-8')
+        self.assertNotIn('printer.status.ready',text)
+        self.assertNotIn('printer.submit',text)
+
+    def test_conflicting_print_status_is_unknown_and_never_resubmitted(self):
+        target=self.connect()
+        number='C2KNEE0STDXC02212611020001'
+        replies=(dict(code=500,data=dict(results=[dict(sn=number,success=True)])),
+                 dict(code=401,success=True,data=dict(results=[dict(sn=number,success=True)])),
+                 dict(success=True,data=dict(results=[dict(sn=number,success=True,outcome='FAILED')])))
+        for reply in replies:
+            http=Mock(return_value=reply)
+            with self.subTest(reply=reply),log_scope(target),self.assertRaises(PrintUnknown) as error:
+                PrinterClient(self.config,http).print_sn(number)
+            self.assertEqual(error.exception.diagnostic_code,'PRINT_ACK_CONFLICT')
+            http.assert_called_once()
+        text=target.path.read_text(encoding='utf-8')
+        self.assertNotIn('printer.confirmed',text)
+        self.assertIn('PRINT_ACK_CONFLICT',text)
+
+    def test_legacy_and_node_print_success_formats_remain_compatible(self):
+        number='C2KNEE0STDXC02212611020001'
+        item=dict(sn=number,success=True)
+        replies=(dict(data=dict(results=[item])),dict(code=200,data=dict(results=[item])),
+                 dict(success=True,data=dict(requestId='job',total=1,success=1,
+                      results=[dict(item,copies=1,submittedCopies=1,outcome='SUBMITTED',
+                                    jobs=[dict(success=True,outcome='SUBMITTED')],physicalOutputConfirmed=False)],
+                      physicalOutputConfirmed=False)))
+        for reply in replies:
+            http=Mock(return_value=reply)
+            with self.subTest(reply=reply):
+                self.assertTrue(PrinterClient(self.config,http).print_sn(number,job_id='job')['success'])
+            http.assert_called_once()
+
+    def test_print_request_echo_must_match_even_when_sn_matches(self):
+        number='C2KNEE0STDXC02212611020001'
+        for success in (True,False):
+            reply=dict(data=dict(requestId='previous-job',results=[dict(sn=number,success=success)]))
+            http=Mock(return_value=reply)
+            with self.subTest(success=success),self.assertRaises(PrintUnknown) as error:
+                PrinterClient(self.config,http).print_sn(number,job_id='current-job')
+            self.assertEqual(error.exception.diagnostic_code,'PRINT_ACK_CONFLICT')
+            self.assertEqual(http.call_args.kwargs['headers'],{'X-Request-Id':'current-job'})
+            http.assert_called_once()
+
+    def test_partial_or_conflicting_copy_evidence_is_unknown_without_replay(self):
+        number='C2KNEE0STDXC02212611020001'
+        config=replace(self.config,printer_copies=2)
+        items=(dict(success=True,submittedCopies=0),dict(success=True,submittedCopies=1),
+               dict(success=True,submittedCopies=True),dict(success=True,submittedCopies=3),
+               dict(success=False,submittedCopies=1,outcome='FAILED'),
+               dict(success=False,outcome='SUBMITTED'),
+               dict(success=True,jobs=[dict(success=True,outcome='SUBMITTED')]),
+               dict(success=True,submittedCopies=2,jobs=[dict(success=True),dict(success=False)]),
+               dict(success=False,jobs=[dict(success=False),dict(success=True)]),
+               dict(success=False,jobs=[dict(success=False,outcome='UNKNOWN')]),
+               dict(success=True,jobs=[dict(success=True),dict(success=True,outcome='UNKNOWN')]),
+               dict(success=True,jobs=[dict(success=True),dict(success=True,outcome='FAILED')]),
+               dict(success=True,jobs=[dict(success=True),dict(success=1)]))
+        for item in items:
+            reply=dict(data=dict(results=[dict(item,sn=number)]))
+            http=Mock(return_value=reply)
+            with self.subTest(item=item),self.assertRaises(PrintUnknown) as error:
+                PrinterClient(config,http).print_sn(number)
+            self.assertEqual(error.exception.diagnostic_code,'PRINT_ACK_CONFLICT')
+            http.assert_called_once()
+        http=Mock(return_value=dict(success=True,data=dict(total=2,success=1,
+                             results=[dict(sn=number,success=False,outcome='FAILED')])))
+        with self.assertRaises(PrintUnknown): PrinterClient(config,http).print_sn(number)
+        http.assert_called_once()
+
+    def test_node_full_copy_success_and_explicit_zero_submission_failure_are_distinct(self):
+        number='C2KNEE0STDXC02212611020001'
+        config=replace(self.config,printer_copies=2)
+        for success in (True,False):
+            outcome='SUBMITTED' if success else 'FAILED'
+            item=dict(sn=number,success=success,copies=2,outcome=outcome,
+                      submittedCopies=2 if success else 0,
+                      jobs=[dict(success=success,outcome=outcome) for _ in range(2)])
+            reply=dict(success=success,data=dict(requestId='current-job',total=2,
+                       success=2 if success else 0,results=[item]))
+            http=Mock(return_value=reply)
+            if success:
+                self.assertEqual(PrinterClient(config,http).print_sn(number,job_id='current-job'),item)
+            else:
+                with self.assertRaises(IntegrationError) as error:
+                    PrinterClient(config,http).print_sn(number,job_id='current-job')
+                self.assertNotIsInstance(error.exception,PrintUnknown)
+                self.assertEqual(error.exception.diagnostic_code,'PRINT_ITEM_FAILED')
+            http.assert_called_once()
 
     def test_sdo_timeout_preserves_address_raw_request_and_uncertain_state(self):
         from scripts.factory_test.maintenance import Maintenance

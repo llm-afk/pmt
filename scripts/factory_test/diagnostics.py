@@ -90,6 +90,8 @@ def error_details(error):
             code, hint = 'HTTP_STATUS_ERROR', '检查 HTTP 状态、响应正文、目标地址及服务端日志；HTTP 成功和业务成功需分别核对。'
         elif 'CanBusError' in types:
             code, hint = 'CAN_ERROR_FRAME', '核对错误帧 ID 和数据、最后一次电机反馈、使能请求及失能回执。'
+            if any(item['type']=='CanBusError' and item.get('can_id')==0x200 for item in chain):
+                hint = 'CANable 报告 CRC 校验错误。核对 TX/RX 错误计数、最后有效反馈及失能回执；单条记录不能确定物理原因。'
         elif 'UsbFrameError' in types:
             code, hint = 'USB_FRAME_INVALID', '主机侧 USB 帧格式校验失败；检查长度、DLC、通道、flags 和原始数据，以及适配器固件/占用情况。'
         elif 'SdoError' in types:

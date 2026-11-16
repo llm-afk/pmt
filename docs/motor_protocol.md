@@ -32,6 +32,22 @@ python -m unittest discover -s tests -v
 本机 `candle-api==0.0.12` 本次枚举结果为空，因而采用 Python ctypes 直接调用 WinUSB。
 使用固件提供的 legacy gs_usb CAN FD 格式，未开启 Elmue blobs 或 USB 硬件时间戳。
 
+## Elmue CAN 错误报告
+
+本后端通过 Elmue 固件的 legacy 接口接收错误帧。其 `0x0200` 是 `ERID_CRC_Error`，
+需要按 CRC 协议事件记录。该位的含义来自实际固件定义和 `buf_store_error()` 的生成路径。
+[Elmue 错误定义](https://github.com/Elmue/CANable-2.5-firmware-Slcan-and-Candlelight/blob/main/Firmware/Candlelight/candlelight_def.h)、[错误帧生成](https://github.com/Elmue/CANable-2.5-firmware-Slcan-and-Candlelight/blob/main/Firmware/Candlelight/buffer.c)
+
+只有 ID 为 0、前六字节为 0、TX/RX 计数均低于 96 的经典标准错误帧作为纯计数通知，
+保存在 `can_counter_reports` 和 `can_last_counter_report`。
+低计数的格式、填充和 CRC 事件保存在 `can_protocol_reports`、`can_last_protocol_report`
+与最近 16 条 `can_protocol_history`，类型分别为 `form`、`stuff`、`crc`。
+
+周期运行时启用真实反馈监督后，仅 TX/RX 计数不超过 8、结构符合对应类型的单一协议事件
+可继续等待真实反馈，100 ms 无反馈保护仍生效。维护和 OTA 会话沿用一秒内第三次协议事件
+转入故障的预算。高计数、混合类别、应用错误、非法帧格式直接交由故障路径处理。
+错误报告不会刷新电机反馈时间，也不能充当 SDO 或停机应答。
+
 ## 分层与接口
 
 | 层 | 对外接口 | 负责内容 |

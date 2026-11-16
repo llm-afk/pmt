@@ -6,7 +6,7 @@ from motor_platform.transports.canable import is_counter_report, Canable
 class CounterReportTests(unittest.TestCase):
     def test_transient_budget_and_real_faults(self):
         can = Canable('test')
-        frame = CanFrame(8, bytes.fromhex('0000040000000001'), is_fd=False, is_error=True)
+        frame = CanFrame(8, bytes.fromhex('0000040000000001'), is_fd=False, brs=False, is_error=True)
         self.assertTrue(can._record_transient(frame, 0))
         self.assertTrue(can._record_transient(frame, .2))
         self.assertFalse(can._record_transient(frame, .9))
@@ -14,12 +14,12 @@ class CounterReportTests(unittest.TestCase):
         for cid, data in [(0x48, '000008000000f800'), (0x204, '003000000000867f'),
                           (8, '0000040000000009'), (8, '0000040000010001')]:
             self.assertFalse(can._record_transient(CanFrame(cid, bytes.fromhex(data),
-                             is_fd=False, is_error=True), 3))
+                             is_fd=False, brs=False, is_error=True), 3))
     def test_only_counter_changes_are_nonfatal(self):
         def report(can_id, data):
             return CanFrame(can_id, bytes.fromhex(data), is_fd=False, brs=False, is_error=True)
         self.assertTrue(is_counter_report(report(0, '0000000000000001')))
-        for can_id, data in [(0xc, '0020080000008800'), (0x48, '000008000000f800'),
+        for can_id, data in [(0x200, '0000000000000001'), (0xc, '0020080000008800'), (0x48, '000008000000f800'),
                              (0, '0000000000010001'), (0, '0000000000000060'),
                              (0, '000000')]:
             self.assertFalse(is_counter_report(report(can_id, data)))
@@ -29,7 +29,7 @@ class CounterReportTests(unittest.TestCase):
 class SupervisedProtocolTests(unittest.TestCase):
     def test_low_counter_reports_keep_history_only_in_supervised_mode(self):
         can=Canable('offline');can.set_feedback_supervision(True)
-        frame=CanFrame(8,bytes.fromhex('0000020000000001'),is_fd=False,is_error=True)
+        frame=CanFrame(8,bytes.fromhex('0000020000000001'),is_fd=False,brs=False,is_error=True)
         for n in range(50):self.assertTrue(can._record_transient(frame,n/1000))
         self.assertEqual(can.protocol_reports,50);self.assertEqual(len(can.protocol_history),16)
         self.assertEqual(can.last_protocol_report['kind'],'form')
@@ -42,7 +42,7 @@ class SupervisedProtocolTests(unittest.TestCase):
                          (8,'0000040000000009'),(8,'0000040000010001'),
                          (8,'0000010000000001'),(0x20,'0000000000000100')]:
             with self.subTest(cid=cid,data=data):
-                self.assertFalse(can._record_transient(CanFrame(cid,bytes.fromhex(data),is_fd=False,is_error=True),0))
+                self.assertFalse(can._record_transient(CanFrame(cid,bytes.fromhex(data),is_fd=False,brs=False,is_error=True),0))
 
     def test_error_only_usb_batch_yields_to_feedback_and_lease_guards(self):
         import struct
@@ -72,30 +72,61 @@ class CounterReportUsbTests(unittest.TestCase):
         can._usb.transfer.return_value = packets
         return can
 
-    def test_legacy_and_standard_counter_notifications_preserve_next_feedback(self):
+    def test_class_free_counter_notifications_preserve_next_feedback(self):
         feedback = CanFrame(0x123, b'feedback', is_fd=False, brs=False)
-        for can_id in (0, 0x200):
-            for tx_errors, rx_errors in ((0, 1), (95, 95)):
-                with self.subTest(can_id=can_id, tx=tx_errors, rx=rx_errors):
-                    data = bytes(6) + bytes((tx_errors, rx_errors))
-                    can = self.receiver(self.packet(0x20000000 | can_id, data) +
-                                        self.packet(feedback.can_id, feedback.data))
-                    self.assertEqual(can.recv(.1), feedback)
-                    self.assertEqual(can.counter_reports, 1)
-                    self.assertEqual(can.last_counter_report['can_id'], can_id)
-                    self.assertEqual(can.last_counter_report['data'], data.hex())
-                    self.assertEqual(can.last_counter_report['tx_errors'], tx_errors)
-                    self.assertEqual(can.last_counter_report['rx_errors'], rx_errors)
-                    self.assertGreater(can.last_counter_report['received_at'], 0)
-                    can._usb.transfer.assert_called_once()
+        for tx_errors, rx_errors in ((0, 1), (95, 95)):
+            with self.subTest(tx=tx_errors, rx=rx_errors):
+                data = bytes(6) + bytes((tx_errors, rx_errors))
+                can = self.receiver(self.packet(0x20000000, data) +
+                                    self.packet(feedback.can_id, feedback.data))
+                self.assertEqual(can.recv(.1), feedback)
+                self.assertEqual(can.counter_reports, 1)
+                self.assertEqual(can.last_counter_report['can_id'], 0)
+                self.assertEqual(can.last_counter_report['data'], data.hex())
+                self.assertEqual(can.last_counter_report['tx_errors'], tx_errors)
+                self.assertEqual(can.last_counter_report['rx_errors'], rx_errors)
+                self.assertGreater(can.last_counter_report['received_at'], 0)
+                can._usb.transfer.assert_called_once()
+
+    def test_elmue_crc_reports_keep_protocol_history_under_supervision(self):
+        data = bytes.fromhex('0000000000000001')
+        feedback = self.packet(0x123, b'feedback')
+        can = self.receiver(self.packet(0x20000200, data) * 50 + feedback)
+        can.set_feedback_supervision(True)
+        self.assertEqual(can.recv(.1).can_id, 0x123)
+        self.assertEqual(can.counter_reports, 0)
+        self.assertEqual(can.protocol_reports, 50)
+        self.assertEqual(len(can.protocol_history), 16)
+        self.assertEqual(can.last_protocol_report['kind'], 'crc')
+        self.assertEqual(can.last_protocol_report['can_id'], 0x200)
+        self.assertEqual(can.last_protocol_report['data'], data.hex())
+        self.assertEqual(can.last_protocol_report['rx_errors'], 1)
+
+    def test_elmue_crc_reports_cannot_bypass_strict_sdo_error_budget(self):
+        import time
+        from motor_platform import MotorBus
+        from motor_platform.components.motor.client import CanBusError
+        packet = self.packet(0x20000200, bytes.fromhex('0000000000000001'))
+        ack = self.packet(0x581, bytes.fromhex('6002200000000000'))
+        can = self.receiver(packet * 100 + ack)
+        bus = MotorBus(can)
+        with self.assertRaises(CanBusError) as caught:
+            bus._wait_sdo(1, 0x2002, time.perf_counter() + .1)
+        self.assertEqual(caught.exception.can_id, 0x200)
+        self.assertEqual(can.counter_reports, 0)
+        self.assertEqual(can.protocol_reports, 3)
+        self.assertEqual(can.last_protocol_report['kind'], 'crc')
+        self.assertFalse(can.last_protocol_report['feedback_supervised'])
 
     def test_severe_or_malformed_counter_frames_remain_errors(self):
         data = bytes.fromhex('0000000000000001')
         cases = [
-            (0x204, data, 0),  # Controller state combined with counter class.
-            (0x240, data, 0),  # Bus-off combined with counter class.
-            (0x208, data, 0),  # Protocol error combined with counter class.
+            (0x204, data, 0),  # Controller state combined with CRC class.
+            (0x240, data, 0),  # Bus-off combined with CRC class.
+            (0x208, data, 0),  # Multiple protocol error classes.
+            (0x200, bytes.fromhex('0000000000000009'), 0),
             (0x200, bytes.fromhex('0000000000000060'), 0),
+            (0x200, bytes.fromhex('0000020000000001'), 0),
             (0x200, bytes.fromhex('000000000000ff00'), 0),
             (0x200, bytes.fromhex('0000000000010001'), 0),
             (0x200, data[:7], 0),
@@ -116,7 +147,7 @@ class CounterReportUsbTests(unittest.TestCase):
 
     def test_counter_only_batch_yields_at_deadline_without_losing_packets(self):
         from unittest.mock import patch
-        packet = self.packet(0x20000200, bytes.fromhex('0000000000000001'))
+        packet = self.packet(0x20000000, bytes.fromhex('0000000000000001'))
         can = self.receiver(b'')
         can._rx.extend(packet * 100)
         with patch('motor_platform.transports.canable.time.perf_counter', side_effect=[0, .01, .02]):

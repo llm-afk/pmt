@@ -872,3 +872,207 @@ class FinalStopLogTests(unittest.TestCase):
         self.assertTrue(log.call_args.kwargs['stop_status']['disable_receipt']['confirmed'])
         self.assertNotIn('_stop_probe',summary)
         json.dumps(summary)
+
+
+class MeasurementStepDisplayTests(unittest.TestCase):
+    def run_pipeline(self, root, section_statuses, *, kt_reason='completed', tn_reason='stall_confirmed'):
+        from scripts.factory_test import app
+        from scripts.factory_test.station import Services
+        config=StationConfig(simulation=True)
+        events=[]
+        emit=lambda kind,value:events.append((kind,value))
+        service=DemoServices(config,lambda:False,emit)
+        service.measure=lambda directory,sn:Services.measure(service,directory,sn)
+        service.render=Mock();service.allocate=Mock()
+        modules=[NS(main=Mock(return_value=dict(reason=reason)),POWER_PORT='auto',DYNO_PORT='auto')
+                 for reason in (kt_reason,tn_reason)]
+        stages=(('kt',modules[0],'kt_curve.csv'),('tn',modules[1],'curve.csv'))
+        sections=[dict(name=name,title=name,status=status,metrics=[])
+                  for name,status in zip(('kt','tn'),section_statuses)]
+        execute=app.execute
+        def run(*args,**kwargs):
+            return execute(*args,**kwargs,identify=lambda _:kwargs['motor_sn'],pause=lambda _:None)
+        runner=StationRunner(config,root=root,services=service,emit=emit)
+        with patch.object(app,'STAGES',stages),patch.object(app,'execute',side_effect=run), \
+             patch('scripts.factory_test.station.report.analyze',return_value=sections):
+            result=runner.begin('incoming')
+        return runner,service,modules,events,result
+
+    @staticmethod
+    def states(events,name):
+        return [value['status'] for kind,value in events if kind=='step' and value['name']==name]
+
+    def test_collected_kt_failure_is_red_while_passed_tn_is_complete(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _,service,_,events,result=self.run_pipeline(Path(folder),('FAIL','PASS'))
+        self.assertEqual(result['summary']['status'],'FAIL')
+        self.assertEqual(self.states(events,'kt'),['RUNNING','COLLECTED','FAILED'])
+        self.assertEqual(self.states(events,'tn'),['RUNNING','COLLECTED','DONE'])
+        service.allocate.assert_not_called()
+
+    def test_passed_kt_survives_later_incomplete_tn_without_inheriting_whole_failure(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _,_,_,events,result=self.run_pipeline(Path(folder),('PASS','INCOMPLETE'),tn_reason='operator_stop')
+        self.assertEqual(result['summary']['status'],'INCOMPLETE')
+        self.assertEqual(self.states(events,'kt')[-1],'DONE')
+        self.assertEqual(self.states(events,'tn')[-1],'INCOMPLETE')
+        self.assertNotIn('DONE',self.states(events,'tn'))
+
+    def test_unexecuted_tn_stays_waiting_after_kt_capture_fault(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _,_,modules,events,result=self.run_pipeline(Path(folder),('INCOMPLETE','INCOMPLETE'),kt_reason='feedback stale')
+        self.assertEqual(result['summary']['stages']['tn']['status'],'SKIPPED')
+        modules[1].main.assert_not_called()
+        self.assertEqual(self.states(events,'tn'),['WAITING'])
+        self.assertEqual(self.states(events,'kt')[-1],'INCOMPLETE')
+
+    def test_recovery_restores_each_saved_report_result_without_copying_measure_done(self):
+        with tempfile.TemporaryDirectory() as folder:
+            config=StationConfig(simulation=True)
+            events=[];emit=lambda kind,value:events.append((kind,value))
+            service=DemoServices(config,lambda:False,emit);service.render=Mock()
+            service.allocate=Mock(side_effect=TimeoutError('MES unavailable'))
+            runner=StationRunner(config,root=Path(folder),services=service,emit=emit)
+            record=runner.begin('incoming')
+            self.assertEqual(record['steps']['measure'],'DONE')
+            record['summary']['stages']['tn']['status']='SKIPPED'
+            record['summary']['sections'][1]['status']='INCOMPLETE'
+            runner.save();events.clear()
+            for name in ('allocate','write_sn','print_sn','upload','measure','calibrate'):
+                setattr(service,name,Mock())
+            restored=runner.resume()
+            self.assertEqual(self.states(events,'kt'),['DONE'])
+            self.assertEqual(self.states(events,'tn'),['WAITING'])
+            self.assertEqual(restored['status'],'FAILED')
+            self.assertEqual(restored['diagnostic']['code'],'MEASUREMENT_RECOVERY_UNCONFIRMED')
+            evidence=restored['diagnostic']['exception_chain'][0]['diagnostic_context']
+            self.assertEqual(evidence['stages']['tn'],'SKIPPED')
+            self.assertEqual(evidence['sections']['tn'],'INCOMPLETE')
+            for name in ('allocate','write_sn','print_sn','upload','measure','calibrate'):
+                getattr(service,name).assert_not_called()
+
+    def test_recovery_rejects_missing_and_null_report_evidence_before_downstream_actions(self):
+        for missing in ('summary_absent','summary_null','stages_null','sections_null','tn_null'):
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as folder:
+                config=StationConfig(simulation=True)
+                service=DemoServices(config,lambda:False,lambda *args:None)
+                service.render=Mock();service.allocate=Mock(side_effect=TimeoutError('MES unavailable'))
+                runner=StationRunner(config,root=Path(folder),services=service)
+                record=runner.begin('incoming')
+                if missing=='summary_absent': record.pop('summary')
+                elif missing=='summary_null': record['summary']=None
+                elif missing=='tn_null': record['summary']['stages']['tn']=None
+                else: record['summary'][missing.removesuffix('_null')]=None
+                runner.save()
+                for name in ('allocate','write_sn','print_sn','upload','measure','calibrate'):
+                    setattr(service,name,Mock())
+                restored=runner.resume()
+                self.assertEqual(restored['status'],'FAILED')
+                self.assertEqual(restored['diagnostic']['code'],'MEASUREMENT_RECOVERY_UNCONFIRMED')
+                for name in ('allocate','write_sn','print_sn','upload','measure','calibrate'):
+                    getattr(service,name).assert_not_called()
+
+    def test_conflicting_duplicate_sections_never_display_or_resume_as_passed(self):
+        for verdicts in (('PASS','FAIL'),('FAIL','PASS')):
+            with self.subTest(verdicts=verdicts), tempfile.TemporaryDirectory() as folder:
+                config=StationConfig(simulation=True)
+                events=[];emit=lambda kind,value:events.append((kind,value))
+                service=DemoServices(config,lambda:False,emit)
+                service.render=Mock();service.allocate=Mock(side_effect=TimeoutError('MES unavailable'))
+                runner=StationRunner(config,root=Path(folder),services=service,emit=emit)
+                record=runner.begin('incoming')
+                record['summary']['sections']=[dict(name='kt',status=status) for status in verdicts]+[
+                    dict(name='tn',status='PASS')]
+                runner.save();events.clear()
+                for name in ('allocate','write_sn','print_sn','upload','measure','calibrate'):
+                    setattr(service,name,Mock())
+                restored=runner.resume()
+                self.assertEqual(self.states(events,'kt'),['INCOMPLETE'])
+                self.assertEqual(self.states(events,'tn'),['DONE'])
+                self.assertEqual(restored['diagnostic']['code'],'MEASUREMENT_RECOVERY_UNCONFIRMED')
+                evidence=restored['diagnostic']['exception_chain'][0]['diagnostic_context']
+                self.assertEqual(evidence['section_reports']['kt'],list(verdicts))
+                for name in ('allocate','write_sn','print_sn','upload','measure','calibrate'):
+                    getattr(service,name).assert_not_called()
+
+    def test_gui_collection_and_incomplete_states_use_existing_warning_and_failure_colors(self):
+        from tests.test_factory_modes import window
+        host=window();host.steps=Mock();host.steps.exists.return_value=True
+        host.refresh_progress=Mock();host.stopping=False;host.terminal_prompt=None
+        for state in ('COLLECTED','INCOMPLETE','WAITING'):
+            host.events.put(('step',dict(name='kt',status=state)))
+        while not host.events.empty():host.process_events()
+        updates=[call.kwargs for call in host.steps.item.call_args_list]
+        self.assertEqual([item['values'][1] for item in updates],['已采集，待判定','未完成','等待'])
+        self.assertEqual([item['tags'] for item in updates],[('PENDING',),('FAILED',),('WAITING',)])
+
+
+class RecoveryIdentityTests(unittest.TestCase):
+    def interrupted(self, root, *, allocate='FAILED', formal_written=False):
+        from scripts.factory_test.station_config import atomic_json
+        config = StationConfig()
+        directory = Path(root) / 'data' / 'piece-A'
+        directory.mkdir(parents=True)
+        steps = dict(firmware='DONE', assign_id='DONE', base_sn='DONE',
+                     calibrate='DONE', measure='DONE', allocate=allocate)
+        if formal_written:
+            steps['write_sn'] = 'DONE'
+        record = dict(session='piece-A', directory=str(directory), status='FAILED', demo=False,
+            config=dict(asdict(config), target_id=config.target_id), steps=steps,
+            detected_sn='incoming-A', detected_id=config.target_id, base_sn=config.base_sn,
+            module_sn=SN if allocate == 'DONE' else None, request_id='request-A',
+            mes_payload=dict(requestId='request-A'), log_boot_id='boot-A', connection_id='connection-A')
+        path = directory / 'station.json'
+        atomic_json(path, record)
+        atomic_json(Path(root) / 'active.json', dict(record=str(path)))
+        services = Mock()
+        services.probe.return_value = SN if formal_written else config.base_sn
+        runner = StationRunner(config, root=root, services=services)
+        return runner, services, path, record
+
+    def test_shared_temporary_sn_cannot_reuse_pass_or_allocated_sn_for_a_replacement(self):
+        for allocation in ('RUNNING', 'FAILED', 'DONE'):
+            with self.subTest(allocation=allocation), tempfile.TemporaryDirectory() as tmp:
+                runner, services, path, before = self.interrupted(tmp, allocate=allocation)
+                runner.run = Mock()
+                with self.assertRaises(RecoveryRequired) as caught:
+                    runner.resume()
+                self.assertEqual(caught.exception.diagnostic_code, 'RECOVERY_IDENTITY_UNVERIFIED')
+                runner.run.assert_not_called()
+                services.probe.assert_not_called()
+                services.allocate.assert_not_called()
+                services.write_sn.assert_not_called()
+                services.measure.assert_not_called()
+                self.assertEqual(json.loads(path.read_text(encoding='utf-8')), before)
+
+    def test_same_software_connection_does_not_make_temporary_sn_unique(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner, services, path, before = self.interrupted(tmp)
+            runner.log = Mock()
+            runner.log.owner.boot_id = before['log_boot_id']
+            runner.log.context = dict(connection_id=before['connection_id'])
+            with self.assertRaises(RecoveryRequired) as caught:
+                runner.resume()
+            self.assertEqual(caught.exception.diagnostic_code, 'RECOVERY_IDENTITY_UNVERIFIED')
+            services.probe.assert_not_called()
+            self.assertEqual(json.loads(path.read_text(encoding='utf-8')), before)
+
+    def test_verified_formal_sn_can_still_resume_after_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner, services, _, _ = self.interrupted(tmp, allocate='DONE', formal_written=True)
+            runner.run = Mock(return_value=dict(status='RESUMED'))
+            self.assertEqual(runner.resume(), dict(status='RESUMED'))
+            services.probe.assert_called_once_with()
+            runner.run.assert_called_once_with()
+
+    def test_recovery_before_temporary_sn_write_keeps_existing_identity_check(self):
+        from scripts.factory_test.station_config import atomic_json
+        with tempfile.TemporaryDirectory() as tmp:
+            runner, services, path, record = self.interrupted(tmp)
+            record['steps'] = dict(firmware='DONE', assign_id='DONE')
+            atomic_json(path, record)
+            services.probe.return_value = record['detected_sn']
+            runner.run = Mock(return_value=dict(status='RESUMED'))
+            self.assertEqual(runner.resume(), dict(status='RESUMED'))
+            services.probe.assert_called_once_with()
+            runner.run.assert_called_once_with()

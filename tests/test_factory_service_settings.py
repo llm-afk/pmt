@@ -363,7 +363,9 @@ class ServiceSettingsTests(unittest.TestCase):
         from scripts.factory_test.integrations import PendingConfiguration
         config=StationConfig(simulation=True)
         services=DemoServices(config,lambda:False,lambda *_:None)
-        services.measure=Mock(return_value=dict(status='PASS',sections=[],stages={},demo=True,
+        services.measure=Mock(return_value=dict(status='PASS',demo=True,
+            sections=[dict(name=name,status='PASS') for name in ('kt','tn')],
+            stages={name:dict(status='COMPLETED') for name in ('kt','tn')},
             started_at='2026-11-06T12:00:00+08:00'))
         services.render=Mock()
         services.allocate=Mock(side_effect=PendingConfiguration('offline fixture pause'))

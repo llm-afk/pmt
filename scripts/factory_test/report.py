@@ -1,5 +1,6 @@
 """离线指标及白底矢量PDF；不改变原始CSV，不控制设备。"""
 from bisect import bisect_left
+from itertools import pairwise
 import csv
 import math
 from pathlib import Path
@@ -91,7 +92,11 @@ def metric(label, value, unit='', lo=None, hi=None, precision=3):
 
 def kt_target_curve(rows, summary):
     """新CSV用实际下发目标；旧数据只能按已保存的斜坡参数重建理论目标。"""
-    estimated = not any(r.get('motor_application_target_torque', '') != '' for r in rows)
+    # 旧格式确实没有这一列；新格式的空列意味着记录缺失，不能用理论值代替。
+    config = summary['stages']['kt'].get('result', {}).get('config', {})
+    estimated = 'motor_application_target_torque' not in rows[0]
+    if estimated and 'motor_application_target_torque' in config.get('OUTPUT_COLUMNS', ()):
+        raise ValueError('KT采集配置要求记录实际下发目标，CSV缺少该列')
     if 'time_ms' not in rows[0]:
         # 历史两路平铺文件先按真实时间一对一配对，不能用行号冒充同步。
         from scripts.factory_test.measurements.csv_streams import independent_rows
@@ -108,18 +113,41 @@ def kt_target_curve(rows, summary):
                 events.append(event)
         fields, packed = independent_rows(['time_ms', *fields], events, align_motor=True)
         rows = [dict(zip(fields, row)) for row in packed]
-    duration = summary['stages']['kt'].get('result', {}).get('config', {}).get('RAMP_DURATION_S', 3.0)
+    duration = config.get('RAMP_DURATION_S', 3.0)
     maximum = abs(summary['target_torque'])
-    if maximum <= 0 or duration <= 0: raise ValueError('KT目标或斜坡参数无效')
-    points = []
+    if not all(math.isfinite(v) and v > 0 for v in (maximum, duration)):
+        raise ValueError('KT目标或斜坡参数无效')
+    points, times = [], []
     for row in rows:
-        if row.get('dyno_torque_smooth_nm', '') == '': continue
-        x = (maximum*min(1.0, max(0.0, float(row['time_ms'])/(duration*1000))) if estimated else
+        if row.get('dyno_torque_smooth_nm') in ('', None): continue
+        if (row.get('time_ms') in ('', None)
+                or (not estimated and row.get('motor_application_target_torque') in ('', None))):
+            raise ValueError('KT配对数据缺少采样时间或实际下发目标')
+        at = float(row['time_ms'])
+        if not math.isfinite(at): raise ValueError('KT采样时间非有限数')
+        x = (maximum*min(1.0, max(0.0, at/(duration*1000))) if estimated else
              float(row['motor_application_target_torque']))
         y = float(row['dyno_torque_smooth_nm'])
         if not (math.isfinite(x) and math.isfinite(y)): raise ValueError('KT数据非有限数')
         points.append((x, y))
+        times.append(at)
     if len(points) < 10: raise ValueError('KT有效目标/测功机平滑数据不足')
+    if all(x == points[0][0] for x, _ in points):
+        raise ValueError('KT有效数据中目标扭矩未变化，无法评价扭矩斜坡')
+    # 只用本件采集时保存的时间参数检查覆盖，不给历史文件套用推测的采样率。
+    if 'RAMP_DURATION_S' in config and 'FEEDBACK_TIMEOUT_S' in config:
+        allowed_ms = 1000 * config['FEEDBACK_TIMEOUT_S']
+        end_ms = 1000 * duration
+        if not math.isfinite(allowed_ms) or allowed_ms <= 0:
+            raise ValueError('KT反馈时限记录无效')
+        if min(times) < 0 or max(times) > end_ms + 1e-6:
+            raise ValueError('KT有效样本超出本次记录的斜坡时间范围')
+        times.extend((0.0, end_ms))
+        times.sort()
+        left, right = max(pairwise(times), key=lambda interval: interval[1] - interval[0])
+        if right - left > allowed_ms + 1e-6:
+            raise ValueError(f'KT斜坡配对数据覆盖不足：{left:.1f}～{right:.1f} ms 无样本'
+                             f'（本次反馈时限 {allowed_ms:g} ms）')
     return points, estimated
 
 
@@ -189,7 +217,7 @@ def analyze(directory, summary):
             temperatures = [float(r[k]) for r in rows for k in ('motor_temperature_c', 'driver_temperature_c') if r.get(k)]
             section['max_temperature_c'] = max(temperatures) if temperatures else None
             section['csv_rows'] = len(rows)
-        except (OSError, ValueError, KeyError, ZeroDivisionError) as exc:
+        except (OSError, ValueError, TypeError, KeyError, ZeroDivisionError) as exc:
             section.update(status='INCOMPLETE', note=str(exc), points=[], metrics=[])
     return sections
 

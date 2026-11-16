@@ -1038,6 +1038,36 @@ class FactoryWindow:
                 continue
             try:
                 probe_latch = self.latch
+                # Serial checks and file access can be slow. Read motor identity last
+                # so readiness and removal use a new sample, with one CAN session per scan.
+                if time.monotonic()-self.last_health > 2:
+                    with log_scope(self.diagnostics.current.bind(phase='device_health')):
+                        health = self.device_health.check(config,
+                            emit=lambda name,info:self.events.put(('device_health',dict(name=name,info=info,
+                                config_revision=revision,mode_generation=mode_generation))),cancelled=self.station_cancelled,
+                                generation=(mode_generation,),
+                                inventory_emit=lambda info:self.events.put(('serial_inventory',dict(info,
+                                    config_revision=revision,mode_generation=mode_generation))))
+                    with self.lock:
+                        if (self.configuring or revision != self.config_revision or config != self.config
+                                or mode_generation != self.mode_generation):
+                            continue
+                        self.health_states = health
+                        self.last_health = time.monotonic()
+                if not config.simulation and (revision!=firmware_revision or time.monotonic()>=firmware_check_at):
+                    from .firmware_library import load_target, FirmwareError
+                    try:
+                        _, firmware_info = load_target(config)
+                        firmware_file,firmware_sha256,firmware_issue=firmware_info['file'],firmware_info['sha256'],''
+                    except (OSError,FirmwareError,ValueError) as exc:
+                        firmware_file,firmware_sha256,firmware_issue='','',str(exc)
+                    firmware_revision,firmware_check_at=revision,time.monotonic()+1
+                if self.station_cancelled():
+                    raise InterruptedError('产测已暂停，正在交接连接')
+                with self.lock:
+                    if (self.configuring or revision != self.config_revision or config != self.config
+                            or mode_generation != self.mode_generation or probe_latch is not self.latch):
+                        continue
                 motor_state, detail = 'unavailable', '请连接或选择 CAN 适配器'
                 detected, detected_id = '', None
                 if config.simulation:
@@ -1091,20 +1121,6 @@ class FactoryWindow:
                     self.events.put(('motor_probe', probe.copy()))
                     last_probe_key = preview_key
                     last_station_error = None
-                if time.monotonic()-self.last_health > 2:
-                    with log_scope(self.diagnostics.current.bind(phase='device_health')):
-                        health = self.device_health.check(config,
-                            emit=lambda name,info:self.events.put(('device_health',dict(name=name,info=info,
-                                config_revision=revision,mode_generation=mode_generation))),cancelled=self.station_cancelled,
-                                generation=(mode_generation,),
-                                inventory_emit=lambda info:self.events.put(('serial_inventory',dict(info,
-                                    config_revision=revision,mode_generation=mode_generation))))
-                    with self.lock:
-                        if (self.configuring or revision != self.config_revision or config != self.config
-                                or mode_generation != self.mode_generation):
-                            continue
-                        self.health_states = health
-                        self.last_health = time.monotonic()
                 if self.station_cancelled():
                     raise InterruptedError('产测已暂停，正在交接连接')
                 with self.lock:
@@ -1134,14 +1150,6 @@ class FactoryWindow:
                 needed = [] if config.simulation else [key for key in ('can','dyno','power','printer') if states.get(key)!='READY']
                 support_ready = not needed
                 sn_configured=self.sn_configuration_ready(config)
-                if not config.simulation and (revision!=firmware_revision or time.monotonic()>=firmware_check_at):
-                    from .firmware_library import load_target, FirmwareError
-                    try:
-                        _, firmware_info = load_target(config)
-                        firmware_file,firmware_sha256,firmware_issue=firmware_info['file'],firmware_info['sha256'],''
-                    except (OSError,FirmwareError,ValueError) as exc:
-                        firmware_file,firmware_sha256,firmware_issue='','',str(exc)
-                    firmware_revision,firmware_check_at=revision,time.monotonic()+1
                 if firmware_issue and not config.simulation: needed.append('firmware')
                 if not present: needed.append('motor')
                 if not sn_configured: needed.append('sn_key')
@@ -1373,7 +1381,8 @@ class FactoryWindow:
     def process_events(self):
         if self.closing:
             return
-        statuses=dict(RUNNING='进行中',DONE='完成',FAILED='失败',PENDING='待配置',UNKNOWN='异常已记录',LEGACY='沿用旧流程')
+        statuses=dict(RUNNING='进行中',DONE='完成',FAILED='失败',PENDING='待配置',UNKNOWN='异常已记录',
+                      LEGACY='沿用旧流程',COLLECTED='已采集，待判定',INCOMPLETE='未完成',WAITING='等待')
         started=time.monotonic()
         handled=0
         while (not self.events.empty() and handled<GUI_EVENT_LIMIT
@@ -1549,7 +1558,8 @@ class FactoryWindow:
                 if self.steps.exists(name):
                     label=dict(STEPS)[name]
                     index=[n for n,_ in STEPS].index(name)+1
-                    self.steps.item(name,values=(f'{index:02d}   {label}',statuses[state]),tags=(state,))
+                    tag = {'COLLECTED':'PENDING', 'INCOMPLETE':'FAILED'}.get(state,state)
+                    self.steps.item(name,values=(f'{index:02d}   {label}',statuses[state]),tags=(tag,))
                     if state=='RUNNING' and not self.stopping and not self.terminal_prompt:
                         title='请保持连接，等待自动测试'
                         hint=label+'进行中，请保持电源和 CAN 连接。'

@@ -50,15 +50,15 @@ def execute(args, directory, *, stages=STAGES, identify=read_motor_sn, pause=tim
             if i+1 < len(stages):
                 pause(BETWEEN_TESTS_S)
     except (Exception, KeyboardInterrupt) as exc:
-        from scripts.factory_test.diagnostics import error_details, log_event
+        from scripts.factory_test.diagnostics import error_details, log_event, unconfirmed_cleanup_notes
         log_event('test.exception', '性能测试异常', level='ERROR', error=exc, stages=summary['stages'])
         summary['error'] = str(exc) or '用户中止'
         summary['diagnostic'] = error_details(exc)
         summary['error_notes'] = list(getattr(exc, '__notes__', []))
         # A recorder or context manager can raise while an unconfirmed stop unwinds.
-        for cause in error_details(exc)['exception_chain'][1:]:
-            for note in cause.get('notes', []):
-                if note.startswith('工装停机未确认') and note not in summary['error_notes']:
+        for cause in summary['diagnostic']['exception_chain'][1:]:
+            for note in unconfirmed_cleanup_notes(cause.get('notes', [])):
+                if note not in summary['error_notes']:
                     summary['error_notes'].append(note)
         for stage in summary['stages'].values():
             if stage['status'] == 'RUNNING':

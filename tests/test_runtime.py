@@ -368,7 +368,7 @@ class WorkerStopReceiptTests(unittest.TestCase):
 
     def test_worker_fault_with_real_disable_ack_does_not_raise_unconfirmed_stop(self):
         tr,rt,ch=self.runtime()
-        tr.rx.put(CanFrame(8,bytes.fromhex('0000020000000001'),is_fd=False,is_error=True))
+        tr.rx.put(CanFrame(8,bytes.fromhex('0000020000000001'),is_fd=False,brs=False,is_error=True))
         rt._thread.join(1)
         ch.disable()
         self.assertEqual(ch.stop_status()['disable_receipt']['via'],'worker_cleanup')
@@ -382,7 +382,7 @@ class WorkerStopReceiptTests(unittest.TestCase):
 
     def test_thread_exit_or_best_effort_write_does_not_replace_disable_ack(self):
         tr,rt,ch=self.runtime(drop_stop=True)
-        tr.rx.put(CanFrame(8,bytes.fromhex('0000020000000001'),is_fd=False,is_error=True))
+        tr.rx.put(CanFrame(8,bytes.fromhex('0000020000000001'),is_fd=False,brs=False,is_error=True))
         rt._thread.join(1)
         with self.assertRaises(RuntimeError):ch.disable()
         self.assertFalse(ch.stop_status()['worker_cleanup']['confirmed'])
@@ -401,7 +401,7 @@ class RuntimeSupervisionTests(unittest.TestCase):
                 self.peer=Transport();self.drop=False
             def send(self,frame):
                 if self.drop and frame.can_id<0x600:
-                    self.peer.rx.put(CanFrame(8,bytes.fromhex('0000020000000001'),is_fd=False,is_error=True))
+                    self.peer.rx.put(CanFrame(8,bytes.fromhex('0000020000000001'),is_fd=False,brs=False,is_error=True))
                 else:self.peer.send(frame)
             def recv(self,timeout):
                 deadline=time.perf_counter()+timeout
@@ -419,7 +419,7 @@ class RuntimeSupervisionTests(unittest.TestCase):
     def test_three_low_counter_reports_do_not_stop_valid_feedback(self):
         peer,rt,ch=self.create()
         try:
-            for _ in range(3):peer.peer.rx.put(CanFrame(8,bytes.fromhex('0000020000000001'),is_fd=False,is_error=True))
+            for _ in range(3):peer.peer.rx.put(CanFrame(8,bytes.fromhex('0000020000000001'),is_fd=False,brs=False,is_error=True))
             time.sleep(.03)
             self.assertTrue(rt._thread.is_alive());self.assertEqual(peer.protocol_reports,3)
             self.assertEqual(ch.state().node_id,1);self.assertGreater(ch.stats()['rx_count'],0)
@@ -442,7 +442,7 @@ class RuntimeSupervisionTests(unittest.TestCase):
     def test_bus_off_still_stops_immediately_under_supervision(self):
         from motor_platform.components.motor.client import CanBusError
         peer,rt,ch=self.create()
-        peer.peer.rx.put(CanFrame(0x48,bytes.fromhex('000008000000f800'),is_fd=False,is_error=True))
+        peer.peer.rx.put(CanFrame(0x48,bytes.fromhex('000008000000f800'),is_fd=False,brs=False,is_error=True))
         rt._thread.join(1)
         self.assertIsInstance(rt._error,CanBusError)
         self.assertEqual(rt._error.can_id,0x48)
@@ -462,7 +462,7 @@ class PendingStopReceiptTests(unittest.TestCase):
             return send(frame)
         tr.send=blocked
         try:
-            tr.rx.put(CanFrame(8,bytes.fromhex('0000020000000001'),is_fd=False,is_error=True))
+            tr.rx.put(CanFrame(8,bytes.fromhex('0000020000000001'),is_fd=False,brs=False,is_error=True))
             self.assertTrue(started.wait(1))
             with self.assertRaises(RuntimeError):ch.disable(timeout=.005)
             self.assertFalse(ch.stop_status()['worker_finished'])
@@ -479,15 +479,15 @@ class ClosedRuntimeReceiptTests(unittest.TestCase):
 
     def test_closed_bus_cannot_reuse_an_old_stop_receipt_as_a_new_command(self):
         tr,rt,ch=self.runtime()
-        tr.rx.put(CanFrame(8,bytes.fromhex('0000020000000001'),is_fd=False,is_error=True))
+        tr.rx.put(CanFrame(8,bytes.fromhex('0000020000000001'),is_fd=False,brs=False,is_error=True))
         rt._thread.join(1);ch.disable()
         with self.assertRaises(RuntimeShutdownError):rt.close()
         rt._bus.close()
         with self.assertRaises(RuntimeError):ch.disable()
 
 
-class RuntimeCounterUsbTests(unittest.TestCase):
-    def create(self, *, stop_ack=True):
+class RuntimeUsbReportTests(unittest.TestCase):
+    def create(self, *, stop_ack=True, report_id=0):
         from motor_platform.transports.canable import Canable, DLC_LENGTHS
 
         class Peer(Canable):
@@ -499,15 +499,15 @@ class RuntimeCounterUsbTests(unittest.TestCase):
                 self._usb = SimpleNamespace(input=0x81, transfer=self.read)
 
             def send(self, frame):
-                counter = CanFrame(0x200, bytes.fromhex('0000000000000001'),
+                report = CanFrame(report_id, bytes.fromhex('0000000000000001'),
                                    is_fd=False, brs=False, is_error=True)
                 if frame.can_id < 0x600:
-                    self.peer.rx.put(counter)
+                    self.peer.rx.put(report)
                     if self.drop_feedback:
                         return
                 if (not stop_ack and frame.can_id >= 0x600 and
                         frame.data[1:3] == b'\x02\x20' and frame.data[4] == 2):
-                    self.peer.rx.put(counter)
+                    self.peer.rx.put(report)
                     return
                 self.peer.send(frame)
 
@@ -532,7 +532,7 @@ class RuntimeCounterUsbTests(unittest.TestCase):
         self.addCleanup(bus.close)
         return peer, runtime, channel
 
-    def test_standard_counter_packets_with_real_feedback_keep_runtime_active(self):
+    def test_class_free_counter_packets_with_real_feedback_keep_runtime_active(self):
         peer, runtime, channel = self.create()
         try:
             time.sleep(.03)
@@ -541,7 +541,7 @@ class RuntimeCounterUsbTests(unittest.TestCase):
             self.assertGreater(channel.stats()['rx_count'], 0)
             self.assertGreater(channel.stats()['can_counter_reports'], 0)
             report = channel.stats()['can_last_counter_report']
-            self.assertEqual(report['can_id'], 0x200)
+            self.assertEqual(report['can_id'], 0)
             self.assertEqual(report['data'], '0000000000000001')
             self.assertEqual(channel.state().node_id, 1)
             channel.disable()
@@ -563,19 +563,56 @@ class RuntimeCounterUsbTests(unittest.TestCase):
             runtime.close()
         self.assertTrue(caught.exception.cleanup_confirmed)
 
-    def test_counter_packets_cannot_substitute_for_stop_ack(self):
-        peer, runtime, channel = self.create(stop_ack=False)
+    def test_crc_packets_with_real_feedback_remain_protocol_diagnostics(self):
+        peer, runtime, channel = self.create(report_id=0x200)
+        try:
+            time.sleep(.03)
+            self.assertTrue(runtime._thread.is_alive())
+            self.assertIsNone(runtime._error)
+            statistics = channel.stats()
+            self.assertGreater(statistics['rx_count'], 0)
+            self.assertGreater(statistics['can_protocol_reports'], 0)
+            self.assertEqual(statistics['can_counter_reports'], 0)
+            report = statistics['can_last_protocol_report']
+            self.assertEqual(report['can_id'], 0x200)
+            self.assertEqual(report['kind'], 'crc')
+            self.assertEqual(report['data'], '0000000000000001')
+            self.assertTrue(report['feedback_supervised'])
+            channel.disable()
+        finally:
+            runtime.close()
+
+    def test_crc_packets_cannot_refresh_feedback_or_replace_stop_ack(self):
+        peer, runtime, channel = self.create(report_id=0x200)
         peer.drop_feedback = True
         runtime._thread.join(1)
         self.assertFalse(runtime._thread.is_alive())
         self.assertEqual(runtime._error.diagnostic_code, 'MOTOR_FEEDBACK_STALE')
-        with self.assertRaises(RuntimeError):
-            channel.disable()
-        self.assertFalse(channel.stop_status()['worker_cleanup']['confirmed'])
-        self.assertFalse(channel.stop_status()['disable_receipt']['confirmed'])
+        self.assertGreater(peer.protocol_reports, 0)
+        self.assertEqual(peer.counter_reports, 0)
+        channel.disable()
+        self.assertTrue(channel.stop_status()['worker_cleanup']['confirmed'])
+        self.assertEqual(channel.stop_status()['disable_receipt']['via'], 'worker_cleanup')
+        self.assertFalse(peer.peer.enabled[1])
         with self.assertRaises(RuntimeShutdownError) as caught:
             runtime.close()
-        self.assertFalse(caught.exception.cleanup_confirmed)
+        self.assertTrue(caught.exception.cleanup_confirmed)
+
+    def test_counter_and_crc_packets_cannot_substitute_for_stop_ack(self):
+        for report_id in (0, 0x200):
+            with self.subTest(report_id=report_id):
+                peer, runtime, channel = self.create(stop_ack=False, report_id=report_id)
+                peer.drop_feedback = True
+                runtime._thread.join(1)
+                self.assertFalse(runtime._thread.is_alive())
+                self.assertEqual(runtime._error.diagnostic_code, 'MOTOR_FEEDBACK_STALE')
+                with self.assertRaises(RuntimeError):
+                    channel.disable()
+                self.assertFalse(channel.stop_status()['worker_cleanup']['confirmed'])
+                self.assertFalse(channel.stop_status()['disable_receipt']['confirmed'])
+                with self.assertRaises(RuntimeShutdownError) as caught:
+                    runtime.close()
+                self.assertFalse(caught.exception.cleanup_confirmed)
 
 
 if __name__=='__main__':unittest.main()
