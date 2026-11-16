@@ -159,6 +159,7 @@ def run(motor, dyno, ui, args, result):
         raise
     finally:
         original = sys.exception()
+        result['_stop_probe'] = getattr(motor,'stop_status',None)
         if 'runtime_snapshot' not in result:
             result['runtime_snapshot'] = device_snapshot(motor,dyno,target=applied,loop_at=locals().get('now',time.perf_counter()))
         try:

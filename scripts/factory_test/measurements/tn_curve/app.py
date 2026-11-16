@@ -238,6 +238,7 @@ def run(motor, dyno, power, pool, ui, writer, summary, *, torque=None):
             time.sleep(0.001)
     finally:
         active_error = sys.exception()
+        summary['_stop_probe'] = getattr(motor,'stop_status',None)
         summary['runtime_snapshot'] = device_snapshot(motor,dyno,target=applied_torque,
                                                      loop_at=locals().get('now',time.perf_counter()))
         record_cutoff = time.perf_counter()

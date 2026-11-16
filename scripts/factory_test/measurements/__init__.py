@@ -40,11 +40,18 @@ def device_snapshot(motor, dyno, *, target, loop_at):
 
 def log_measurement_snapshot(stage, summary):
     from ..diagnostics import log_event
+    probe = summary.pop('_stop_probe', None)
+    if callable(probe):
+        try:
+            summary['stop_status'] = probe()
+        except Exception as exc:
+            summary['stop_status'] = dict(snapshot_error=repr(exc))
     snapshot = summary.get('runtime_snapshot')
     if snapshot:
         log_event('test.runtime.summary', '采集运行统计，故障快照在停机前取自内存',
                   level='WARNING' if summary.get('reason') == 'error' else 'INFO',
-                  stage=stage, reason=summary.get('reason'), snapshot=snapshot)
+                  stage=stage, reason=summary.get('reason'), snapshot=snapshot,
+                  stop_status=summary.get('stop_status'))
 
 
 def power_off(power, summary=None):

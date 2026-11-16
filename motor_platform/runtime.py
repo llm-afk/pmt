@@ -37,9 +37,10 @@ class Stats:
 
 class RuntimeShutdownError(RuntimeError):
     """The worker failed; distinguish its fault from unconfirmed cleanup."""
-    def __init__(self, error, *, cleanup_confirmed):
+    def __init__(self, error, *, cleanup_confirmed, cleanup_results=None):
         super().__init__(f'CAN runtime stopped with error: {error}')
         self.cleanup_confirmed = cleanup_confirmed
+        self.diagnostic_context = dict(cleanup_confirmed=cleanup_confirmed, motors=cleanup_results or {})
         if not cleanup_confirmed:
             self.add_note('工装停机未确认：CAN 工作线程退出时电机失能未获确认，请切断工装电源。')
 
@@ -68,6 +69,7 @@ class MotorChannel:
         self._last_rx = 0.0
         self._gap_anchor = None
         self._stats = Stats()
+        self._disable_receipt = None
 
     @property
     def node_id(self):
@@ -113,10 +115,38 @@ class MotorChannel:
 
         Resets prior target to neutral. Call set_mit after enable, then keep refreshing it.
         """
+        self._disable_receipt = None
         return self._runtime._call(self, True, positive(timeout))
 
     def disable(self, timeout=0.5):
-        return self._runtime._call(self, False, positive(timeout))
+        timeout = positive(timeout)
+        try:
+            result = self._runtime._call(self, False, timeout)
+        except RuntimeError:
+            # A failed worker owns emergency cleanup. Wait for its actual receipt;
+            # never enqueue another write or infer a stop merely from thread exit.
+            runtime = self._runtime
+            if (not runtime._bus._closed and threading.current_thread() is not runtime._thread and
+                    (runtime._error is not None or runtime._stop.is_set())):
+                runtime._thread.join(timeout)
+                cleanup = runtime._cleanup_results.get(self.node_id, {})
+                previous = self._disable_receipt or {}
+                if not runtime._thread.is_alive() and (cleanup.get('confirmed') or previous.get('confirmed')):
+                    self._disable_receipt = dict(confirmed=True,
+                        via='worker_cleanup' if cleanup.get('confirmed') else 'previous_disable_ack',
+                        confirmed_at=cleanup.get('confirmed_at', previous.get('confirmed_at')))
+                    return None
+                self._disable_receipt = dict(confirmed=False, via='worker_cleanup',
+                                             worker_finished=not runtime._thread.is_alive())
+            raise
+        self._disable_receipt = dict(confirmed=True, via='disable_command', confirmed_at=time.perf_counter())
+        return result
+
+    def stop_status(self):
+        with self._runtime._lock:
+            return dict(disable_receipt=dict(self._disable_receipt or {}),
+                        worker_finished=not self._runtime._thread.is_alive(),
+                        worker_cleanup=dict(getattr(self._runtime,'_cleanup_results',{}).get(self.node_id,{})))
 
     def monitor(self):
         """Opt into periodic neutral RPDO5 feedback, including while disabled.
@@ -154,6 +184,7 @@ class MotorChannel:
             data['can_counter_reports'] = getattr(self._runtime._bus.transport, 'counter_reports', 0)
             data['can_protocol_reports'] = getattr(self._runtime._bus.transport, 'protocol_reports', 0)
             data['can_last_protocol_report'] = getattr(self._runtime._bus.transport, 'last_protocol_report', None)
+            data['can_protocol_history'] = list(getattr(self._runtime._bus.transport, 'protocol_history', ()))
             data['can_last_counter_report'] = getattr(self._runtime._bus.transport, 'last_counter_report', None)
             now = time.perf_counter()
             feedback = self._motor.last_state
@@ -178,7 +209,7 @@ class MotorChannel:
                         target=asdict(self._target), captured_at=now,
                         worker_alive=self._runtime._thread.is_alive(),
                         worker_error=repr(self._runtime._error) if self._runtime._error else None,
-                        poll_inflight_ms=(now-started)*1000 if started else 0)
+                        poll_inflight_ms=(now-started)*1000 if started else 0, stop_status=self.stop_status())
 
 
 class ControlRuntime:
@@ -194,6 +225,9 @@ class ControlRuntime:
         self._queue = queue.Queue(maxsize=32)
         self._error = None
         self._cleanup_error = None
+        self._cleanup_results = {}
+        self._close_error_reported = False
+        self._supervision_policy = getattr(bus.transport, 'set_feedback_supervision', None)
         self._max_poll_s = self._max_poll_overrun_s = 0.0
         self._touched = set()
         self._channels = {name: MotorChannel(self, name, m, self.rate_hz) for name, m in motors.items()}
@@ -208,9 +242,11 @@ class ControlRuntime:
                 raise RuntimeError("bus already has a runtime")
             self._bus._io_owner = self._thread
         try:
+            if callable(self._supervision_policy): self._supervision_policy(True)
             self._thread.start()
         except BaseException:
             self._bus._io_owner = None
+            if callable(self._supervision_policy): self._supervision_policy(False)
             raise
         self._ready.wait()
         return self
@@ -369,8 +405,11 @@ class ControlRuntime:
             for channel in self._channels.values():
                 with self._lock: channel._active = channel._monitoring = False
                 if channel.node_id in self._touched:
-                    try: channel._motor.disable(timeout=0.1)
+                    try:
+                        channel._motor.disable(timeout=0.1)
+                        self._cleanup_results[channel.node_id] = dict(confirmed=True, confirmed_at=time.perf_counter())
                     except BaseException as exc:
+                        self._cleanup_results[channel.node_id] = dict(confirmed=False, error=repr(exc))
                         self._cleanup_error = exc
                         self._error = self._error or exc
                         with self._lock: channel._stats.fault = f"disable unconfirmed: {exc!r}"
@@ -378,6 +417,7 @@ class ControlRuntime:
                         except BaseException as send_exc:
                             self._error = self._error or send_exc
             self._bus._io_owner = None
+            if callable(self._supervision_policy): self._supervision_policy(False)
             # Synchronize with producer's check + enqueue, so no future can be stranded.
             with self._lock:
                 while True:
@@ -388,8 +428,12 @@ class ControlRuntime:
     def close(self):
         self._stop.set()
         self._thread.join()
-        if self._error is not None:
-            raise RuntimeShutdownError(self._error, cleanup_confirmed=self._cleanup_error is None) from self._error
+        with self._lock:
+            report = self._error is not None and not self._close_error_reported
+            self._close_error_reported = self._close_error_reported or report
+        if report:
+            raise RuntimeShutdownError(self._error, cleanup_confirmed=self._cleanup_error is None,
+                                       cleanup_results=self._cleanup_results) from self._error
 
     def __enter__(self):
         return self
@@ -400,7 +444,10 @@ class ControlRuntime:
         except Exception as cleanup:
             if exc is None:
                 raise
-            exc.add_note(f'Cleanup failed: {cleanup}')
+            if isinstance(cleanup,RuntimeShutdownError) and cleanup.cleanup_confirmed:
+                exc.add_note('CAN 运行异常已保留；工作线程收尾已确认。')
+            else:
+                exc.add_note(f'Cleanup failed: {cleanup}')
             for note in getattr(cleanup, '__notes__', ()):
                 if note not in exc.__notes__:
                     exc.add_note(note)

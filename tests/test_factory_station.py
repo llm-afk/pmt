@@ -861,3 +861,14 @@ class MeasurementFaultPropagationTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=1) as pool:
             pool.submit(observer,'power.command.confirmed',command='OUTP OFF').result(timeout=2)
         target.event.assert_called_once_with('power.command.confirmed',command='OUTP OFF')
+
+
+class FinalStopLogTests(unittest.TestCase):
+    def test_final_worker_receipt_is_recorded_after_cleanup_without_serializing_objects(self):
+        from scripts.factory_test.measurements import log_measurement_snapshot
+        summary=dict(reason='error',runtime_snapshot=dict(before_stop=True),
+                     _stop_probe=lambda:dict(disable_receipt=dict(confirmed=True,via='worker_cleanup')))
+        with patch('scripts.factory_test.diagnostics.log_event') as log:log_measurement_snapshot('kt',summary)
+        self.assertTrue(log.call_args.kwargs['stop_status']['disable_receipt']['confirmed'])
+        self.assertNotIn('_stop_probe',summary)
+        json.dumps(summary)

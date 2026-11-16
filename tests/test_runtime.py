@@ -300,7 +300,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertIsNone(bus._io_owner)
 
 
-if __name__=='__main__':unittest.main()
+
 
 
 class FeedbackDiagnosticsTests(unittest.TestCase):
@@ -347,3 +347,143 @@ class FeedbackDiagnosticsTests(unittest.TestCase):
         with self.assertRaises(MotorFeedbackTimeout) as caught:ControlRuntime._tick(runtime,time.perf_counter())
         self.assertEqual(caught.exception.diagnostic_context['feedback_limit_ms'],100)
         self.assertEqual(channel._stats.feedback_limited_periods,1)
+
+
+class WorkerStopReceiptTests(unittest.TestCase):
+    def runtime(self, *, drop_stop=False):
+        tr=Transport()
+        if drop_stop:
+            send=tr.send
+            def without_stop_ack(frame):
+                if frame.can_id>=0x600 and frame.data[1:3]==b'\x02\x20' and frame.data[4]==2:
+                    tr.sent.append(frame)
+                    return
+                return send(frame)
+            tr.send=without_stop_ack
+        bus=MotorBus(tr);rt=ControlRuntime(bus,{1:bus.motor(1)}).start()
+        channel=rt.motor(1);channel.enable()
+        self.addCleanup(bus.close)
+        self.addCleanup(lambda:rt._thread.join(1))
+        return tr,rt,channel
+
+    def test_worker_fault_with_real_disable_ack_does_not_raise_unconfirmed_stop(self):
+        tr,rt,ch=self.runtime()
+        tr.rx.put(CanFrame(8,bytes.fromhex('0000020000000001'),is_fd=False,is_error=True))
+        rt._thread.join(1)
+        ch.disable()
+        self.assertEqual(ch.stop_status()['disable_receipt']['via'],'worker_cleanup')
+        self.assertTrue(ch.stop_status()['worker_cleanup']['confirmed'])
+        self.assertFalse(tr.enabled[1])
+        with self.assertRaises(RuntimeShutdownError) as caught:rt.close()
+        self.assertTrue(caught.exception.cleanup_confirmed)
+        self.assertFalse(getattr(caught.exception,'__notes__',[]))
+        rt.close()  # Bench and context exit must not duplicate the same cleanup failure.
+        with self.assertRaises(RuntimeError):ch.set_mit(MitCommand(torque=1))
+
+    def test_thread_exit_or_best_effort_write_does_not_replace_disable_ack(self):
+        tr,rt,ch=self.runtime(drop_stop=True)
+        tr.rx.put(CanFrame(8,bytes.fromhex('0000020000000001'),is_fd=False,is_error=True))
+        rt._thread.join(1)
+        with self.assertRaises(RuntimeError):ch.disable()
+        self.assertFalse(ch.stop_status()['worker_cleanup']['confirmed'])
+        self.assertFalse(ch.stop_status()['disable_receipt']['confirmed'])
+        with self.assertRaises(RuntimeShutdownError) as caught:rt.close()
+        self.assertFalse(caught.exception.cleanup_confirmed)
+        self.assertIn('停机未确认',str(caught.exception.__notes__))
+
+
+class RuntimeSupervisionTests(unittest.TestCase):
+    def create(self):
+        from motor_platform.transports.canable import Canable
+        class Peer(Canable):
+            def __init__(self):
+                super().__init__('in-memory')
+                self.peer=Transport();self.drop=False
+            def send(self,frame):
+                if self.drop and frame.can_id<0x600:
+                    self.peer.rx.put(CanFrame(8,bytes.fromhex('0000020000000001'),is_fd=False,is_error=True))
+                else:self.peer.send(frame)
+            def recv(self,timeout):
+                deadline=time.perf_counter()+timeout
+                while (remaining:=deadline-time.perf_counter())>0:
+                    frame=self.peer.recv(remaining)
+                    if frame is None:return None
+                    if self._record_transient(frame,time.perf_counter()):continue
+                    return frame
+                return None
+        peer=Peer();bus=MotorBus(peer);rt=ControlRuntime(bus,{1:bus.motor(1)}).start()
+        ch=rt.motor(1);ch.enable()
+        self.addCleanup(bus.close)
+        return peer,rt,ch
+
+    def test_three_low_counter_reports_do_not_stop_valid_feedback(self):
+        peer,rt,ch=self.create()
+        try:
+            for _ in range(3):peer.peer.rx.put(CanFrame(8,bytes.fromhex('0000020000000001'),is_fd=False,is_error=True))
+            time.sleep(.03)
+            self.assertTrue(rt._thread.is_alive());self.assertEqual(peer.protocol_reports,3)
+            self.assertEqual(ch.state().node_id,1);self.assertGreater(ch.stats()['rx_count'],0)
+            ch.disable()
+        finally:rt.close()
+        self.assertFalse(peer._feedback_supervised)
+
+    def test_error_reports_never_refresh_feedback_or_bypass_100ms_guard(self):
+        peer,rt,ch=self.create();peer.drop=True
+        rt._thread.join(1)
+        self.assertFalse(rt._thread.is_alive())
+        self.assertIsInstance(rt._error,TimeoutError)
+        self.assertEqual(rt._error.diagnostic_code,'MOTOR_FEEDBACK_STALE')
+        self.assertGreaterEqual(peer.protocol_reports,3)
+        self.assertFalse(peer._feedback_supervised)
+        ch.disable()  # The same worker obtained the real stop ACK after loss of feedback.
+        with self.assertRaises(RuntimeShutdownError) as caught:rt.close()
+        self.assertTrue(caught.exception.cleanup_confirmed)
+
+    def test_bus_off_still_stops_immediately_under_supervision(self):
+        from motor_platform.components.motor.client import CanBusError
+        peer,rt,ch=self.create()
+        peer.peer.rx.put(CanFrame(0x48,bytes.fromhex('000008000000f800'),is_fd=False,is_error=True))
+        rt._thread.join(1)
+        self.assertIsInstance(rt._error,CanBusError)
+        self.assertEqual(rt._error.can_id,0x48)
+        ch.disable()
+        with self.assertRaises(RuntimeShutdownError):rt.close()
+
+
+class PendingStopReceiptTests(unittest.TestCase):
+    runtime = WorkerStopReceiptTests.runtime
+
+    def test_pending_worker_stop_never_reports_confirmation_before_ack(self):
+        tr,rt,ch=self.runtime();started=threading.Event();release=threading.Event()
+        send=tr.send
+        def blocked(frame):
+            if frame.can_id>=0x600 and frame.data[1:3]==b'\x02\x20' and frame.data[4]==2:
+                started.set();release.wait(1)
+            return send(frame)
+        tr.send=blocked
+        try:
+            tr.rx.put(CanFrame(8,bytes.fromhex('0000020000000001'),is_fd=False,is_error=True))
+            self.assertTrue(started.wait(1))
+            with self.assertRaises(RuntimeError):ch.disable(timeout=.005)
+            self.assertFalse(ch.stop_status()['worker_finished'])
+            self.assertFalse(ch.stop_status()['disable_receipt']['confirmed'])
+        finally:release.set();rt._thread.join(1)
+        ch.disable()
+        self.assertTrue(ch.stop_status()['disable_receipt']['confirmed'])
+        with self.assertRaises(RuntimeShutdownError):rt.close()
+
+
+
+class ClosedRuntimeReceiptTests(unittest.TestCase):
+    runtime = WorkerStopReceiptTests.runtime
+
+    def test_closed_bus_cannot_reuse_an_old_stop_receipt_as_a_new_command(self):
+        tr,rt,ch=self.runtime()
+        tr.rx.put(CanFrame(8,bytes.fromhex('0000020000000001'),is_fd=False,is_error=True))
+        rt._thread.join(1);ch.disable()
+        with self.assertRaises(RuntimeShutdownError):rt.close()
+        rt._bus.close()
+        with self.assertRaises(RuntimeError):ch.disable()
+
+
+if __name__=='__main__':unittest.main()

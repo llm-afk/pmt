@@ -258,7 +258,9 @@ class Canable:
         self.last_counter_report = None
         self.protocol_reports = 0
         self.last_protocol_report = None
-        self._recent_protocol_reports = deque()
+        self._recent_protocol_reports = deque(maxlen=64)
+        self.protocol_history = deque(maxlen=16)
+        self._feedback_supervised = False
         self._usb = None
         self._configured = False
         self._started = False
@@ -364,8 +366,14 @@ class Canable:
                             self.last_counter_report = {
                                 'tx_errors': frame.data[6], 'rx_errors': frame.data[7],
                                 'received_at': time.perf_counter()}
+                            if time.perf_counter() >= deadline:
+                                return None
                             continue
                         if self._record_transient(frame, time.perf_counter()):
+                            # Bounded draining: an error-report stream must not starve
+                            # the periodic worker's feedback-age and lease checks.
+                            if time.perf_counter() >= deadline:
+                                return None
                             continue
                         return frame
                     continue
@@ -377,9 +385,19 @@ class Canable:
                 return None
             self._rx.extend(chunk)
 
+    def set_feedback_supervision(self, enabled):
+        """Memory-only policy switch, owned by the periodic runtime.
+
+        Outside it, maintenance/OTA keeps the original strict report budget.
+        """
+        if type(enabled) is not bool:
+            raise ValueError('feedback supervision must be bool')
+        self._feedback_supervised = enabled
+
     def _record_transient(self, frame, now):
-        # 仅容忍低计数的位填充/帧格式错误。报告不当作反馈，运行时
-        # 的反馈超时仍然有效。1 秒内第 3 次报告交给上层触发停机。
+        # Low-counter form/stuff reports are not feedback or ACKs. During periodic
+        # operation, the real 100 ms feedback guard decides continuity; severe
+        # error classes/counters still pass through immediately. SDO/OTA remains strict.
         if not (frame.is_error and frame.can_id == 0x8 and not frame.is_fd
                 and not frame.is_extended and not frame.is_remote
                 and len(frame.data) == 8 and frame.data[:2] == bytes(2)
@@ -387,11 +405,14 @@ class Canable:
                 and max(frame.data[6:]) <= 8):
             return False
         self.protocol_reports += 1
-        self.last_protocol_report = dict(can_id=frame.can_id, data=frame.data.hex(), received_at=now)
+        self.last_protocol_report = dict(can_id=frame.can_id, data=frame.data.hex(), received_at=now,
+            kind='form' if frame.data[2] == 2 else 'stuff', location=frame.data[3],
+            tx_errors=frame.data[6], rx_errors=frame.data[7], feedback_supervised=self._feedback_supervised)
+        self.protocol_history.append(self.last_protocol_report)
         while self._recent_protocol_reports and now-self._recent_protocol_reports[0] >= 1:
             self._recent_protocol_reports.popleft()
         self._recent_protocol_reports.append(now)
-        return len(self._recent_protocol_reports) < 3
+        return self._feedback_supervised or len(self._recent_protocol_reports) < 3
 
     def close(self):
         usb, self._usb = self._usb, None
@@ -400,6 +421,7 @@ class Canable:
                 usb.control(2, data=struct.pack("<II", 0, 0))
         finally:
             self._configured = self._started = False
+            self._feedback_supervised = False
             self._rx.clear()
             if usb:
                 usb.close()
