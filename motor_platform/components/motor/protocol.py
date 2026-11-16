@@ -48,16 +48,15 @@ class MotorState:
     received_at: float = 0.0  # host monotonic time, not motor sampling time
 
 
-def mit_frame(node_id: int, command: MitCommand) -> CanFrame:
-    # Common GD/ADM compatibility control entry. Both firmwares auto-enable
-    # when this RPDO is accepted, then answer on TPDO5 (0x190 + node).
-    return CanFrame(0x400 + validate_node(node_id), command.pack())
+def mit_frame(node_id: int, command: MitCommand, *, auto_enable: bool = True) -> CanFrame:
+    # Both entries apply the same MIT targets and return TPDO5. Only 0x400
+    # requests enable, so ongoing RPDO5 traffic cannot re-enable a stopped drive.
+    base = 0x400 if auto_enable else 0x100
+    return CanFrame(base + validate_node(node_id), command.pack())
 
 
 def feedback_request_frame(node_id: int) -> CanFrame:
-    # GD RPDO5 / ADM RPDO5 updates neutral targets and returns TPDO5, without
-    # the automatic enable performed by their 0x400 compatibility entry.
-    return CanFrame(0x100 + validate_node(node_id), MitCommand().pack())
+    return mit_frame(node_id, MitCommand(), auto_enable=False)
 
 
 def control_frame(node_id: int, enabled: bool) -> CanFrame:

@@ -51,10 +51,8 @@ with Bench(transport=Canable(CANABLE_SERIAL), motor_ids=[1]) as bench:
 - `bench.start()` 默认使用脚本传入的 rate_hz（缺省 1000 Hz），也可传入频率；启动线程本身不发送 MIT 或自动使能。
 - 上层只更新完整 `MitCommand`，不会排队堆积过期目标。默认每 250 ms 内需调用一次 `set_mit()`。
 - 目标租约到期，停止该电机周期发送并尝试发送不等 ACK 的失能。再次更新不会偷偷重新使能。
-- 调度落后时跳过已错过周期，不以补发突发流量追赶。每个电机默认最多保留 4 个未收到反馈的请求额度。
-  每收到本节点一帧真实 TPDO5，先归还一个占用额度，最低减至零。TPDO5 没有事务序号，因此这个计数只能估算在途数量。
-  如果本节点连续 4 帧反馈均无电机错误，且每次归还后仍有欠额，则额外释放一个额度，让此前零散漏收的反馈逐步退出计数。
-  这次额外释放只影响发送额度。无新反馈时最多用完现有额度（默认 4 次），上位机随后等候反馈，不通过超时探发或重放旧目标补额度。
+- 显式使能收到反馈后，工位以设定频率发送普通 RPDO5（`0x100 + node`），驱动器每收到一帧就有机会回应。周期帧更新目标，不触发使能。未使能的监视模式只发送全零目标。
+- 偶尔漏回包时仍发送当前目标。每次 USB 写完成后才发送下一帧，调度落后时跳过错过的周期。
 - 等待电机回包期间，自该节点最后一帧有效 TPDO5 起满 1 秒仍无新状态，运行时报告通信中断，并尝试失能。USB 发送回显、其他节点的回包和总线诊断帧均不会延后该截止时间。明确的严重总线或 USB 故障单独处理。
 - 使能/失能为低频同步操作，由同一 I/O 线程执行；使能等待 TPDO5，失能等待 SDO ACK，期间其他周期发送暂缓。
   不要把使能/失能放在 1 kHz 控制循环里。需要无扰动并发 SDO 时应另行扩展非阻塞事务状态机。
@@ -67,7 +65,7 @@ with Bench(transport=Canable(CANABLE_SERIAL), motor_ids=[1]) as bench:
 
 `MotorChannel.set_mit_source(source, on_sent=None)` 是可选接口，现有 `set_mit()` 调用方式不变。
 调度线程仅在本次确实可以发送时调用 `source(now)`，参数为主机单调时间，返回完整的 `MitCommand`。
-迟到时按当前时间计算一个目标，不回放漏掉的轨迹点；反馈限流或租约过期时不会调用生成器。
+迟到时按当前时间计算一个目标，不回放漏掉的轨迹点；租约过期时停止调用生成器。
 
 `on_sent(sent_at, command)` 在对应 USB 写成功返回后调用，用于记录提交的目标和主机时间。
 回调不代表 CAN 线上发送完成或电机执行确认。两个回调都运行在 I/O 线程中，必须快速返回，不能进行文件、
@@ -80,8 +78,8 @@ with Bench(transport=Canable(CANABLE_SERIAL), motor_ids=[1]) as bench:
 ## 可观察指标
 
 `stats()` 包括 `target_hz`、`actual_tx_hz`、`tx_count`、`rx_count`、`enabled`、`skipped_periods`、
-`max_lateness_s`、`feedback_limited_periods`、`feedback_credit_reconciliations`、`periodic_active`、`fault`。
-`feedback_credit_reconciliations` 统计额外释放额度的次数。定位故障时结合 `inflight`、`rx_count` 和最后反馈时间查看。
+`max_lateness_s`、`requests_since_feedback`、`periodic_active`、`fault`。
+`requests_since_feedback` 统计本节点自上次有效回包后已完成的周期 USB 写入次数，用于核对断线前上位机是否仍在发送。
 在 1 kHz 工位可结合 `tx_gaps_over_2ms`、`rx_gaps_over_2ms` 查看主机两次发送或接收间隔超过 2 ms 的次数。它们仅用于诊断。 `usb_read_wait_mode` 标明本次采用事件与计时器等待（event_timer）还是兼容轮询（poll）。
 实际频率由首末周期 USB 写完成时间估算，不是 CAN 分析仪的线上位级测量。
 `rx_count` 统计运行时常规接收路径的状态；SDO 等待期间分发的状态不计入该计数。

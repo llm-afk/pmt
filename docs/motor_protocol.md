@@ -1,6 +1,6 @@
 # Python 电机控制接口
 
-适配 GD 与 ADM 固件共用的 **8 字节 SDO + 0x400 MIT 控制/TPDO5** 线路协议。
+适配 GD 与 ADM 固件共用的 **8 字节 SDO + MIT RPDO/TPDO5** 线路协议。
 电机协议层提供自动使能 MIT 指令、显式失能、状态接收与解析；不包含 OTA、标定或参数修改。
 可选的后台调度见 [周期控制](periodic_control.md)。
 固件文件未修改。
@@ -107,6 +107,7 @@ command = MitCommand(position=0.0, velocity=0.0, torque=0.0, kp=0, kd=0)
 | 失能 | `0x600 + node` | `2B 02 20 00 02 00 00 00` |
 | 控制字 ACK | `0x580 + node` | `60 02 20 00 00 00 00 00` |
 | MIT 指令并自动使能 | `0x400 + node` | 16 字节 `<fffHH`：position, velocity, torque, kp×100, kd×100 |
+| 周期 MIT 目标（保持当前使能状态） | `0x100 + node` | 同上，监视时为全零目标 |
 | 状态 | `0x190 + node` | 16 字节 `<fffhh`：position, velocity, torque, motor_temp×10, board_temp×10 |
 | 带错误状态 | `0x190 + node` | 20 字节：上述 16 字节 + uint16 error + 未定义的 2 字节 |
 
@@ -125,7 +126,7 @@ command = MitCommand(position=0.0, velocity=0.0, torque=0.0, kp=0, kd=0)
   状态中的 `error_code` 已被固件屏蔽 `ERR_HEARTBEAT_TIMEOUT=0x0080`，0 不代表完整错误寄存器为零。
 - `MotorState.received_at` 为主机 `time.perf_counter()` 接收时间；`last_state` 是缓存，可能过期。
   `receive_state()` 等待下一个状态而不返回缓存，也不发送“状态查询”帧。
-  当前固件收到 `0x400 + node` 后回传 TPDO5；两者没有序号，无法把反馈严格关联到某一条 MIT 指令。
+  当前固件收到 `0x100 + node` 或 `0x400 + node` 后回传 TPDO5；两者没有序号，无法把反馈严格关联到某一条 MIT 指令。
 
 ## CANable 位定时与验证边界
 

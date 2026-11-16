@@ -56,16 +56,14 @@ class RuntimeSourceTests(unittest.TestCase):
         self.assertEqual(stats['max_usb_write_s'], 0)
         self.assertEqual(len(tr.sent), 3)
 
-    def test_source_is_not_evaluated_when_inactive_expired_or_backpressured(self):
-        for mode in ('inactive', 'expired', 'backpressure', 'monitoring'):
+    def test_source_is_not_evaluated_when_inactive_expired_or_monitoring(self):
+        for mode in ('inactive', 'expired', 'monitoring'):
             tr, rt, channel = self.prepare()
             channel._source = lambda now: self.fail('source should not run')
             if mode == 'inactive':
                 channel._active = False
             elif mode == 'expired':
                 channel._expires = .9
-            elif mode == 'backpressure':
-                channel._inflight, channel._last_rx = 4, 1
             else:
                 channel._active=False
                 channel._monitoring=True

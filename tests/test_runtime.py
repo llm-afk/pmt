@@ -224,9 +224,9 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(len(tr.owners),1)
             self.assertNotIn(threading.get_ident(),tr.owners)
             one.disable()
-            n=len([f for f in tr.sent if f.can_id==0x401])
+            n=len([f for f in tr.sent if f.can_id==0x101])
             time.sleep(0.02)
-            self.assertEqual(n,len([f for f in tr.sent if f.can_id==0x401]))
+            self.assertEqual(n,len([f for f in tr.sent if f.can_id==0x101]))
         finally: rt.close()
         self.assertTrue(any(f.can_id==0x602 and f.data[1:3]==b"\x02\x20" and f.data[4]==2 for f in tr.sent))
 
@@ -358,14 +358,15 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(one.stats()['skipped_periods'],10)
         self.assertGreater(one._next,1.0105)
 
-    def test_feedback_limits_outstanding_requests(self):
+    def test_unanswered_requests_do_not_gate_normal_periodic_sends(self):
         tr,bus,rt=self.make()
         one=rt.motor('J1')
-        one._active=True;one._expires=10;one._next=1;one._last_rx=1;one._inflight=4
-        rt._tick(1.01)
-        self.assertEqual(tr.sent,[])
-        self.assertEqual(one.stats()['feedback_limited_periods'],1)
+        one._active=True;one._expires=10;one._next=1;one._last_rx=1;one._requests_since_feedback=4
+        with patch('motor_platform.runtime.time.perf_counter',return_value=1.01):rt._tick(1.01)
         with patch('motor_platform.runtime.time.perf_counter',return_value=1.99):rt._tick(1.99)
+        self.assertEqual(len(tr.sent),2)
+        self.assertTrue(all(frame.can_id==0x101 for frame in tr.sent))
+        self.assertEqual(one.stats()['requests_since_feedback'],6)
         with patch('motor_platform.runtime.time.perf_counter',return_value=2.0):
             with self.assertRaises(TimeoutError):rt._tick(2.0)
 
@@ -405,7 +406,7 @@ class FeedbackDiagnosticsTests(unittest.TestCase):
             _max_poll_s=.12,_max_poll_overrun_s=.119,_bus=SimpleNamespace(transport=SimpleNamespace()),
             _thread=SimpleNamespace(is_alive=lambda:True),_error=None,_poll_started=now-.11)
         channel=MotorChannel(runtime,'joint',motor,1000)
-        channel._active=True;channel._expires=now+.1;channel._inflight=4
+        channel._active=True;channel._expires=now+.1;channel._requests_since_feedback=4
         channel._stats.tx_count=8;channel._stats.rx_count=4
         channel._stats.first_tx_at=now-.03;channel._stats.last_tx_at=now-.02
         return channel,runtime
@@ -417,7 +418,7 @@ class FeedbackDiagnosticsTests(unittest.TestCase):
         with self.assertRaises(MotorFeedbackTimeout) as caught:channel.state()
         snapshot=caught.exception.diagnostic_context
         self.assertEqual(snapshot['last_feedback']['node_id'],3)
-        self.assertEqual(snapshot['statistics']['inflight'],4)
+        self.assertEqual(snapshot['statistics']['requests_since_feedback'],4)
         self.assertGreaterEqual(snapshot['statistics']['feedback_age_ms'],1219)
         self.assertGreaterEqual(snapshot['poll_inflight_ms'],109)
         self.assertEqual(snapshot['feedback_limit_ms'],1000)
@@ -426,13 +427,13 @@ class FeedbackDiagnosticsTests(unittest.TestCase):
         self.assertGreaterEqual(snapshot['statistics']['feedback_age_ms'],1219)
         self.assertIs(channel.state(),channel._motor.last_state)
 
-    def test_inflight_guard_keeps_same_stale_limit_and_snapshot(self):
+    def test_no_feedback_guard_keeps_one_second_limit_and_snapshot(self):
         from motor_platform.runtime import MotorFeedbackTimeout
-        channel,runtime=self.channel();runtime._channels={'joint':channel};runtime.max_inflight=4
+        channel,runtime=self.channel();runtime._channels={'joint':channel}
         channel._next=0;channel._last_rx=time.perf_counter()-1.2
         with self.assertRaises(MotorFeedbackTimeout) as caught:ControlRuntime._tick(runtime,time.perf_counter())
         self.assertEqual(caught.exception.diagnostic_context['feedback_limit_ms'],1000)
-        self.assertEqual(channel._stats.feedback_limited_periods,1)
+        self.assertEqual(caught.exception.diagnostic_context['statistics']['requests_since_feedback'],4)
 
 
 class WorkerStopReceiptTests(unittest.TestCase):
@@ -711,7 +712,7 @@ class FeedbackWindowRecoveryTests(unittest.TestCase):
                 self.dropped=[]
                 self.passed_119=threading.Event()
             def send(self, frame):
-                if frame.can_id==0x401 and self.armed:
+                if frame.can_id==0x101 and self.armed:
                     self.periodic_count+=1
                     number=self.periodic_count
                     if number>=150:self.passed_119.set()
@@ -795,51 +796,30 @@ class FeedbackWindowRecoveryTests(unittest.TestCase):
         runtime._thread.join(2)
         self.assertFalse(runtime._thread.is_alive())
         self.assertEqual(runtime._error.diagnostic_code,'MOTOR_FEEDBACK_STALE')
-        self.assertEqual(peer.periodic_count,runtime.max_inflight)
-        self.assertEqual(channel.stats()['feedback_credit_reconciliations'],0)
+        self.assertGreater(peer.periodic_count,4)
+        self.assertGreater(channel.stats()['requests_since_feedback'],4)
         self.assertGreater(runtime.motor(2).stats()['rx_count'],16)
 
-    def test_slow_feedback_cannot_release_four_commands_per_reply(self):
-        sent=[]
-        transport=SimpleNamespace(send=sent.append,close=lambda:None)
-        bus=MotorBus(transport)
-        runtime=ControlRuntime(bus,{1:bus.motor(1)})
-        channel=runtime.motor(1)
-        channel._active=True;channel._expires=10;channel._next=1;channel._last_rx=1
-        generated=[]
-        def source(now):
-            generated.append(now)
-            return MitCommand(torque=1)
-        channel._source=source
-        # Deterministic 1 kHz scheduler with one healthy readout every 8 ms.
-        # Exercise the actual credit handler and scheduler without kernel timing.
-        replies=0
-        for tick in range(1600):
-            at=1+tick*.001
-            with patch('motor_platform.runtime.time.perf_counter',return_value=at):
-                runtime._tick(at)
-                if tick%8==7:
-                    with runtime._lock:
-                        channel._account_feedback(SimpleNamespace(error_code=0))
-                        channel._last_rx=at
-                    replies+=1
-        self.assertLessEqual(len(sent),runtime.max_inflight+replies+replies//4)
-        self.assertGreaterEqual(len(sent),replies)
-        self.assertEqual(len(generated),len(sent))
-        self.assertLessEqual(channel.stats()['feedback_credit_reconciliations'],replies//4)
-        bus.close()
+    def test_slow_valid_feedback_keeps_the_requested_one_khz_transmission_rate(self):
+        events=[(index*.008,OneSecondFeedbackTests.feedback(1),0xffffffff) for index in range(1,201)]
+        runtime,_,_,sent=OneSecondFeedbackTests().replay(events,until=1.6,requests_waiting=0)
+        self.assertIsNone(runtime._error)
+        self.assertEqual(runtime.motor(1)._stats.rx_count,200)
+        self.assertGreaterEqual(len(sent),1590)
+        self.assertLessEqual(len(sent),1601)
+        self.assertTrue(all(frame.can_id==0x101 and frame.data==bytes(16) for frame in sent))
 
-    def test_continuous_loss_still_limits_sends_and_requires_real_feedback_and_stop_ack(self):
+    def test_continuous_loss_sends_until_one_second_and_requires_real_stop_ack(self):
         for stop_ack in (True,False):
             with self.subTest(stop_ack=stop_ack):
                 peer,runtime,channel,generated,observed=self.create(stop_ack=stop_ack)
                 runtime._thread.join(2)
                 self.assertFalse(runtime._thread.is_alive())
                 self.assertEqual(runtime._error.diagnostic_code,'MOTOR_FEEDBACK_STALE')
-                self.assertEqual(peer.periodic_count,runtime.max_inflight)
-                self.assertEqual(peer.dropped,list(range(1,runtime.max_inflight+1)))
+                self.assertGreater(peer.periodic_count,4)
+                self.assertEqual(peer.dropped,list(range(1,peer.periodic_count+1)))
                 statistics=channel.stats()
-                self.assertEqual(statistics['inflight'],runtime.max_inflight)
+                self.assertGreaterEqual(statistics['requests_since_feedback'],peer.periodic_count)
                 self.assertGreaterEqual(statistics['feedback_age_ms'],1000)
                 self.assertEqual(generated,observed)
                 sent_after_stop=len(peer.sent)
@@ -866,7 +846,7 @@ class OneSecondFeedbackTests(unittest.TestCase):
         from motor_platform.runtime import MotorFeedbackTimeout
         peer,bus,runtime=RuntimeTests.make(self)
         channel=runtime.motor('J1')
-        channel._monitoring=True;channel._next=10;channel._last_rx=10;channel._inflight=4
+        channel._monitoring=True;channel._next=10;channel._last_rx=10;channel._requests_since_feedback=4
         with patch('motor_platform.runtime.time.perf_counter',return_value=10):
             bus._dispatch(self.feedback(1))
         for at in (10.1,10.99):
@@ -877,10 +857,11 @@ class OneSecondFeedbackTests(unittest.TestCase):
             with self.assertRaises(MotorFeedbackTimeout) as caught:runtime._tick(11)
             self.assertEqual(caught.exception.diagnostic_context['feedback_limit_ms'],1000)
             with self.assertRaises(MotorFeedbackTimeout):channel.state()
-        self.assertEqual(peer.sent,[])
+        self.assertEqual(len(peer.sent),2)
+        self.assertTrue(all(frame.can_id==0x101 for frame in peer.sent))
         bus.close()
 
-    def replay(self, events, *, until=None, inflight=4, next_due=10, supervised=False, stop_ack=None):
+    def replay(self, events, *, until=None, requests_waiting=4, next_due=10, supervised=False, stop_ack=None):
         from collections import deque
         from motor_platform.transports.canable import Canable,DLC_LENGTHS
         clock=[10.0]
@@ -906,7 +887,7 @@ class OneSecondFeedbackTests(unittest.TestCase):
         bus=MotorBus(peer)
         runtime=ControlRuntime(bus,{node:bus.motor(node) for node in (1,2)})
         channel=runtime.motor(1)
-        channel._monitoring=True;channel._next=next_due;channel._last_rx=10;channel._inflight=inflight
+        channel._monitoring=True;channel._next=next_due;channel._last_rx=10;channel._requests_since_feedback=requests_waiting
         if stop_ack is not None:
             runtime._touched.add(1)
             channel._motor.enabled=True
@@ -930,10 +911,10 @@ class OneSecondFeedbackTests(unittest.TestCase):
         return runtime,peer,clock[0],sent
 
     def test_one_pending_reply_times_out_even_before_a_slow_next_send_is_due(self):
-        runtime,_,at,sent=self.replay([],inflight=1,next_due=14)
+        runtime,_,at,sent=self.replay([],requests_waiting=1,next_due=14)
         self.assertEqual(runtime._error.diagnostic_code,'MOTOR_FEEDBACK_STALE')
         self.assertGreaterEqual(at,11);self.assertLess(at,11.006)
-        self.assertEqual(runtime.motor(1)._inflight,1)
+        self.assertEqual(runtime.motor(1)._requests_since_feedback,1)
         self.assertEqual(sent,[])
 
     def test_slow_poll_wait_starts_when_the_new_request_is_sent(self):
@@ -964,7 +945,8 @@ class OneSecondFeedbackTests(unittest.TestCase):
         self.assertEqual(runtime.motor(1)._stats.rx_count,0)
         self.assertEqual(runtime.motor(2)._stats.rx_count,3)
         self.assertEqual(peer.counter_reports,3)
-        self.assertEqual(sent,[])
+        self.assertGreater(len(sent),4)
+        self.assertTrue(all(frame.can_id==0x101 and frame.data==bytes(16) for frame in sent))
 
     def test_same_node_recovers_at_990ms_and_fresh_feedback_keeps_the_channel_running(self):
         events=[(.99+index*.02,self.feedback(1),0xffffffff) for index in range(26)]
@@ -1061,6 +1043,106 @@ class SupervisedCounterRangeReplayTests(unittest.TestCase):
         self.assertFalse(runtime.motor(1).stop_status()['worker_cleanup']['confirmed'])
         self.assertIsNotNone(runtime._cleanup_error)
         self.assertGreaterEqual(peer.disable_requests,2)
+
+
+
+
+class PeriodicBurstLossTests(unittest.TestCase):
+    def create(self,drop_positions,*,change_pending=False):
+        generated=[]
+        class Peer(Transport):
+            def __init__(self):
+                super().__init__()
+                self.armed=False;self.normal_count=0
+                self.normal_payloads={};self.source_counts=[]
+                self.recovered=threading.Event()
+            def send(self,frame):
+                if self.armed and frame.can_id==0x101:
+                    self.normal_count+=1
+                    self.normal_payloads[self.normal_count]=frame.data
+                    self.source_counts.append(len(generated))
+                    if self.normal_count in drop_positions:
+                        with self.lock:self.sent.append(frame)
+                        if change_pending and self.normal_count==max(drop_positions):
+                            channel.set_mit(MitCommand(torque=9))
+                        return
+                    if self.normal_count>=100:self.recovered.set()
+                return super().send(frame)
+            def recv(self,timeout):
+                deadline=time.perf_counter()+timeout
+                while time.perf_counter()<deadline:
+                    try:return self.rx.get_nowait()
+                    except queue.Empty:pass
+                return None
+        peer=Peer();bus=MotorBus(peer)
+        runtime=ControlRuntime(bus,{1:bus.motor(1)},command_timeout=3).start()
+        channel=runtime.motor(1);channel.enable()
+        def source(now):
+            target=MitCommand(torque=1+len(generated)%100/100)
+            generated.append(target)
+            return target
+        channel.set_mit_source(source)
+        peer.armed=True
+        def close_runtime():
+            try:runtime.close()
+            except RuntimeShutdownError:pass
+        self.addCleanup(bus.close);self.addCleanup(close_runtime)
+        return peer,runtime,channel
+
+    def test_four_and_twelve_adjacent_missing_replies_do_not_block_normal_periodic_control(self):
+        for losses in (4,12):
+            with self.subTest(losses=losses):
+                peer,runtime,channel=self.create(tuple(range(30,30+losses)))
+                try:
+                    self.assertTrue(peer.recovered.wait(2))
+                    self.assertIsNone(runtime._error)
+                    self.assertGreaterEqual(peer.normal_count,100)
+                    self.assertTrue(all(right==left+1 for left,right in zip(peer.source_counts,peer.source_counts[1:])))
+                    enabling=[frame for frame in peer.sent if frame.can_id==0x401]
+                    self.assertEqual(len(enabling),1)
+                    self.assertEqual(enabling[0].data,bytes(16))
+                    channel.disable()
+                    self.assertTrue(channel.stop_status()['disable_receipt']['confirmed'])
+                    self.assertFalse(peer.enabled[1])
+                finally:
+                    if runtime._error is None:runtime.close()
+                    else:
+                        with self.assertRaises(RuntimeShutdownError):runtime.close()
+
+    def test_three_old_missing_replies_and_a_fourth_apply_new_pending_target_next_period(self):
+        peer,runtime,channel=self.create((30,32,34,36),change_pending=True)
+        try:
+            self.assertTrue(peer.recovered.wait(2))
+            self.assertIsNone(runtime._error)
+            self.assertNotEqual(peer.normal_payloads[36],MitCommand(torque=9).pack())
+            self.assertEqual(peer.normal_payloads[37],MitCommand(torque=9).pack())
+            self.assertEqual(peer.normal_payloads[100],MitCommand(torque=9).pack())
+            self.assertEqual(len([frame for frame in peer.sent if frame.can_id==0x401]),1)
+            channel.disable()
+            self.assertTrue(channel.stop_status()['disable_receipt']['confirmed'])
+        finally:
+            if runtime._error is None:runtime.close()
+            else:
+                with self.assertRaises(RuntimeShutdownError):runtime.close()
+
+    def test_periodic_frames_do_not_reenable_a_driver_that_reset_after_explicit_enable(self):
+        transport,bus,runtime=RuntimeTests.make(self,lease=3)
+        runtime.start();channel=runtime.motor('J1');channel.enable()
+        try:
+            channel.set_mit(MitCommand(torque=2))
+            transport.enabled[1]=False
+            start=len(transport.sent)
+            deadline=time.perf_counter()+.5
+            while len(transport.sent)<start+4 and time.perf_counter()<deadline:time.sleep(.001)
+            frames=transport.sent[start:]
+            self.assertGreaterEqual(len(frames),4)
+            self.assertTrue(all(frame.can_id==0x101 for frame in frames))
+            self.assertEqual(frames[-1].data,MitCommand(torque=2).pack())
+            self.assertFalse(transport.enabled[1])
+            self.assertEqual(len([frame for frame in transport.sent if frame.can_id==0x401]),1)
+            channel.disable()
+            self.assertTrue(channel.stop_status()['disable_receipt']['confirmed'])
+        finally:runtime.close();bus.close()
 
 
 if __name__=='__main__':unittest.main()
