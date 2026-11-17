@@ -8,6 +8,7 @@ import uuid
 import time
 
 from . import app, report
+from motor_platform import PowerSupply
 from .integrations import MesClient, PrinterClient, PendingConfiguration, PrintUnknown, mes_payload
 from .maintenance import Maintenance
 from .station_config import StationConfig, atomic_json, state_root
@@ -69,6 +70,15 @@ class RecoveryRequired(RuntimeError):
     pass
 
 
+class LoadOutputUnconfirmed(RuntimeError):
+    diagnostic_code = 'LOAD_OFF_UNCONFIRMED'
+    diagnostic_hint = '磁粉加载输出未获 OFF 回读确认，未继续校准。核对电源串口、原始 SCPI 回包及异常收尾的关闭结果。'
+
+    def __init__(self, port, reason, error):
+        super().__init__('磁粉加载输出关闭未确认：'+str(error))
+        self.diagnostic_context = dict(port=port,phase=reason)
+
+
 class Services:
     def __init__(self, config, cancelled, emit, delivery=None, *, firmware_sha256=None, hardware_ports=None):
         self.config, self.cancelled, self.emit = config, cancelled, emit
@@ -77,7 +87,56 @@ class Services:
         self.firmware_sha256 = firmware_sha256
         self.hardware_ports = dict(hardware_ports or {})
 
+    def disable_load(self, reason):
+        """Production owns the fixture now: turn off magnetic loading with readback."""
+        from .measurements import power_observer
+        port = self.hardware_ports.get('power') or self.config.power_port
+        if port == 'auto':
+            from serial.tools.list_ports import comports
+            from motor_platform.components.dynamometer import detect_dynamometers
+            from motor_platform.components.power_supply.discovery import detect_power_supplies
+            dyno = self.hardware_ports.get('dyno') or self.config.dyno_port
+            excluded = [dyno] if dyno != 'auto' else detect_dynamometers()
+            excluded = {name.strip().casefold() for name in excluded}
+            candidates = [item.device for item in comports() if item.device.strip().casefold() not in excluded]
+            observations = []
+            matches = detect_power_supplies(ports=candidates,observations=observations)
+            log_event('load.power.discovery',reason=reason,excluded_ports=sorted(excluded),
+                      observations=observations,matches=matches)
+            if len(matches) != 1:
+                raise RuntimeError('无法唯一确认磁粉加载电源，未进入校准；请核对电源串口')
+            port = next(iter(matches))
+        self.hardware_ports['power'] = port
+        self.emit('maintenance_progress','正在关闭磁粉阻尼并核对输出回执…')
+        log_event('load.off.request','关闭磁粉加载输出',reason=reason,port=port)
+        with PowerSupply(port=port,observer=power_observer()) as power:
+            # OFF is first: do not spend time reading a still-loaded fixture.
+            try:
+                power.disable()
+            except Exception as exc:
+                # The caller may already be handling a calibration fault: preserve
+                # this separate OFF failure rather than suppressing it as cleanup.
+                try:
+                    power.disable(verify=False)
+                except Exception as fallback:
+                    exc.add_note('补发 OFF 写入失败：'+str(fallback))
+                raise LoadOutputUnconfirmed(port,reason,exc) from exc
+            measured = {}
+            try:
+                reading = power.measure()
+                measured = dict(voltage_v=reading.voltage,current_a=reading.current,received_at=reading.received_at)
+            except Exception as exc:
+                log_event('load.off.measurement_unavailable','输出关闭已确认，附加电压电流读取未完成',
+                          level='WARNING',error=exc,reason=reason,port=port)
+            log_event('load.off.confirmed','磁粉加载输出已回读为关闭',reason=reason,port=port,
+                      identity=power.identity,output_enabled=False,**measured)
+        self.emit('maintenance_progress','磁粉阻尼已关闭，继续执行产测。')
+
+    def abort(self):
+        self.disable_load('production_aborted')
+
     def firmware(self, node, expected_sn):
+        self.disable_load('before_production')
         from .firmware import check_firmware
         return check_firmware(self.config,self.motor,node,expected_sn,
                               lambda message:self.emit('firmware_progress',message), expected_sha256=self.firmware_sha256)
@@ -95,6 +154,7 @@ class Services:
         return self.motor.probe()
 
     def calibrate(self):
+        self.disable_load('before_calibration')
         self.motor.calibrate()
 
     def measure(self, directory, base_sn):
@@ -170,6 +230,9 @@ class Services:
 
 class DemoServices(Services):
     """不会创建 CANable、HTTP 请求或打印任务；报告也标明模拟。"""
+    def abort(self):
+        pass
+
     def firmware(self, node, expected_sn):
         self.check_stop()
         return dict(outcome='SIMULATED',node_id=node,sn=expected_sn)
@@ -499,6 +562,13 @@ class StationRunner:
                 atomic_json(path, completed)
             self.emit('complete', dict(demo=record['demo'], sn=record['module_sn']))
         except BaseException as exc:
+            abort = getattr(self.services,'abort',None)
+            if callable(abort):
+                try:
+                    abort()
+                except Exception as cleanup:
+                    exc.add_note('工装停机未确认：磁粉加载电源关闭未确认，请切断工装电源。原因：'+str(cleanup))
+                    log_event('load.shutdown.failed','异常收尾未能确认磁粉加载关闭',level='ERROR',error=cleanup)
             step = record.get('current_step', '')
             status = 'UNKNOWN' if isinstance(exc, PrintUnknown) else 'PENDING' if isinstance(exc, PendingConfiguration) else 'FAILED'
             record['steps'][step] = status

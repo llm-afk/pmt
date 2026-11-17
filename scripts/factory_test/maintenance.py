@@ -8,6 +8,21 @@ from motor_platform.components.motor.client import SdoReplyTimeout, CanBusError
 from .diagnostics import current_log, log_event, log_scope, idle_poll, idle_evidence
 
 
+class CalibrationFault(RuntimeError):
+    diagnostic_code = 'DRIVER_CALIBRATION_ERROR'
+    diagnostic_hint = '校准前先核对磁粉加载关闭回执；0x0400 表示编码器运动范围检查失败，转动不足或编码器读数异常均可能触发。'
+
+    def __init__(self, node, code, *, before=False):
+        flags = []
+        if code & 0x0400:
+            flags.append('编码器运动范围检查失败')
+        if code & 0x4000:
+            flags.append('校准未完成')
+        suffix = '（'+'、'.join(flags)+'）' if flags else ''
+        super().__init__(f'{"校准前" if before else "校准"}驱动器错误：0x{code:04X}'+suffix)
+        self.diagnostic_context = dict(node_id=node,error_word=code,error_hex=f'0x{code:04X}',flags=flags)
+
+
 class MotorAbsent(TimeoutError):
     """The adapter completed the requested discovery scan with no matching node."""
 
@@ -354,7 +369,7 @@ class Maintenance:
             log_event('motor.disable.ack',node_id=node,reason='before_calibration')
             initial = self.read(bench, node, 0x2000, 2)
             if initial & ~0x4000:
-                raise RuntimeError(f'校准前驱动器错误：0x{initial:04X}')
+                raise CalibrationFault(node,initial,before=True)
             adm = self.config.model[0] == '2'
             log_event('calibration.preflight',node_id=node,initial_error=f'0x{initial:04X}',
                       platform='ADM' if adm else 'GD',timeout_s=self.config.calibration_timeout)
@@ -373,7 +388,7 @@ class Maintenance:
                     self.check_stop()
                     error = self.read(bench, node, 0x2000, 2)
                     if error & ~0x4000:
-                        raise RuntimeError(f'校准驱动器错误：0x{error:04X}')
+                        raise CalibrationFault(node,error)
                     complete = self.read(bench, node, 0x2072, 2) == 1 if adm else True
                     stable = stable+1 if complete and error == 0 else 0
                     if current_log():

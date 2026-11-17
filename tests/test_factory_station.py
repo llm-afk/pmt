@@ -407,6 +407,115 @@ class MaintenanceTests(unittest.TestCase):
         bench._bus.transport.send.assert_called_once()
 
 
+class ProductionLoadTests(unittest.TestCase):
+    def fixture(self, *, output_reply=b'OFF\n'):
+        from scripts.factory_test.station import Services
+        from motor_platform.components.power_supply import PowerSupply
+        from motor_platform.transports.serial_scpi import SerialScpi
+        from tests.test_power_supply import Stream
+        events, streams = [], []
+        class LoadStream(Stream):
+            def write(self, data):
+                events.append(data.decode().strip())
+                return super().write(data)
+            def close(self):
+                events.append('load.closed')
+                super().close()
+        def make_power(**kwargs):
+            stream = LoadStream();stream.replies[b'OUTP?\n'] = output_reply;streams.append(stream)
+            transport = SerialScpi(kwargs['port'],serial_factory=lambda **_:stream)
+            return PowerSupply(port=kwargs['port'],transport=transport,observer=kwargs.get('observer'))
+        service = Services(StationConfig(),lambda:False,lambda *_:None,
+                           hardware_ports=dict(power='COM19',dyno='COM18'))
+        service.motor = Mock()
+        service.motor.calibrate.side_effect = lambda: events.append('calibrate')
+        return service,make_power,events,streams
+
+    def test_load_off_receipt_precedes_firmware_and_calibration_and_handles_close(self):
+        service,factory,events,streams = self.fixture()
+        def firmware(*args,**kwargs): events.append('firmware')
+        with patch('scripts.factory_test.station.PowerSupply',side_effect=factory) as power, \
+             patch('scripts.factory_test.firmware.check_firmware',side_effect=firmware), \
+             patch('motor_platform.transports.serial_scpi.time.sleep'):
+            service.firmware(1,'incoming')
+            service.calibrate()
+        self.assertEqual(events.count('OUTP OFF'),2)
+        self.assertEqual(events.count('OUTP?'),2)
+        self.assertEqual(events.count('load.closed'),2)
+        first,second = [i for i,value in enumerate(events) if value=='OUTP OFF']
+        self.assertLess(first,events.index('OUTP?'))
+        self.assertLess(events.index('load.closed'),events.index('firmware'))
+        self.assertLess(events.index('firmware'),second)
+        self.assertLess(second,events.index('calibrate'))
+        self.assertEqual(events[-2:],['load.closed','calibrate'])
+        self.assertNotIn('OUTP ON',events)
+        self.assertEqual([call.kwargs['port'] for call in power.call_args_list],['COM19','COM19'])
+        self.assertTrue(all(stream.closed for stream in streams))
+
+    def test_rejected_off_readback_blocks_calibration_and_ota_without_switching_on(self):
+        for operation in ('firmware','calibrate'):
+            with self.subTest(operation=operation):
+                service,factory,events,streams = self.fixture(output_reply=b'ON\n')
+                with patch('scripts.factory_test.station.PowerSupply',side_effect=factory), \
+                     patch('scripts.factory_test.firmware.check_firmware') as firmware, \
+                     patch('motor_platform.transports.serial_scpi.time.sleep'):
+                    with self.assertRaisesRegex(RuntimeError,'output readback'):
+                        service.firmware(1,'incoming') if operation=='firmware' else service.calibrate()
+                firmware.assert_not_called();service.motor.calibrate.assert_not_called()
+                self.assertNotIn('OUTP ON',events)
+                self.assertTrue(all(stream.closed for stream in streams))
+
+    def test_off_failure_during_abort_cannot_be_suppressed_by_the_original_exception(self):
+        from scripts.factory_test.diagnostics import log_scope
+        from scripts.factory_test.station import LoadOutputUnconfirmed
+        service,factory,events,_ = self.fixture(output_reply=b'ON\n')
+        target=Mock()
+        with patch('scripts.factory_test.station.PowerSupply',side_effect=factory), \
+             patch('motor_platform.transports.serial_scpi.time.sleep'),log_scope(target):
+            try:
+                raise RuntimeError('original calibration error')
+            except RuntimeError:
+                with self.assertRaisesRegex(LoadOutputUnconfirmed,'output readback'):
+                    service.abort()
+        self.assertFalse(any(call.args[0]=='load.off.confirmed' for call in target.event.call_args_list))
+        self.assertIn('OUTP OFF',events)
+        self.assertNotIn('OUTP ON',events)
+        service.motor.calibrate.assert_not_called()
+
+    def test_missing_optional_current_read_does_not_undo_confirmed_off(self):
+        service,factory,events,streams = self.fixture()
+        def missing_current(**kwargs):
+            power=factory(**kwargs)
+            power.measure=Mock(side_effect=TimeoutError('optional telemetry unavailable'))
+            return power
+        with patch('scripts.factory_test.station.PowerSupply',side_effect=missing_current), \
+             patch('motor_platform.transports.serial_scpi.time.sleep'):
+            service.calibrate()
+        service.motor.calibrate.assert_called_once()
+        self.assertLess(events.index('OUTP?'),events.index('calibrate'))
+
+    def test_auto_power_discovery_excludes_the_passive_dynamometer_port(self):
+        service,factory,events,_ = self.fixture();service.hardware_ports.pop('power')
+        with patch('scripts.factory_test.station.PowerSupply',side_effect=factory), \
+             patch('serial.tools.list_ports.comports',return_value=[NS(device=name) for name in ('COM18','COM19','COM20')]), \
+             patch('motor_platform.components.power_supply.discovery.detect_power_supplies',return_value={'COM19':'UDP6721'}) as detect, \
+             patch('motor_platform.transports.serial_scpi.time.sleep'):
+            service.calibrate()
+        self.assertEqual(detect.call_args.kwargs['ports'],['COM19','COM20'])
+        self.assertEqual(service.hardware_ports['power'],'COM19')
+        service.motor.calibrate.assert_called_once()
+
+    def test_calibration_error_word_is_decoded_without_claiming_missing_encoder_hardware(self):
+        from scripts.factory_test.maintenance import CalibrationFault
+        from scripts.factory_test.diagnostics import error_details
+        error=CalibrationFault(1,0x4400)
+        result=error_details(error)
+        self.assertEqual(result['code'],'DRIVER_CALIBRATION_ERROR')
+        self.assertEqual(error.diagnostic_context['error_word'],0x4400)
+        self.assertEqual(error.diagnostic_context['flags'],['编码器运动范围检查失败','校准未完成'])
+        self.assertIn('0x4400',str(error))
+
+
 class PipelineTests(unittest.TestCase):
     def runner(self, root, service=None, cancelled=lambda:False):
         cfg=StationConfig(simulation=True)
@@ -480,11 +589,25 @@ class PipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             runner,service=self.runner(tmp)
             service.calibrate=Mock(side_effect=RuntimeError('calibration fault'))
+            service.abort=Mock()
             service.measure=Mock();service.allocate=Mock();service.print_sn=Mock()
             result=runner.begin('blank')
+            service.abort.assert_called_once()
             self.assertEqual(result['status'],'FAILED')
             service.measure.assert_not_called();service.allocate.assert_not_called();service.print_sn.assert_not_called()
             with self.assertRaises(RecoveryRequired): runner.begin('another')
+
+    def test_load_cleanup_failure_keeps_original_calibration_error_and_stop_note(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner,service=self.runner(tmp)
+            service.calibrate=Mock(side_effect=RuntimeError('original calibration fault'))
+            service.abort=Mock(side_effect=TimeoutError('load OFF receipt missing'))
+            service.measure=Mock();service.allocate=Mock()
+            result=runner.begin('blank')
+            self.assertIn('original calibration fault',result['error'])
+            self.assertTrue(any('磁粉加载电源关闭未确认' in note for note in result['error_notes']))
+            service.abort.assert_called_once()
+            service.measure.assert_not_called();service.allocate.assert_not_called()
 
     def test_test_failure_never_allocates_or_prints(self):
         with tempfile.TemporaryDirectory() as tmp:
