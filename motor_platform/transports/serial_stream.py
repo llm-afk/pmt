@@ -1,6 +1,5 @@
 """Read-only bounded serial byte stream for actively reporting instruments."""
 import math
-from ..core import io_trace
 
 
 class SerialStream:
@@ -36,8 +35,6 @@ class SerialStream:
         # the configured short timeout.
         waiting = getattr(self._serial, 'in_waiting', 0)
         data = self._serial.read(min(4096, max(1, waiting)))
-        if data:
-            io_trace.record('serial.rx', device='dynamometer', interface=self.port, direction='RX', raw=data)
         return data
 
     def close(self):

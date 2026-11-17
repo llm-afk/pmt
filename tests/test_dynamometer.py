@@ -2,6 +2,7 @@ import math
 import queue
 import time
 import unittest
+from unittest.mock import patch
 
 from motor_platform.components.dynamometer import Dynamometer, FrameParser, parse_frame
 from motor_platform.components.dynamometer.protocol import crc16
@@ -114,12 +115,38 @@ class DynamometerTests(unittest.TestCase):
         self.assertEqual(sizes, [1])
         stream.close()
 
+    def test_fault_snapshot_keeps_raw_and_converted_last_feedback_after_close(self):
+        transport = Transport()
+        device = Dynamometer(port='COM_TEST',transport=transport)
+        raw = frame(torque=-2100,speed=123)
+        device._latest = parse_frame(raw,received_at=time.perf_counter()-2)
+        device._latest_frame = raw
+        device._error = OSError('USB disconnected')
+        with patch.object(transport,'read',side_effect=AssertionError('snapshot must not read serial')) as read:
+            snapshot = device.diagnostic_snapshot()
+        read.assert_not_called()
+        self.assertEqual(snapshot['last_raw_frame'],raw.hex())
+        self.assertEqual(snapshot['last_feedback']['raw_torque'],-2100)
+        self.assertEqual(snapshot['last_feedback']['torque'],21.)
+        self.assertGreaterEqual(snapshot['feedback_age_ms'],2000)
+        self.assertFalse(snapshot['reader_alive'])
+        self.assertIn('USB disconnected',snapshot['statistics']['fault'])
+
+    def test_snapshot_before_first_frame_does_not_fabricate_sensor_data(self):
+        device = Dynamometer(port='COM_TEST',transport=Transport())
+        snapshot = device.diagnostic_snapshot()
+        self.assertIsNone(snapshot['last_feedback'])
+        self.assertIsNone(snapshot['last_raw_frame'])
+        self.assertIsNone(snapshot['feedback_age_ms'])
+        self.assertEqual(snapshot['statistics']['rx_count'],0)
+
     def test_worker_keeps_every_frame_and_reports_overflow(self):
         transport = Transport()
         with Dynamometer(port='COM_TEST', transport=transport, capacity=3) as d:
             transport.incoming.put(b''.join(frame(i) for i in range(10)))
             wait_for(lambda: d.stats()['rx_count'] == 10)
             self.assertEqual(d.state().torque, -0.09)
+            self.assertEqual(d.diagnostic_snapshot()['last_raw_frame'],frame(9).hex())
             self.assertEqual(d.stats()['dropped_samples'], 7)
             self.assertEqual([s.raw_torque for s in d.drain()], [7, 8, 9])
             self.assertEqual(d.drain(), [])

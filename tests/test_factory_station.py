@@ -887,6 +887,52 @@ class FinalStopLogTests(unittest.TestCase):
         json.dumps(summary)
 
 
+    def test_shutdown_fault_snapshot_precedes_disable_and_keeps_acquisition_evidence(self):
+        from scripts.factory_test.measurements import stop_with_ramp, capture_shutdown_error, log_measurement_snapshot
+        before = dict(acquisition='complete')
+        summary = dict(runtime_snapshot=before,snapshot_phase='acquisition_complete',reason='error')
+        events = []
+        motor, dyno = Mock(), Mock()
+        motor.diagnostic_snapshot.side_effect = lambda: dict(disabled='disabled' in events)
+        dyno.diagnostic_snapshot.return_value = dict(raw_torque=-2100,torque_nm=21.)
+        motor.disable.side_effect = lambda: events.append('disabled')
+        def fail(torque):
+            events.append('ramp_fault')
+            raise RuntimeError('ramp feedback fault')
+        with self.assertRaisesRegex(RuntimeError,'ramp feedback fault'):
+            stop_with_ramp(motor,21.,1.,fail,on_error=lambda: capture_shutdown_error(summary,motor,dyno))
+        self.assertEqual(events,['ramp_fault','disabled'])
+        self.assertIs(summary['acquisition_snapshot'],before)
+        self.assertEqual(summary['snapshot_phase'],'shutdown_failed')
+        self.assertFalse(summary['runtime_snapshot']['motor']['disabled'])
+        with patch('scripts.factory_test.diagnostics.log_event') as log: log_measurement_snapshot('kt',summary)
+        self.assertEqual(log.call_args.kwargs['snapshot_phase'],'shutdown_failed')
+        self.assertNotIn('shutdown_snapshot',log.call_args.kwargs)  # No duplicate copy of the large fault snapshot.
+        self.assertEqual(log.call_args.kwargs['snapshot']['dynamometer']['raw_torque'],-2100)
+
+    def test_secondary_shutdown_failure_keeps_the_primary_acquisition_error(self):
+        from scripts.factory_test.measurements import capture_shutdown_error
+        original = dict(primary='acquisition_fault')
+        summary = dict(runtime_snapshot=original,snapshot_phase='acquisition_failed')
+        motor, dyno = Mock(), Mock()
+        capture_shutdown_error(summary,motor,dyno)
+        first = summary['shutdown_snapshot']
+        capture_shutdown_error(summary,motor,dyno)
+        self.assertIs(summary['runtime_snapshot'],original)
+        self.assertIs(summary['shutdown_snapshot'],first)
+        motor.diagnostic_snapshot.assert_called_once()
+        self.assertEqual(summary['snapshot_phase'],'acquisition_failed')
+
+    def test_stop_ramp_failure_still_disables_and_retains_missing_ack_as_secondary_note(self):
+        from scripts.factory_test.measurements import stop_with_ramp
+        motor = Mock();motor.disable.side_effect = RuntimeError('disable ack missing')
+        def fail(torque): raise RuntimeError('ramp fault')
+        with self.assertRaisesRegex(RuntimeError,'ramp fault') as error:
+            stop_with_ramp(motor,30.,1.,fail)
+        motor.disable.assert_called_once()
+        self.assertTrue(any('disable ack missing' in note for note in error.exception.__notes__))
+
+
 class MeasurementStepDisplayTests(unittest.TestCase):
     def run_pipeline(self, root, section_statuses, *, kt_reason='completed', tn_reason='stall_confirmed'):
         from scripts.factory_test import app

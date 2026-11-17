@@ -2,6 +2,7 @@ import csv
 import io
 from pathlib import Path
 import tempfile
+import time
 from types import SimpleNamespace as NS
 import unittest
 from unittest.mock import Mock, patch
@@ -241,6 +242,7 @@ class ConsistencyTests(unittest.TestCase):
         bench.__enter__.return_value = bench
         motor = MagicMock()
         motor.monitor.side_effect = lambda: events.append('monitor')
+        motor.state.side_effect = lambda **kwargs: NS(received_at=time.perf_counter())
         bench.start.return_value = nullcontext(NS(motor=lambda node: motor))
         def run(motor, dyno, ui, args, result):
             events.append('run')
@@ -254,10 +256,11 @@ class ConsistencyTests(unittest.TestCase):
              patch.object(app, 'Dynamometer', return_value=dyno), \
              patch.object(app, 'PowerSupply', return_value=power), \
              patch.object(app, 'Canable'), patch.object(app, 'Bench', return_value=bench), \
-             patch.object(app, 'TerminalConsole', return_value=nullcontext(None)), \
+             patch.object(app, 'TerminalConsole', return_value=nullcontext(None)) as console, \
              patch.object(app, 'run', side_effect=run), \
              patch.object(app.time, 'sleep', side_effect=lambda seconds: events.append(('wait', seconds))), \
              patch('sys.stdout', io.StringIO()):
+            console.cancelled.is_set.return_value = False
             app.main(['--serial', 'test-sn', '--torque', '30'], output_dir=Path(directory)/"result")
             files = [p for p in Path(directory).rglob('*') if p.is_file()]
             self.assertEqual(len(files), 1)

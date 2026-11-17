@@ -1,6 +1,6 @@
 """One receive worker per instrument, fresh latest state and bounded sample FIFO."""
 from collections import deque
-from ...core import io_trace
+from dataclasses import asdict
 import threading
 import time
 
@@ -47,7 +47,7 @@ class Dynamometer:
         self._condition = threading.Condition()
         self._stop = threading.Event()
         self._thread = None
-        self._latest = None
+        self._latest = self._latest_frame = None
         self._error = None
         self._count = self._dropped = self._bytes = self._discarded = 0
         self._started = self._ended = 0.0
@@ -101,7 +101,7 @@ class Dynamometer:
                 self._transport.open()
                 self._stop.clear()
                 self._samples.clear()
-                self._latest = self._error = None
+                self._latest = self._latest_frame = self._error = None
                 self._close_error = None
                 self._count = self._dropped = self._bytes = self._discarded = 0
                 self._started, self._ended = time.perf_counter(), 0.0
@@ -128,11 +128,6 @@ class Dynamometer:
                 frames = parser.feed(data)
                 states = [parse_frame(frame, torque_scale=self.torque_scale,
                                       speed_scale=self.speed_scale, received_at=received) for frame in frames]
-                for frame, state in zip(frames, states):
-                    io_trace.record('dynamometer.sample', device='dynamometer', interface=self.port,
-                        direction='DECODED', raw=frame, torque_nm=state.torque, raw_torque=state.raw_torque,
-                        raw_speed=state.raw_speed, rpm=state.rpm, speed_rad_s=state.speed,
-                        received_at=state.received_at)
                 with self._condition:
                     self._bytes += len(data)
                     self._discarded = parser.discarded_bytes
@@ -142,6 +137,8 @@ class Dynamometer:
                         self._samples.append(state)
                         self._latest = state
                         self._count += 1
+                    if frames:
+                        self._latest_frame = frames[-1]
                     self._condition.notify_all()
                 if not data:
                     self._stop.wait(0.001)
@@ -193,6 +190,18 @@ class Dynamometer:
             result = list(self._samples)
             self._samples.clear()
             return result
+
+    def diagnostic_snapshot(self):
+        """Read cached evidence even after a fault/close; no serial transactions."""
+        with self._condition:
+            state = self._latest
+            at = time.perf_counter()
+            return dict(port=self.port,captured_at=at,statistics=self.stats(),
+                        last_feedback=asdict(state) if state is not None else None,
+                        last_raw_frame=self._latest_frame.hex() if self._latest_frame is not None else None,
+                        feedback_age_ms=(at-state.received_at)*1000 if state is not None else None,
+                        torque_scale=self.torque_scale,speed_scale=self.speed_scale,torque_sign=-1,
+                        reader_alive=bool(self._thread and self._thread.is_alive()))
 
     def stats(self):
         with self._condition:

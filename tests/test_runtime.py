@@ -5,11 +5,46 @@ import time
 import unittest
 import ctypes as C
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from motor_platform import MotorBus, MitCommand, CanFrame
-from motor_platform.runtime import ControlRuntime, RuntimeShutdownError
+from motor_platform.runtime import ControlRuntime, RuntimeShutdownError, start_monitoring
 from motor_platform.transports.canable import _Usb, Overlapped
+
+
+class MonitorReadinessTests(unittest.TestCase):
+    def test_cached_frame_is_ignored_until_a_new_frame_arrives_within_one_second(self):
+        clock = [100.]
+        motor = Mock()
+        motor.state.side_effect = lambda **kwargs: SimpleNamespace(received_at=99. if clock[0]<100.6 else clock[0])
+        def wait(seconds): clock[0] += seconds
+        with patch('motor_platform.runtime.time.perf_counter',lambda:clock[0]):
+            state = start_monitoring(motor,wait=wait)
+        self.assertGreaterEqual(state.received_at,100.6)
+        self.assertLess(clock[0],101.)
+        motor.monitor.assert_called_once()
+        motor.enable.assert_not_called()
+
+    def test_monitor_wait_allows_one_second_and_remains_cancellable(self):
+        for cancel_at in (None,.2):
+            with self.subTest(cancel_at=cancel_at):
+                clock = [0.]
+                motor = Mock();motor.state.side_effect = TimeoutError('no new frame')
+                def wait(seconds): clock[0] += seconds
+                with patch('motor_platform.runtime.time.perf_counter',lambda:clock[0]):
+                    with self.assertRaises(TimeoutError if cancel_at is None else InterruptedError):
+                        start_monitoring(motor,cancelled=lambda: cancel_at is not None and clock[0]>=cancel_at,wait=wait)
+                self.assertAlmostEqual(clock[0],1. if cancel_at is None else .2,places=2)
+                motor.enable.assert_not_called()
+
+    def test_cancel_before_monitor_and_worker_fault_are_not_retried(self):
+        motor = Mock()
+        with self.assertRaises(InterruptedError): start_monitoring(motor,cancelled=lambda:True)
+        motor.monitor.assert_not_called()
+        motor.state.side_effect = RuntimeError('worker fault')
+        with self.assertRaisesRegex(RuntimeError,'worker fault'): start_monitoring(motor)
+        motor.state.assert_called_once()
+        motor.enable.assert_not_called()
 
 
 class Transport:

@@ -2,6 +2,7 @@ import csv
 import io
 import unittest
 import tempfile
+import time
 from pathlib import Path
 from unittest.mock import Mock, patch
 from types import SimpleNamespace
@@ -21,8 +22,11 @@ class RecordingTests(unittest.TestCase):
              patch.object(app, 'detect_dynamometers', return_value=['COM_TEST']), \
              patch.object(app, 'resolve_power_port', return_value='COM_POWER'), \
              patch.object(app, 'Dynamometer'), patch.object(app, 'PowerSupply'), \
-             patch.object(app, 'TerminalConsole'), patch.object(app, 'Bench'), \
+             patch.object(app, 'TerminalConsole') as console, patch.object(app, 'Bench') as bench, \
              patch.object(app, 'run') as run, patch('builtins.print'):
+            console.cancelled.is_set.return_value=False
+            motor=bench.return_value.__enter__.return_value.start.return_value.__enter__.return_value.motor.return_value
+            motor.state.side_effect=lambda **kwargs: SimpleNamespace(received_at=time.perf_counter())
             app.main(['--id', '1', '--serial', 'test', '--torque', '12'], output_dir=Path(folder)/"result")
             self.assertEqual(run.call_args.kwargs['torque'], 12)
             files = [p for p in Path(folder).rglob('*') if p.is_file()]

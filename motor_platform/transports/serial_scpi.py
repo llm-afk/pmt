@@ -1,6 +1,5 @@
 """Bounded, serialized ASCII line transactions over RS-232 (pyserial optional)."""
 from collections import deque
-from ..core import io_trace
 import math
 import uuid
 import threading
@@ -68,9 +67,6 @@ class SerialScpi:
         if error is not None:
             item.update(error_type=type(error).__name__, error=str(error))
         self._history.append(item)
-        io_trace.record('scpi.'+kind, device='power_supply', interface=self.port,
-                        direction='RX' if kind=='query' else 'TX',
-                        raw=(reply or b'') if kind=='query' else self._encode(command), **item)
 
     def diagnostic_snapshot(self):
         with self._lock:

@@ -5,7 +5,6 @@ Only inspect() is read-only. open() explicitly configures and starts CAN FD.
 """
 import ctypes as C
 from collections import deque
-from ..core import io_trace
 from ctypes import wintypes as W
 import math
 import os
@@ -382,15 +381,7 @@ class Canable:
         if not self._started:
             raise RuntimeError("CANable is not open")
         self._echo = self._echo % 255 + 1
-        try:
-            self._usb.transfer(self._usb.output, encode_usb(frame, self._echo), timeout=0.1)
-        except BaseException as exc:
-            io_trace.record('can.tx.failed',device='motor_can',interface='CANable:'+str(self.serial_number),
-                            direction='TX',raw=frame.data,can_id=frame.can_id,error=repr(exc))
-            raise
-        io_trace.record('can.tx', device='motor_can', interface='CANable:'+str(self.serial_number),
-                        direction='TX', raw=frame.data, can_id=frame.can_id, is_fd=frame.is_fd,
-                        brs=frame.brs, echo_id=self._echo)
+        self._usb.transfer(self._usb.output, encode_usb(frame, self._echo), timeout=0.1)
 
     def recv(self, timeout=0.1):
         if not self._started:
@@ -404,12 +395,6 @@ class Canable:
                 if len(self._rx) >= size:
                     packet = bytes(self._rx[:size])
                     del self._rx[:size]
-                    echo, can_id, dlc, channel, flags, _ = struct.unpack_from('<IIBBBB',packet)
-                    io_trace.record('can.echo' if echo!=0xffffffff else 'can.error' if can_id&0x20000000 else 'can.rx',
-                        device='motor_can', interface='CANable:'+str(self.serial_number), direction='RX',
-                        raw=packet[12:12+DLC_LENGTHS[dlc]] if dlc<len(DLC_LENGTHS) else packet[12:],
-                        can_id=can_id&0x1fffffff, echo_id=echo, dlc=dlc,
-                        channel=channel, flags=flags, usb_packet_hex=packet.hex())
                     frame = decode_usb(packet)
                     if frame is not None:
                         # Class-free Elmue notifications carry only counters.

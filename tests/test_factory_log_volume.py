@@ -46,6 +46,34 @@ class LogVolumeTests(unittest.TestCase):
             yield NS(_bus=bus)
         return bench()
 
+    def test_an_hour_of_idle_numeric_drift_keeps_periodic_summaries_and_immediate_transitions(self):
+        def states(i=0, *, enabled=False, port='COM18', state='READY'):
+            return dict(dyno=dict(state=state,detail=f'{port} · {i/100:.2f} Nm / {i/1000:.3f} rad/s'),
+                        power=dict(state='READY',detail=f'COM19 · {i/100:.2f} V · '+('输出开启' if enabled else '输出关闭')))
+        for i in range(1801):
+            self.logs.record_health(states(i))
+            if i<1800: self.advance(2)
+        snapshots=[data for event,data in self.records() if event=='devices.health']
+        self.assertEqual(len(snapshots),13)
+        self.assertIn('18.00 Nm',snapshots[-1]['details']['dyno']['detail'])
+        self.assertLess(self.logs.path.stat().st_size,20000)
+        for change in (states(enabled=True),states(port='COM20'),states(state='ERROR')):
+            before=len(self.records());self.logs.record_health(change)
+            self.assertEqual(len(self.records()),before+1)
+        self.assertEqual(list(self.logs.path.parent.glob('*.csv')),[])
+        self.assertEqual(list(self.logs.path.parent.glob('*.log')),[self.logs.path])
+
+    def test_close_reports_measured_log_bytes_and_largest_event_categories(self):
+        for i in range(5): self.logs.station.event('sdo.read.ack',payload='00'*32)
+        size_before_close=self.logs.path.stat().st_size
+        self.logs.close()
+        event,summary=self.records()[-1]
+        self.assertEqual(event,'application.stop')
+        self.assertEqual(summary['log_bytes_before_close'],size_before_close)
+        self.assertEqual(sum(self.logs.event_bytes.values()),self.logs.path.stat().st_size)
+        item=next(item for item in summary['largest_events'] if item['event']=='sdo.read.ack')
+        self.assertEqual(item['records'],5)
+
     def test_88_identical_idle_failures_keep_one_stack_and_exact_counters(self):
         maintenance=Maintenance(self.config,bench_factory=self.mock_bench,diagnostic_poll=True)
         with log_scope(self.logs.station),patch('scripts.factory_test.maintenance.Canable',return_value=Mock()):

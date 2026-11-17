@@ -10,7 +10,7 @@ import tkinter as tk
 from tkinter import ttk
 
 from motor_platform import Bench, Canable, MitCommand
-from motor_platform.runtime import MOTOR_FEEDBACK_TIMEOUT_S, RuntimeShutdownError
+from motor_platform.runtime import MOTOR_FEEDBACK_TIMEOUT_S, RuntimeShutdownError, start_monitoring
 from .version import VERSION_LABEL
 from .maintenance import Maintenance
 from .station_config import hardware_parts, hardware_torque_limit
@@ -134,20 +134,7 @@ class ManualSession:
                     self.profile_known=sn[13] in ('1','2')  # Only the chip platform selects maintenance protocol.
             self.firmware=str(Maintenance.read(bench,self.node,0x2100,2))
             channel=bench.start(rate_hz=1000,command_timeout=.25).motor(self.node)
-            monitor_start = time.perf_counter()
-            channel.monitor()
-            deadline = monitor_start + MOTOR_FEEDBACK_TIMEOUT_S
-            while True:
-                try:
-                    if channel.state(max_age=MOTOR_FEEDBACK_TIMEOUT_S).received_at >= monitor_start:
-                        break
-                except TimeoutError:
-                    if time.perf_counter() >= deadline:
-                        raise
-                if time.perf_counter() >= deadline:
-                    raise TimeoutError(f'调试连接在 {MOTOR_FEEDBACK_TIMEOUT_S:g} s 内未收到电机新反馈')
-                if self.stop.wait(.005):
-                    raise InterruptedError('调试连接已取消')
+            start_monitoring(channel,cancelled=self.stop.is_set,wait=self.stop.wait)
             log_event('debug.monitor.started',node_id=self.node,target_hz=1000,
                       request_can_id=hex(0x100+self.node),feedback_can_id=hex(0x190+self.node),
                       neutral_target=asdict(MitCommand()),statistics=channel.stats())

@@ -152,8 +152,7 @@ class FactoryWindow:
             self.saved_credentials = dict.fromkeys(SECRET_FIELDS,'')
             self.credential_error = str(exc)
             credential_exception = exc
-        self.diagnostics = diagnostics or DiagnosticLogs(storage_root or state_root(), simulation=self.config.simulation,
-                                                       capture_io=not self.config.simulation and not preview_only)
+        self.diagnostics = diagnostics or DiagnosticLogs(storage_root or state_root(), simulation=self.config.simulation)
         self.diagnostics.failure = lambda message:self.events.put(('log_failure',message))
         if self.diagnostics.last_error:
             self.diagnostics.failure(self.diagnostics.last_error)
@@ -806,11 +805,9 @@ class FactoryWindow:
             self.write_log('[配置] '+('已读取工位配置：' if self.config_existed else '首次启动，使用默认工位配置：')+str(self.config_path))
         self.write_log('[存储] 工位数据目录：'+str(self.storage_root or state_root()))
         self.write_log('[日志] 当前启动记录：'+str(self.diagnostics.station.path)+'；日志保留 30 天。')
-        if self.diagnostics.io_capture is not None:
-            self.write_log('[详细采集] 全部硬件通信 CSV：'+str(self.diagnostics.io_capture.path))
         self.log_configuration()
         self.write_log('[探测] '+('设备监视已启用，等待环境就绪后探测硬件。' if self.config.automatic else
-            '设备监视已暂停，可在工位配置 → 管理中启用。'))
+            '设备监视已暂停，可在工位配置 → 维护与诊断中启用。'))
         self.write_log('[探测] CANable：枚举适配器；电机：读取实际 ID / SN；测功机：监听有效反馈。')
         self.write_log('[探测] 电源：先确认测功机串口，再检查电源；打印机：核对服务和指定队列。')
         if self.config.simulation:
@@ -1167,8 +1164,10 @@ class FactoryWindow:
                             self.health_states = dict(self.health_states,printer=printer_info)
                             self.events.put(('device_health',dict(name='printer',info=printer_info,
                                 config_revision=revision,mode_generation=mode_generation)))
-                states = {name:info['state'] for name,info in self.health_states.items()}
-                self.diagnostics.snapshot('devices.health',states)
+                with self.lock:
+                    health_snapshot = dict(self.health_states)
+                states = {name:info['state'] for name,info in health_snapshot.items()}
+                self.diagnostics.record_health(health_snapshot)
                 needed = [] if config.simulation else [key for key in ('can','dyno','power','printer') if states.get(key)!='READY']
                 support_ready = not needed
                 sn_configured=self.sn_configuration_ready(config)
@@ -1323,7 +1322,7 @@ class FactoryWindow:
         elif self.config_error:
             self.set_prompt('请联系工程人员检查工位配置',self.config_error,'#C13F50')
         elif not self.config.automatic:
-            self.set_prompt('设备监视已暂停','请联系工程人员在工位配置中启用设备监视。')
+            self.set_prompt('设备监视已暂停','请联系工程人员在工位配置 → 维护与诊断中启用设备监视。')
         elif candidate is None:
             self.set_prompt('正在检查工位，请稍候','正在识别设备并核对开测条件。')
         else:

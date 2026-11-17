@@ -1,6 +1,8 @@
 """上位机内部测量内核、采集记录与离线数据处理。"""
 from contextlib import contextmanager
 import sys
+import time
+from motor_platform import MitCommand
 
 
 SAMPLE_MAX_GAP_S = 0.1  # 采集连续性和平滑分段阈值，独立于电机断线时间。
@@ -40,6 +42,51 @@ def record_shutdown_failure(action):
             target.add_note(note)
 
 
+def stop_with_ramp(motor, torque, ramp_seconds, on_step, *, on_error=None):
+    """One stop sequence for both measurements, including failures during the ramp."""
+    try:
+        if ramp_seconds > 0:
+            began = time.perf_counter()
+            while True:
+                ratio = min(1.0, (time.perf_counter()-began)/ramp_seconds)
+                remaining_torque = torque*(1-ratio)
+                motor.set_mit(MitCommand(torque=remaining_torque))
+                on_step(remaining_torque)
+                if ratio >= 1:
+                    break
+                time.sleep(.005)
+    except BaseException as exc:
+        if on_error is not None:
+            try:
+                on_error()
+            except Exception as snapshot_error:
+                exc.add_note('收尾诊断快照未取得：'+str(snapshot_error))
+        raise
+    finally:
+        try:
+            with record_shutdown_failure('电机失能'):
+                motor.disable()
+        except Exception as exc:
+            if on_error is not None:
+                try:
+                    on_error()
+                except Exception as snapshot_error:
+                    exc.add_note('收尾诊断快照未取得：'+str(snapshot_error))
+            raise
+
+
+def capture_shutdown_error(summary, motor, dyno):
+    """Keep the acquisition evidence and the actual shutdown-failure instant."""
+    if 'shutdown_snapshot' in summary:
+        return
+    snapshot = device_snapshot(motor,dyno,target=None,loop_at=time.perf_counter())
+    summary['shutdown_snapshot'] = snapshot
+    if summary.get('snapshot_phase') == 'acquisition_complete':
+        summary['acquisition_snapshot'] = summary['runtime_snapshot']
+        summary['runtime_snapshot'] = snapshot
+        summary['snapshot_phase'] = 'shutdown_failed'
+
+
 def power_observer():
     # Capture the workpiece context before a load-control executor changes threads.
     from ..diagnostics import current_log
@@ -49,8 +96,8 @@ def power_observer():
 
 def device_snapshot(motor, dyno, *, target, loop_at):
     """Memory reads only; never query USB/serial or write a log before emergency stop."""
-    import time
-    result = dict(applied_target=target, loop_age_ms=(time.perf_counter()-loop_at)*1000)
+    at = time.perf_counter()
+    result = dict(captured_at=at, applied_target=target, loop_age_ms=(at-loop_at)*1000)
     for name, device in (('motor',motor),('dynamometer',dyno)):
         try:
             snapshot = getattr(device, 'diagnostic_snapshot', None)
@@ -70,10 +117,14 @@ def log_measurement_snapshot(stage, summary):
             summary['stop_status'] = dict(snapshot_error=repr(exc))
     snapshot = summary.get('runtime_snapshot')
     if snapshot:
-        log_event('test.runtime.summary', '采集运行统计，故障快照在停机前取自内存',
-                  level='WARNING' if summary.get('reason') == 'error' else 'INFO',
-                  stage=stage, reason=summary.get('reason'), snapshot=snapshot,
-                  stop_status=summary.get('stop_status'))
+        details = dict(stage=stage,reason=summary.get('reason'),snapshot=snapshot,
+                       snapshot_phase=summary.get('snapshot_phase'),stop_status=summary.get('stop_status'))
+        if summary.get('acquisition_snapshot') is not None:
+            details['acquisition_snapshot'] = summary['acquisition_snapshot']
+        if summary.get('shutdown_snapshot') is not None and summary['shutdown_snapshot'] is not snapshot:
+            details['shutdown_snapshot'] = summary['shutdown_snapshot']
+        log_event('test.runtime.summary', '测量运行统计与采集、收尾阶段快照',
+                  level='WARNING' if summary.get('reason') == 'error' else 'INFO',**details)
 
 
 def power_off(power, summary=None):

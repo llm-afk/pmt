@@ -58,6 +58,30 @@ class MotorFeedbackTimeout(TimeoutError):
 MOTOR_FEEDBACK_TIMEOUT_S = 1.0
 
 
+def start_monitoring(motor, timeout=MOTOR_FEEDBACK_TIMEOUT_S, *, cancelled=None, wait=None):
+    """Start neutral monitoring and wait for feedback received after this call."""
+    timeout = positive(timeout)
+    wait = time.sleep if wait is None else wait
+    started = time.perf_counter()
+    if cancelled is not None and cancelled():
+        raise InterruptedError('电机连接已取消')
+    motor.monitor()
+    while True:
+        if cancelled is not None and cancelled():
+            raise InterruptedError('电机连接已取消')
+        try:
+            state = motor.state(max_age=timeout)
+        except TimeoutError:
+            pass
+        else:
+            if state.received_at >= started:
+                return state
+        remaining = started+timeout-time.perf_counter()
+        if remaining <= 0:
+            raise TimeoutError(f'电机监视在 {timeout:g} s 内未收到本次连接的新反馈')
+        wait(min(.005, remaining))
+
+
 class MotorChannel:
     """One named motor instance. Targets are immutable and replaced atomically."""
     def __init__(self, runtime, name, motor, rate_hz):

@@ -8,11 +8,11 @@ import sys
 import time
 
 from motor_platform import Bench, Canable, Dynamometer, MitCommand, PowerSupply
-from motor_platform.runtime import MOTOR_FEEDBACK_TIMEOUT_S
+from motor_platform.runtime import MOTOR_FEEDBACK_TIMEOUT_S, start_monitoring
 from motor_platform.components.dynamometer import detect_dynamometers
 from motor_platform.components.power_supply.discovery import resolve_power_port
 from .. import (FeedbackClock, SAMPLE_MAX_GAP_S, power_off, record_shutdown_failure, power_observer,
-                device_snapshot, log_measurement_snapshot)
+                device_snapshot, log_measurement_snapshot, stop_with_ramp, capture_shutdown_error)
 from ..console import WindowConsole as TerminalConsole
 from scripts.factory_test.measurements.smoothing import append_smoothed_columns
 from scripts.factory_test.measurements.csv_streams import pack_streams
@@ -86,21 +86,11 @@ def check_motor(motor):
     return state, stats
 
 
-def stop_motor(motor, torque, controlled, collect):
-    try:
-        if controlled:
-            began = time.perf_counter()
-            while True:
-                ratio = min(1.0, (time.perf_counter()-began)/STOP_RAMP_S)
-                motor.set_mit(MitCommand(torque=torque*(1-ratio)))
-                check_motor(motor)
-                collect()  # 接收线程可能刚入队的截止前样本也保留；停机样本被时间边界过滤。
-                if ratio >= 1:
-                    break
-                time.sleep(.005)
-    finally:
-        with record_shutdown_failure('电机失能'):
-            motor.disable()
+def stop_motor(motor, torque, controlled, collect, *, on_error=None):
+    def on_step(remaining_torque):
+        check_motor(motor)
+        collect()
+    stop_with_ramp(motor,torque,STOP_RAMP_S if controlled else 0,on_step,on_error=on_error)
 
 
 def run(motor, dyno, ui, args, result):
@@ -165,6 +155,7 @@ def run(motor, dyno, ui, args, result):
             time.sleep(TARGET_UPDATE_S)
     except BaseException as exc:
         result['runtime_snapshot'] = device_snapshot(motor,dyno,target=applied,loop_at=locals().get('now',time.perf_counter()))
+        result['snapshot_phase'] = 'acquisition_failed'
         result['reason'] = 'operator_stop' if isinstance(exc, KeyboardInterrupt) else 'error'
         if recorder is not None:
             recorder.cutoff = min(recorder.cutoff, time.perf_counter())
@@ -174,11 +165,14 @@ def run(motor, dyno, ui, args, result):
         result['_stop_probe'] = getattr(motor,'stop_status',None)
         if 'runtime_snapshot' not in result:
             result['runtime_snapshot'] = device_snapshot(motor,dyno,target=applied,loop_at=locals().get('now',time.perf_counter()))
+            result['snapshot_phase'] = 'acquisition_complete'
         try:
             ui._notice = '正在降扭矩、失能；随后关闭阻尼器电源'
             ui.app.invalidate()
-            stop_motor(motor, applied, enabled and (original is None or isinstance(original, KeyboardInterrupt)), collect)
+            stop_motor(motor, applied, enabled and (original is None or isinstance(original, KeyboardInterrupt)), collect,
+                       on_error=lambda: capture_shutdown_error(result,motor,dyno))
         except Exception as exc:
+            capture_shutdown_error(result,motor,dyno)
             result['reason'] = 'error'
             if original is None:
                 raise
@@ -216,7 +210,8 @@ def main(argv=None, *, output_dir, quiet=False):
                                 with Bench(transport=Canable(args.serial), motor_ids=[args.id], rate_hz=MOTOR_HZ) as bench:
                                     with bench.start() as control:
                                         motor = control.motor(args.id)
-                                        motor.monitor()
+                                        start_monitoring(motor,cancelled=TerminalConsole.cancelled.is_set,
+                                                         wait=TerminalConsole.cancelled.wait)
                                         try:
                                             power.enable()  # 建立阻尼期间保持零目标监视。
                                             time.sleep(LOAD_SETTLE_S)

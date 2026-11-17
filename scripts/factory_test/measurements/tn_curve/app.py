@@ -8,11 +8,11 @@ import sys
 import time
 
 from motor_platform import Bench, MitCommand, Dynamometer, PowerSupply, Canable
-from motor_platform.runtime import MOTOR_FEEDBACK_TIMEOUT_S
+from motor_platform.runtime import MOTOR_FEEDBACK_TIMEOUT_S, start_monitoring
 from motor_platform.components.dynamometer import detect_dynamometers
 from motor_platform.components.power_supply.discovery import resolve_power_port
 from .. import (FeedbackClock, SAMPLE_MAX_GAP_S, power_off, record_shutdown_failure, power_observer,
-                device_snapshot, log_measurement_snapshot)
+                device_snapshot, log_measurement_snapshot, stop_with_ramp, capture_shutdown_error)
 from ..console import WindowConsole as TerminalConsole
 from scripts.factory_test.measurements.tn_curve.recording import CurveRecorder, event_row
 from scripts.factory_test.measurements.smoothing import append_smoothed_columns
@@ -120,29 +120,19 @@ def load_target(step_number):
     return min(MAX_CURRENT_A, round(step_number*CURRENT_STEP_A, 3))
 
 
-def graceful_stop(motor, power, pending, torque, ui, drain):
+def graceful_stop(motor, power, pending, torque, ui, drain, *, on_error=None):
     """正常停机：1 秒降扭矩，再失能并直接关闭电源。
 
     CAN/反馈故障时上层走立即失能，不延长故障状态来执行斜坡。
     """
-    began = time.perf_counter()
-    try:
-        while True:
-            ratio = min(1.0, (time.perf_counter()-began)/STOP_TORQUE_RAMP_S)
-            motor.set_mit(MitCommand(torque=torque*(1-ratio)))
-            state = motor.state(max_age=MOTOR_FEEDBACK_TIMEOUT_S)
-            if state.error_code or motor.stats()['fault']:
-                raise RuntimeError('motor fault during controlled stop')
-            drain('stopping_torque')
-            ui._notice = f'停止中：电机扭矩 {torque*(1-ratio):.3f}，保持阻尼'
-            ui.app.invalidate()
-            if ratio >= 1:
-                break
-            time.sleep(.005)
-    finally:
-        # 即使斜坡期间异常，也尝试失能；保留原始异常。
-        with record_shutdown_failure('电机失能'):
-            motor.disable()
+    def on_step(remaining_torque):
+        state = motor.state(max_age=MOTOR_FEEDBACK_TIMEOUT_S)
+        if state.error_code or motor.stats()['fault']:
+            raise RuntimeError('motor fault during controlled stop')
+        drain('stopping_torque')
+        ui._notice = f'停止中：电机扭矩 {remaining_torque:.3f}，保持阻尼'
+        ui.app.invalidate()
+    stop_with_ramp(motor,torque,STOP_TORQUE_RAMP_S,on_step,on_error=on_error)
     # 串口操作顺序完成后关闭输出，不再阶梯降低电流。
     if pending is not None:
         pending.result()
@@ -255,15 +245,19 @@ def run(motor, dyno, power, pool, ui, writer, summary, *, torque=None):
         summary['_stop_probe'] = getattr(motor,'stop_status',None)
         summary['runtime_snapshot'] = device_snapshot(motor,dyno,target=applied_torque,
                                                      loop_at=locals().get('now',time.perf_counter()))
+        summary['snapshot_phase'] = 'acquisition_failed' if active_error is not None else 'acquisition_complete'
         record_cutoff = time.perf_counter()
         try:
             if motor_started and (active_error is None or isinstance(active_error, KeyboardInterrupt)):
-                graceful_stop(motor, power, pending, applied_torque, ui, drain)
+                graceful_stop(motor, power, pending, applied_torque, ui, drain,
+                              on_error=lambda: capture_shutdown_error(summary,motor,dyno))
                 summary['controlled_stop_completed'] = True
             else:
                 with record_shutdown_failure('电机失能'):
                     motor.disable()
         except Exception as cleanup:
+            capture_shutdown_error(summary,motor,dyno)
+            reason = 'error'
             if active_error is None:
                 raise
             active_error.add_note(f'Motor shutdown failed: {cleanup}')
@@ -325,7 +319,8 @@ def main(argv=None, *, output_dir, quiet=False):
                         with Bench(transport=Canable(args.serial), motor_ids=[args.id], rate_hz=MOTOR_HZ) as bench:
                             with bench.start() as control:
                                 motor = control.motor(args.id)
-                                motor.monitor()
+                                start_monitoring(motor,cancelled=TerminalConsole.cancelled.is_set,
+                                                 wait=TerminalConsole.cancelled.wait)
                                 power.enable()  # Zero current limit, independent motor battery.
                                 run(motor, dyno, power, pool, ui, writer, summary, torque=args.torque)
                 finally:
