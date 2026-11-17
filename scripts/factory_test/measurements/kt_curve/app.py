@@ -1,8 +1,6 @@
 """扭矩输出误差测量内核；仅由上位机流程传入设备、目标和输出目录。"""
 import argparse
 import csv
-from bisect import bisect_right
-from collections import deque
 import math
 from pathlib import Path
 import sys
@@ -27,7 +25,7 @@ CANABLE_SERIAL = None           # 由工位传入已选适配器 SN
 TORQUE_FF = None                # 必须填写最大目标或传 --torque；单位沿用电机固件，支持负方向
 LOAD_VOLTAGE_V = 24.0           # 阻尼器电源电压，--voltage 覆盖
 LOAD_CURRENT_A = 3.0            # 阻尼器限流，--current 覆盖；整个采集期间保持不变
-LOAD_SETTLE_S = 0.5             # 电源输出确认开启后保持，再使能电机；不计入 5 秒采集
+LOAD_SETTLE_S = 0.5             # 电源输出确认开启后保持，再使能电机；不计入扭矩斜坡采集
 POWER_PORT = 'auto'             # 多台电源时在此指定 COM 端口
 DYNO_PORT = 'auto'              # 多台测功机时在此指定 COM 端口
 RAMP_DURATION_S = 3.0           # 从开始爬升到结束采集的时间
@@ -38,42 +36,6 @@ DYNO_FEEDBACK_TIMEOUT_S = 1.0
 DYNO_TORQUE_SCALE = 100.0
 DYNO_SPEED_SCALE = 100.0
 SMOOTH_WINDOW_S = 0.30          # 停机后平滑两路扭矩；原始样本不修改
-
-
-class TorqueErrorLimit(RuntimeError):
-    diagnostic_code = 'KT_TORQUE_ERROR_LIMIT'
-    diagnostic_hint = '实际扭矩与下发目标的误差超过工位设定值，本次提前结束，不申请正式 SN。'
-
-    def __init__(self, target, actual, limit_pct, maximum):
-        error = abs(actual-target)/abs(maximum)*100
-        self.diagnostic_context = dict(target_nm=target,actual_nm=actual,error_pct_fs=error,
-                                       limit_pct_fs=limit_pct,full_scale_nm=abs(maximum))
-        super().__init__(f'扭矩误差 {error:.2f}%FS 超过设定 {limit_pct:g}%FS'
-                         f'（目标 {target:.3f} Nm，实际 {actual:.3f} Nm）')
-
-
-class TorqueErrorMonitor:
-    """Average target and actual at the same real sensor times over 0.3 s."""
-    def __init__(self, recorder, maximum, limit_pct):
-        self.recorder,self.maximum,self.limit_pct = recorder,maximum,limit_pct
-        self.samples = deque()
-
-    def observe(self, states):
-        for state in states:
-            if not self.recorder.origin <= state.received_at <= self.recorder.cutoff:
-                continue
-            index = bisect_right(self.recorder.commands,(state.received_at,math.inf))-1
-            target = self.recorder.commands[max(0,index)][1]
-            self.samples.append((state.received_at,target,state.torque))
-            cutoff = state.received_at-SMOOTH_WINDOW_S
-            while self.samples and self.samples[0][0] < cutoff:
-                self.samples.popleft()
-            if state.received_at-self.recorder.origin < SMOOTH_WINDOW_S:
-                continue
-            target = sum(row[1] for row in self.samples)/len(self.samples)
-            actual = sum(row[2] for row in self.samples)/len(self.samples)
-            if abs(actual-target)/abs(self.maximum)*100 > self.limit_pct:
-                raise TorqueErrorLimit(target,actual,self.limit_pct,self.maximum)
 
 
 def parse_args(argv=None):
@@ -128,7 +90,6 @@ def stop_motor(motor, torque, controlled, collect, *, on_error=None):
 
 def run(motor, dyno, ui, args, result):
     recorder = None
-    error_monitor = None
     enabled = False
     applied = 0.0
     def collect():
@@ -136,8 +97,6 @@ def run(motor, dyno, ui, args, result):
         if recorder is not None:
             recorder.add('motor', motors)
             recorder.add('dyno', dynos)
-            if error_monitor is not None:
-                error_monitor.observe(dynos)
     try:
         check_motor(motor)
         dyno.state(max_age=DYNO_FEEDBACK_TIMEOUT_S)
@@ -152,7 +111,6 @@ def run(motor, dyno, ui, args, result):
         collect()
         recorder = Recorder(time.perf_counter(), RAMP_DURATION_S)
         result['recorder'] = recorder
-        error_monitor = TorqueErrorMonitor(recorder,args.torque,getattr(args,'error_limit_pct',DEFAULT_KT_ERROR_LIMIT_PCT))
         next_display = 0.0
         while True:
             now = time.perf_counter()
@@ -189,7 +147,6 @@ def run(motor, dyno, ui, args, result):
                 next_display = now+.1
             time.sleep(TARGET_UPDATE_S)
     except BaseException as exc:
-        error_monitor = None
         result['runtime_snapshot'] = device_snapshot(motor,dyno,target=applied,loop_at=locals().get('now',time.perf_counter()))
         result['snapshot_phase'] = 'acquisition_failed'
         result['reason'] = 'operator_stop' if isinstance(exc, (KeyboardInterrupt,InterruptedError)) else 'error'
@@ -198,7 +155,6 @@ def run(motor, dyno, ui, args, result):
         raise
     finally:
         original = sys.exception()
-        error_monitor = None
         result['_stop_probe'] = getattr(motor,'stop_status',None)
         if 'runtime_snapshot' not in result:
             result['runtime_snapshot'] = device_snapshot(motor,dyno,target=applied,loop_at=locals().get('now',time.perf_counter()))
@@ -206,7 +162,7 @@ def run(motor, dyno, ui, args, result):
         try:
             ui._notice = '正在降扭矩、失能；随后关闭阻尼器电源'
             ui.app.invalidate()
-            stop_motor(motor, applied, enabled and (original is None or isinstance(original, (KeyboardInterrupt,InterruptedError,TorqueErrorLimit))), collect,
+            stop_motor(motor, applied, enabled and (original is None or isinstance(original, (KeyboardInterrupt,InterruptedError))), collect,
                        on_error=lambda: capture_shutdown_error(result,motor,dyno))
         except Exception as exc:
             capture_shutdown_error(result,motor,dyno)

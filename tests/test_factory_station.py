@@ -1088,13 +1088,15 @@ class MeasurementStepDisplayTests(unittest.TestCase):
     def states(events,name):
         return [value['status'] for kind,value in events if kind=='step' and value['name']==name]
 
-    def test_collected_kt_failure_stops_before_tn_and_mes(self):
+    def test_collected_kt_failure_completes_tn_but_prevents_mes(self):
         with tempfile.TemporaryDirectory() as folder:
             _,service,modules,events,result=self.run_pipeline(Path(folder),('FAIL','PASS'))
         self.assertEqual(result['summary']['status'],'FAIL')
         self.assertEqual(self.states(events,'kt'),['RUNNING','COLLECTED','FAILED'])
-        self.assertEqual(self.states(events,'tn'),['WAITING'])
-        modules[1].main.assert_not_called()
+        self.assertEqual(self.states(events,'tn'),['RUNNING','COLLECTED','DONE'])
+        modules[1].main.assert_called_once()
+        self.assertEqual(result['steps']['report'],'DONE')
+        self.assertTrue(result['local_report_generated'])
         service.allocate.assert_not_called()
 
     def test_passed_kt_survives_later_incomplete_tn_without_inheriting_whole_failure(self):

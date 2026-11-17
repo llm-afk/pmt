@@ -1636,6 +1636,9 @@ class FactoryWindow:
                 self.current_sn.set(value['sn'])
                 self.sn_phase.set('正式 SN · 已写入核对')
             elif kind=='failed':
+                if ((value.get('diagnostic') or {}).get('code')=='TEST_QUALITY_FAILED'
+                        and 'can' in self.device_widgets):
+                    self.device_state('can','STANDBY','曲线测试已结束，等待下一次识别')
                 self.last_failure=self.diagnostics.redact(dict(value,at=datetime.now().astimezone().isoformat(),motor_sn=self.current_sn.get()))
                 self.terminal_prompt=(*self.failure_prompt(value),'#C13F50')
                 self.set_prompt(*self.terminal_prompt)
@@ -1679,6 +1682,9 @@ class FactoryWindow:
             return '打印结果未确认，请隔离本件','勿补打或贴标。请工程人员核对实体标签和打印记录。'
         if code == 'CANCELLED':
             return '本次测试已停止','停止结果和加载关闭回执已保存；确认设备停止后再取件。'
+        if code == 'TEST_QUALITY_FAILED':
+            report = '本地报告已保存' if value.get('local_report_generated') else '报告保存未完成，请查看日志'
+            return '测试不合格，请隔离本件','KT、T-N 曲线均已采集；'+report+'；不申请正式 SN、不打印、不上传。'
         if code == 'KT_TORQUE_ERROR_LIMIT':
             detail=value.get('message') or '扭矩误差超过工位设定值'
             return '扭矩误差超限，请隔离本件',detail+'；已提前结束，不申请正式 SN，请勿贴合格标签。'

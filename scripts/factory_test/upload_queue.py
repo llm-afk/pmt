@@ -29,7 +29,8 @@ def read_json(path):
 
 
 def production_pass(summary):
-    return (summary.get('demo') is False and not summary.get('integration_test') and
+    return (summary.get('delivery_policy') != 'LOCAL_ONLY' and
+            summary.get('demo') is False and not summary.get('integration_test') and
             (summary.get('station_version') != 2 or summary.get('station_ready') is True) and
             summary.get('status') == 'PASS' and summary.get('test_status', 'PASS') == 'PASS')
 
@@ -140,6 +141,8 @@ class UploadQueue:
             if not saved.get('report_error'):
                 return
         summary = read_json(source)
+        if summary.get('delivery_policy') == 'LOCAL_ONLY':
+            return
         if not outcome_only and not production_pass(summary):
             return
         if outcome_only and (summary.get('demo') is not False or summary.get('integration_test')):

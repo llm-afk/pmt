@@ -80,15 +80,6 @@ class FactoryTests(unittest.TestCase):
             )
             self.assertEqual(result['stages'][name]['status'],'COMPLETED')
 
-    def test_online_torque_error_stops_sequence_and_is_classified(self):
-        from scripts.factory_test.measurements.kt_curve.app import TorqueErrorLimit
-        stages=self.stages()
-        stages[0][1].main.side_effect=TorqueErrorLimit(15.,10.,5.,30.)
-        result=app.execute(self.args(),Path('output'),stages=stages,identify=lambda _:'same')
-        stages[1][1].main.assert_not_called()
-        self.assertEqual(result['diagnostic']['code'],'KT_TORQUE_ERROR_LIMIT')
-        self.assertEqual(result['stages']['tn']['status'],'SKIPPED')
-        self.assertEqual(report.analyze(Path('output'),result)[0]['status'],'FAIL')
 
     def test_fault_or_sn_change_prevents_next_test(self):
         for mismatch in (False,True):

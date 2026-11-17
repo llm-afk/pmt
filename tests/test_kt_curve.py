@@ -114,28 +114,20 @@ class ConsistencyTests(unittest.TestCase):
         self.assertGreater(len(set(rising)),1)
         self.assertEqual(max(torque for _,torque in motor.commands),30)
 
-    def test_torque_error_monitor_averages_matched_sensor_times_then_stops_over_limit(self):
-        recorder=app.Recorder(100.,3.)
-        recorder.command(100.01,10.)
-        monitor=app.TorqueErrorMonitor(recorder,30.,5.)
-        monitor.observe([NS(received_at=100.1,torque=10.1),NS(received_at=100.31,torque=10.2)])
-        with self.assertRaises(app.TorqueErrorLimit) as caught:
-            monitor.observe([NS(received_at=100.7,torque=5.)])
-        self.assertEqual(caught.exception.diagnostic_context['limit_pct_fs'],5.)
 
-    def test_engineering_error_ramps_to_zero_before_disable(self):
+    def test_low_measured_torque_still_completes_full_ramp_and_records_data(self):
         clock,events,result=[100.],[],{}
         motor,dyno=FakeMotor(clock,events),FakeDyno(clock)
         ui=NS(app=NS(invalidate=lambda:None),poll=lambda:None)
         with patch.object(app.time,'perf_counter',lambda:clock[0]),patch.object(app.time,'sleep',lambda dt:clock.__setitem__(0,clock[0]+dt)),patch.object(app,'RAMP_DURATION_S',.6),patch.object(app,'TARGET_UPDATE_S',.01),patch.object(app,'STOP_RAMP_S',.05):
-            with self.assertRaises(app.TorqueErrorLimit):
-                app.run(motor,dyno,ui,self.args(),result)
-        values=[torque for _,torque in motor.commands]
-        peak=values.index(max(values))
-        self.assertGreater(len(values)-peak,3)
-        self.assertEqual(values[-1],0.)
+            app.run(motor,dyno,ui,self.args(),result)
+        self.assertEqual(result['reason'],'completed')
+        self.assertAlmostEqual(result['recorder'].cutoff,100.6)
+        self.assertEqual(max(torque for _,torque in motor.commands),30.)
+        self.assertEqual(motor.commands[-1][1],0.)
         self.assertEqual(events,['motor_on','motor_off'])
-        self.assertEqual(result['reason'],'error')
+        self.assertTrue(result['recorder'].events)
+        self.assertTrue(all(sample.torque==.3 for _,_,sample in result['recorder'].events))
 
     def test_motor_disable_loss_marks_failure_even_if_ramp_succeeded(self):
         motor=Mock()

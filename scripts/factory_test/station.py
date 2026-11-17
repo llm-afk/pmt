@@ -25,6 +25,12 @@ STEPS = (
 )
 
 
+def measurement_overview(summary):
+    """Keep verdict evidence in the log; curve points remain in report data."""
+    fields = ('name','title','status','metrics','note','max_deviation_nm','max_temperature_c','csv_rows')
+    return [{key:section[key] for key in fields if key in section} for section in summary.get('sections',[])]
+
+
 def measurement_evidence(summary):
     """Read the saved KT/TN evidence once, including absent or conflicting reports."""
     summary = summary if isinstance(summary, dict) else {}
@@ -78,9 +84,17 @@ class MeasurementFailed(RuntimeError):
     def __init__(self, summary):
         super().__init__(summary.get('error') or '测试未通过或未完成；不会申请正式 SN')
         diagnostic = summary.get('diagnostic') or {}
-        self.diagnostic_code = diagnostic.get('code', 'TEST_NOT_PASSED')
-        self.diagnostic_hint = diagnostic.get('hint', '查看测试数据、原始故障快照和停机确认记录。')
-        self.diagnostic_context = dict(original=diagnostic, stages=summary.get('stages', {}))
+        complete = all((summary.get('stages') or {}).get(name,{}).get('status')=='COMPLETED' for name in ('kt','tn'))
+        if summary.get('status')=='FAIL' and complete:
+            self.diagnostic_code = 'TEST_QUALITY_FAILED'
+            self.diagnostic_hint = '两项曲线已完整采集；查看本地不合格报告，不申请正式 SN、不打印、不上传。'
+            self.diagnostic_context = dict(sections=measurement_overview(summary),limits=summary.get('limits',{}))
+            self.args = ('两项曲线已完整采集，测试结果不合格',)
+        else:
+            self.diagnostic_code = diagnostic.get('code','TEST_NOT_PASSED')
+            self.diagnostic_hint = diagnostic.get('hint','查看测试数据、原始故障快照和停机确认记录。')
+            self.diagnostic_context = dict(original=diagnostic,stages=summary.get('stages',{}))
+
 
 
 class RecoveryRequired(RuntimeError):
@@ -227,18 +241,9 @@ class Services:
                 self.emit('step', dict(name=_name, status='COLLECTED' if complete else 'INCOMPLETE'))
                 return result
             stages.append((name, SimpleNamespace(main=run), csv))
-        def after_stage(name, summary):
-            if name != 'kt':
-                return
-            section = report.analyze(directory,summary)[0]
-            log_event('test.stage.analysis',stage='kt',status=section['status'],metrics=section['metrics'])
-            if section['status']=='FAIL':
-                target,actual=max(section['points'],key=lambda point:abs(point[1]-point[0]))
-                raise app.kt.TorqueErrorLimit(target,actual,self.config.kt_error_limit_pct,self.config.torque)
-        summary = app.execute(args,directory,stages=stages,motor_sn=base_sn,after_stage=after_stage)
+        summary = app.execute(args,directory,stages=stages,motor_sn=base_sn)
         summary['sections'] = report.analyze(directory, summary)
-        summary['status'] = ('FAIL' if summary.get('diagnostic',{}).get('code')=='KT_TORQUE_ERROR_LIMIT'
-                             else report.overall(summary['sections'],summary['stages']))
+        summary['status'] = report.overall(summary['sections'],summary['stages'])
         return summary
 
     def check_stop(self):
@@ -555,7 +560,7 @@ class StationRunner:
                     summary['firmware'] = record['firmware']
                 record['summary'] = summary
                 emit_measurement_steps(self.emit, summary)
-                log_event('test.analysis', status=summary['status'], sections=summary.get('sections'),
+                log_event('test.analysis', status=summary['status'], sections=measurement_overview(summary),
                           limits=summary.get('limits'), stages=summary.get('stages'))
                 self.emit('metrics', summary)
                 if summary['status'] == 'PASS':
@@ -564,9 +569,14 @@ class StationRunner:
                 failure = MeasurementFailed(summary)
                 for note in summary.get('error_notes', []):
                     failure.add_note(note)
+                summary.update(station_version=2,station_ready=False,delivery_policy='LOCAL_ONLY')
                 try:
                     atomic_json(directory/'summary.json', summary)
                     self.services.render(directory, summary)
+                    record['local_report_generated'] = True
+                    record['steps']['report'] = 'DONE'
+                    self.emit('step',dict(name='report',status='DONE'))
+                    log_event('report.local_only','本地不合格报告已保存；不取号、不打印、不上传',path=str(directory/'report.png'))
                 except Exception as report_error:
                     failure.add_note('保存失败件报告时出现异常：'+str(report_error))
                     raise failure from report_error
@@ -636,7 +646,7 @@ class StationRunner:
                           level='ERROR', error=save_exc, original_diagnostic=record['diagnostic'])
                 record['error_notes'].append(redact('本件状态保存失败：'+str(save_exc)))
             self.emit('step', dict(name=step, status=status))
-            self.emit('failed', dict(message=record['error'], notes=record['error_notes'], step=step, status=status,
+            self.emit('failed', dict(local_report_generated=record.get('local_report_generated',False),message=record['error'], notes=record['error_notes'], step=step, status=status,
                 step_label=dict(STEPS).get(step,'两项性能测试' if step=='measure' else step),
                 diagnostic=record['diagnostic'], log_path=str(self.log.path) if self.log else None))
         return record

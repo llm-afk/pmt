@@ -181,6 +181,63 @@ class MeasurementReadyOrderTests(unittest.TestCase):
 
 
 
+class QualityReportTests(unittest.TestCase):
+    def test_failed_quality_saves_full_local_report_without_sn_print_or_upload(self):
+        import csv
+        from scripts.factory_test.preview import create_demo
+        from scripts.factory_test.station import DemoServices,StationRunner
+        from scripts.factory_test import report
+        config=StationConfig(simulation=True)
+        service=DemoServices(config,lambda:False,lambda *_:None)
+        def measure(directory,sn):
+            summary=create_demo(directory)
+            path=directory/'kt'/'kt_curve.csv'
+            with path.open(encoding='utf-8',newline='') as source:
+                reader=csv.DictReader(source);fields=reader.fieldnames;rows=list(reader)
+            for row in rows:row['dyno_torque_smooth_nm']='0'
+            with path.open('w',encoding='utf-8',newline='') as target:
+                writer=csv.DictWriter(target,fields);writer.writeheader();writer.writerows(rows)
+            summary['sections']=report.analyze(directory,summary)
+            summary['status']=report.overall(summary['sections'],summary['stages'])
+            return summary
+        service.measure=measure
+        service.allocate=Mock();service.print_sn=Mock();service.upload=Mock()
+        with tempfile.TemporaryDirectory() as root,patch('scripts.factory_test.report._find_pdftoppm',return_value=None):
+            record=StationRunner(config,root=Path(root),services=service).begin('incoming')
+            self.assertEqual(record['summary']['status'],'FAIL')
+            self.assertTrue(all(stage['status']=='COMPLETED' for stage in record['summary']['stages'].values()))
+            self.assertEqual(record['diagnostic']['code'],'TEST_QUALITY_FAILED')
+            self.assertEqual(record['summary']['delivery_policy'],'LOCAL_ONLY')
+            from scripts.factory_test.upload_queue import production_pass
+            trial=dict(record['summary'],demo=False,status='PASS',station_ready=True)
+            self.assertFalse(production_pass(trial))
+            self.assertEqual(record['steps']['report'],'DONE')
+            self.assertTrue((Path(record['directory'])/'report.png').exists())
+            self.assertTrue((Path(record['directory'])/'summary.json').exists())
+            self.assertNotIn('module_sn',record)
+        service.allocate.assert_not_called();service.print_sn.assert_not_called();service.upload.assert_not_called()
+
+    def test_quality_log_keeps_metrics_without_copying_curve_points(self):
+        from scripts.factory_test.station import measurement_overview,MeasurementFailed
+        section=dict(name='kt',status='FAIL',metrics=[{'label':'error','value':99.}],
+                     points=[(0,0)]*10000,error_points=[(0,1)]*10000)
+        summary=dict(status='FAIL',sections=[section],stages={name:{'status':'COMPLETED'} for name in ('kt','tn')})
+        overview=measurement_overview(summary)
+        self.assertEqual(overview[0]['metrics'],section['metrics'])
+        self.assertNotIn('points',overview[0]);self.assertNotIn('error_points',overview[0])
+        self.assertNotIn('points',MeasurementFailed(summary).diagnostic_context['sections'][0])
+        self.assertEqual(len(summary['sections'][0]['points']),10000)
+
+    def test_quality_prompt_distinguishes_report_saved_from_report_error(self):
+        from scripts.factory_test.gui import FactoryWindow
+        value=dict(diagnostic={'code':'TEST_QUALITY_FAILED'},local_report_generated=True)
+        title,hint=FactoryWindow.failure_prompt(value)
+        self.assertIn('不合格',title);self.assertIn('均已采集',hint);self.assertIn('报告已保存',hint)
+        self.assertIn('不上传',hint)
+        value['local_report_generated']=False
+        self.assertIn('保存未完成',FactoryWindow.failure_prompt(value)[1])
+
+
 class CleanupAndProgressTests(unittest.TestCase):
     def test_confirmed_off_is_reused_only_by_measurement_owner(self):
         from scripts.factory_test.measurements import power_off
