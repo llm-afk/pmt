@@ -13,7 +13,7 @@ from motor_platform.components.dynamometer import detect_dynamometers
 from motor_platform.components.power_supply.discovery import resolve_power_port
 from .. import (SAMPLE_MAX_GAP_S, power_off, record_shutdown_failure, power_observer,
                 device_snapshot, log_measurement_snapshot, stop_with_ramp, capture_shutdown_error,
-                check_motor_feedback, hardware_state)
+                check_motor_feedback, hardware_state, finish_capture, record_progress, check_cancelled)
 from ..console import WindowConsole as TerminalConsole
 from scripts.factory_test.measurements.tn_curve.recording import CurveRecorder, event_row
 from scripts.factory_test.measurements.smoothing import append_smoothed_columns
@@ -112,7 +112,7 @@ def load_target(step_number):
     return round(step_number*CURRENT_STEP_A, 3)
 
 
-def graceful_stop(motor, power, pending, torque, ui, drain, *, on_error=None):
+def graceful_stop(motor, power, pending, torque, ui, drain, *, on_error=None, summary=None):
     """正常停机：1 秒降扭矩，再失能并直接关闭电源。
 
     CAN/反馈故障时上层走立即失能，不延长故障状态来执行斜坡。
@@ -128,8 +128,7 @@ def graceful_stop(motor, power, pending, torque, ui, drain, *, on_error=None):
     # 串口操作顺序完成后关闭输出，不再阶梯降低电流。
     if pending is not None:
         pending.result()
-    with record_shutdown_failure('负载电源关闭'):
-        power.disable()
+    power_off(power,summary)
     ui._notice = '停止完成：电机已失能，电源输出已关闭'
     ui.app.invalidate()
 
@@ -153,6 +152,7 @@ def run(motor, dyno, power, pool, ui, writer, summary, *, torque=None):
         check_motor_feedback(motor)
         dyno.state(max_age=DYNO_FEEDBACK_TIMEOUT_S)
         motor.start_recording()
+        check_cancelled()
         motor.enable()
         motor_started = True
         hardware_state('motor','使能请求已获回包 · T-N 特性采集中',motion=True)
@@ -201,11 +201,13 @@ def run(motor, dyno, power, pool, ui, writer, summary, *, torque=None):
                 pending = None
             if progress.loading_at is not None:
                 if pending is None and now >= next_step:
+                    check_cancelled()
                     load_steps += 1
                     target = load_target(load_steps)
                     # 只允许一个未完成事务；延迟时只发下一步，不追赶过去的周期。
                     pending = pool.submit(set_load_current, power, target)
             if now >= next_display:
+                record_progress('tn',motor,state,ds,applied_torque)
                 ui._panel = (f'ID={motor.node_id}  {"加载中" if progress.loading_at is not None else "最大扭矩等待中"}\n'
                     f'前馈扭矩 {applied_torque:.3f}/{torque}  加载电流设定 {current:.3f} A\n'
                     f'电机速度 {state.velocity:+.3f} rad/s  扭矩 {state.torque:+.4f}\n'
@@ -226,9 +228,9 @@ def run(motor, dyno, power, pool, ui, writer, summary, *, torque=None):
         summary['snapshot_phase'] = 'acquisition_failed' if active_error is not None else 'acquisition_complete'
         record_cutoff = time.perf_counter()
         try:
-            if motor_started and (active_error is None or isinstance(active_error, KeyboardInterrupt)):
+            if motor_started and (active_error is None or isinstance(active_error, (KeyboardInterrupt,InterruptedError))):
                 graceful_stop(motor, power, pending, applied_torque, ui, drain,
-                              on_error=lambda: capture_shutdown_error(summary,motor,dyno))
+                              on_error=lambda: capture_shutdown_error(summary,motor,dyno),summary=summary)
                 summary['controlled_stop_completed'] = True
             else:
                 with record_shutdown_failure('电机失能'):
@@ -243,9 +245,9 @@ def run(motor, dyno, power, pool, ui, writer, summary, *, torque=None):
                 active_error.add_note(note)
         finally:
             if motor_started:
-                motor.drain_states()
+                finish_capture(motor.drain_states)
             if not recorder.finished:
-                recorder.finish(record_cutoff)
+                finish_capture(lambda:recorder.finish(record_cutoff))
             termination = ('normal_end' if reason=='stall_confirmed' else
                            'operator_stop' if reason=='operator_stop' else 'fault')
             summary.update(reason=reason, termination=termination, rows=recorder.count, motor_rows=recorder.motor_count,
@@ -306,6 +308,7 @@ def main(argv=None, *, output_dir, quiet=False, power_port=None, dyno_port=None)
                                                  wait=TerminalConsole.cancelled.wait)
                                 check_motor_feedback(motor)
                                 dyno.state(max_age=DYNO_FEEDBACK_TIMEOUT_S)
+                                check_cancelled()
                                 power.enable()  # Zero current limit, independent motor battery.
                                 run(motor, dyno, power, pool, ui, writer, summary, torque=args.torque)
                 finally:
@@ -313,7 +316,7 @@ def main(argv=None, *, output_dir, quiet=False, power_port=None, dyno_port=None)
                     power_off(power, summary)
     except BaseException as exc:
         summary['error'] = repr(exc)
-        summary['reason'] = 'operator_stop' if isinstance(exc, KeyboardInterrupt) else 'error'
+        summary['reason'] = 'operator_stop' if isinstance(exc, (KeyboardInterrupt,InterruptedError)) else 'error'
         raise
     finally:
         log_measurement_snapshot('tn',summary)

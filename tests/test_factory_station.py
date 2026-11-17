@@ -1073,7 +1073,7 @@ class MeasurementStepDisplayTests(unittest.TestCase):
         modules=[NS(main=Mock(return_value=dict(reason=reason)),POWER_PORT='auto',DYNO_PORT='auto')
                  for reason in (kt_reason,tn_reason)]
         stages=(('kt',modules[0],'kt_curve.csv'),('tn',modules[1],'curve.csv'))
-        sections=[dict(name=name,title=name,status=status,metrics=[])
+        sections=[dict(name=name,title=name,status=status,metrics=[],points=[(30.,0. if status=='FAIL' else 30.)])
                   for name,status in zip(('kt','tn'),section_statuses)]
         execute=app.execute
         def run(*args,**kwargs):
@@ -1088,12 +1088,13 @@ class MeasurementStepDisplayTests(unittest.TestCase):
     def states(events,name):
         return [value['status'] for kind,value in events if kind=='step' and value['name']==name]
 
-    def test_collected_kt_failure_is_red_while_passed_tn_is_complete(self):
+    def test_collected_kt_failure_stops_before_tn_and_mes(self):
         with tempfile.TemporaryDirectory() as folder:
-            _,service,_,events,result=self.run_pipeline(Path(folder),('FAIL','PASS'))
+            _,service,modules,events,result=self.run_pipeline(Path(folder),('FAIL','PASS'))
         self.assertEqual(result['summary']['status'],'FAIL')
         self.assertEqual(self.states(events,'kt'),['RUNNING','COLLECTED','FAILED'])
-        self.assertEqual(self.states(events,'tn'),['RUNNING','COLLECTED','DONE'])
+        self.assertEqual(self.states(events,'tn'),['WAITING'])
+        modules[1].main.assert_not_called()
         service.allocate.assert_not_called()
 
     def test_passed_kt_survives_later_incomplete_tn_without_inheriting_whole_failure(self):

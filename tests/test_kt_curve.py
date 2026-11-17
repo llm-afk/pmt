@@ -233,7 +233,7 @@ class ConsistencyTests(unittest.TestCase):
             self.assertNotIn('motor_speed_smooth_rad_s', rows[0])
             self.assertNotIn('dyno_speed_smooth_rad_s', rows[0])
         self.assertEqual(events, ['off', ('current', 0), ('voltage', 24.), ('current', 3.),
-                                  'monitor', 'on', ('wait', .5), 'run', 'off', 'off'])
+                                  'monitor', 'on', ('wait', .5), 'run', 'off'])
 
 
 if __name__ == '__main__':

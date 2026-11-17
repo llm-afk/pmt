@@ -35,6 +35,12 @@ def hardware_state(name, detail, *, state='IN_USE', **data):
     _hardware_emit(_hardware_events.get(),current_log(),name,detail,state=state,**data)
 
 
+def check_cancelled():
+    from .console import WindowConsole
+    if WindowConsole.cancelled.is_set():
+        raise InterruptedError('操作员已停止测试')
+
+
 def check_motor_feedback(motor):
     from motor_platform.runtime import MOTOR_FEEDBACK_TIMEOUT_S
     state = motor.state(max_age=MOTOR_FEEDBACK_TIMEOUT_S)
@@ -178,7 +184,40 @@ def log_measurement_snapshot(stage, summary):
                   level='WARNING' if summary.get('reason') == 'error' else 'INFO',**details)
 
 
+def finish_capture(action):
+    """Preserve the hardware fault if draining/writing data also fails during cleanup."""
+    original = sys.exception()
+    try:
+        action()
+    except Exception as exc:
+        if original is None:
+            raise
+        original.add_note('采集数据收尾失败：'+str(exc))
+
+
+def record_progress(stage, motor, state, dyno, target):
+    """One compact observation per second, outside the CAN worker; never a stop rule."""
+    try:
+        from ..diagnostics import current_log
+        log = current_log()
+        if log is None:
+            return
+        snapshot = motor.diagnostic_snapshot()
+        sent = snapshot.get('last_submitted') or {}
+        log.sample('test.target_feedback.'+stage,interval=1.,target=target,
+            submitted_can_id=sent.get('can_id'),submitted_data=sent.get('data'),
+            motor_torque=state.torque,motor_speed=state.velocity,
+            dyno_torque=dyno.torque,dyno_speed=dyno.speed,
+            motor_feedback_age_ms=(time.perf_counter()-state.received_at)*1000)
+    except Exception:
+        # Optional diagnostics must not interrupt the hardware control sequence.
+        pass
+
+
 def power_off(power, summary=None):
+    # Only a receipt owned by this measurement suppresses its outer duplicate cleanup.
+    if summary is not None and summary.get('load_output_off_confirmed') is True:
+        return
     with record_shutdown_failure('负载电源关闭'):
         try:
             power.disable()

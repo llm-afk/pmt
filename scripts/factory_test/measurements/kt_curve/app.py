@@ -15,7 +15,7 @@ from motor_platform.components.dynamometer import detect_dynamometers
 from motor_platform.components.power_supply.discovery import resolve_power_port
 from .. import (SAMPLE_MAX_GAP_S, power_off, record_shutdown_failure, power_observer,
                 device_snapshot, log_measurement_snapshot, stop_with_ramp, capture_shutdown_error,
-                check_motor_feedback, hardware_state)
+                check_motor_feedback, hardware_state, finish_capture, record_progress, check_cancelled)
 from ..console import WindowConsole as TerminalConsole
 from scripts.factory_test.measurements.smoothing import append_smoothed_columns
 from scripts.factory_test.measurements.csv_streams import pack_streams
@@ -143,6 +143,7 @@ def run(motor, dyno, ui, args, result):
         dyno.state(max_age=DYNO_FEEDBACK_TIMEOUT_S)
         motor.start_recording()
         dyno.drain()
+        check_cancelled()
         motor.enable()
         enabled = True
         hardware_state('motor','使能请求已获回包 · KT 扭矩采集中',motion=True)
@@ -176,6 +177,7 @@ def run(motor, dyno, ui, args, result):
                           stage='kt',reason='completed',condition=result['end_condition'])
                 break
             if now >= next_display:
+                record_progress('kt',motor,state,ds,applied)
                 ui._panel = (f'ID={args.id}  扭矩爬升 {elapsed:.2f}/{RAMP_DURATION_S:g} s\n'
                     f'下发目标 {applied:+.4f}/{args.torque:+g}  阻尼电源 {args.voltage:g} V / {args.current:g} A\n'
                     f'电机 {state.torque:+.4f}  {state.velocity:+.3f} rad/s\n'
@@ -190,7 +192,7 @@ def run(motor, dyno, ui, args, result):
         error_monitor = None
         result['runtime_snapshot'] = device_snapshot(motor,dyno,target=applied,loop_at=locals().get('now',time.perf_counter()))
         result['snapshot_phase'] = 'acquisition_failed'
-        result['reason'] = 'operator_stop' if isinstance(exc, KeyboardInterrupt) else 'error'
+        result['reason'] = 'operator_stop' if isinstance(exc, (KeyboardInterrupt,InterruptedError)) else 'error'
         if recorder is not None:
             recorder.cutoff = min(recorder.cutoff, time.perf_counter())
         raise
@@ -204,7 +206,7 @@ def run(motor, dyno, ui, args, result):
         try:
             ui._notice = '正在降扭矩、失能；随后关闭阻尼器电源'
             ui.app.invalidate()
-            stop_motor(motor, applied, enabled and (original is None or isinstance(original, (KeyboardInterrupt,TorqueErrorLimit))), collect,
+            stop_motor(motor, applied, enabled and (original is None or isinstance(original, (KeyboardInterrupt,InterruptedError,TorqueErrorLimit))), collect,
                        on_error=lambda: capture_shutdown_error(result,motor,dyno))
         except Exception as exc:
             capture_shutdown_error(result,motor,dyno)
@@ -215,7 +217,7 @@ def run(motor, dyno, ui, args, result):
             for note in getattr(exc, '__notes__', ()):
                 original.add_note(note)
         finally:
-            collect()
+            finish_capture(collect)
 
 
 def main(argv=None, *, output_dir, quiet=False, power_port=None, dyno_port=None):
@@ -255,19 +257,20 @@ def main(argv=None, *, output_dir, quiet=False, power_port=None, dyno_port=None)
                                         try:
                                             check_motor(motor)
                                             dyno.state(max_age=DYNO_FEEDBACK_TIMEOUT_S)
+                                            check_cancelled()
                                             power.enable()  # 建立阻尼期间保持零目标监视。
                                             time.sleep(LOAD_SETTLE_S)
                                             run(motor, dyno, ui, args, result)
                                         finally:
-                                            power_off(power)  # 降扭矩、失能之后立即关闭阻尼输出。
+                                            power_off(power,result)  # 降扭矩、失能之后立即关闭阻尼输出。
                         finally:
-                            power_off(power)
+                            power_off(power,result)
             except BaseException as exc:
-                result['reason'] = 'operator_stop' if isinstance(exc, KeyboardInterrupt) else 'error'
+                result['reason'] = 'operator_stop' if isinstance(exc, (KeyboardInterrupt,InterruptedError)) else 'error'
                 raise
             finally:
                 recorder = result.get('recorder', Recorder(0, RAMP_DURATION_S))
-                recorder.write(csv.writer(target), args, result['reason'])
+                finish_capture(lambda:recorder.write(csv.writer(target),args,result['reason']))
     finally:
         log_measurement_snapshot('kt',result)
         # 所有设备已经停止；平滑和磁盘输出不占用控制循环。

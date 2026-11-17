@@ -113,7 +113,7 @@ class FrozenPortTests(unittest.TestCase):
                 calls.append((kwargs['power_port'],kwargs['dyno_port']))
                 return dict(reason=_reason)
             module.main=main;modules.append((name,module,name+'.csv'))
-        def execute(args,directory,*,stages,motor_sn):
+        def execute(args,directory,*,stages,motor_sn,after_stage=None):
             for name,module,_ in stages:module.main([],output_dir=directory/name,quiet=True)
             return dict(stages={},sections=[])
         service=Services(StationConfig(),lambda:False,lambda *_:None,
@@ -179,6 +179,65 @@ class MeasurementReadyOrderTests(unittest.TestCase):
                 self.assertEqual(events[0][0],'off');self.assertEqual(events[-1][0],'off')
 
 
+
+
+class CleanupAndProgressTests(unittest.TestCase):
+    def test_confirmed_off_is_reused_only_by_measurement_owner(self):
+        from scripts.factory_test.measurements import power_off
+        power=Mock();summary={}
+        power_off(power,summary);power_off(power,summary)
+        power.disable.assert_called_once_with()
+        self.assertTrue(summary['load_output_off_confirmed'])
+        power_off(power,{})
+        self.assertEqual(power.disable.call_count,2)
+
+    def test_data_cleanup_retains_original_hardware_failure(self):
+        from scripts.factory_test.measurements import finish_capture
+        original=RuntimeError('CAN fault first')
+        with self.assertRaises(RuntimeError) as caught:
+            try:raise original
+            finally:finish_capture(Mock(side_effect=OSError('disk full second')))
+        self.assertIs(caught.exception,original)
+        self.assertTrue(any('disk full second' in note for note in original.__notes__))
+        self.assertFalse(any('工装停机未确认' in note for note in original.__notes__))
+        with self.assertRaises(OSError):finish_capture(Mock(side_effect=OSError('data error only')))
+
+    def test_cancel_before_control_does_not_enable_motor(self):
+        from scripts.factory_test.measurements.console import WindowConsole
+        from scripts.factory_test.measurements.kt_curve import app as kt
+        from scripts.factory_test.measurements.tn_curve import app as tn
+        WindowConsole.cancelled.set()
+        self.addCleanup(WindowConsole.cancelled.clear)
+        for module in (kt,tn):
+            motor=Mock();motor.state.return_value=state();motor.stats.return_value={'fault':None}
+            with self.assertRaises(InterruptedError):
+                if module is kt:module.run(motor,Mock(),Mock(),NS(torque=30),{})
+                else:module.run(motor,Mock(),Mock(),Mock(),Mock(),Mock(),{})
+            motor.enable.assert_not_called()
+
+    def test_closed_ui_output_cannot_mask_primary_failure(self):
+        from scripts.factory_test.measurements.console import WindowConsole
+        console=WindowConsole()
+        primary=RuntimeError('hardware failure')
+        with patch('builtins.print',side_effect=OSError('UI output closed')):
+            with self.assertRaises(RuntimeError) as caught:
+                with console:raise primary
+        self.assertIs(caught.exception,primary)
+        self.assertEqual(console.notification_error,'UI output closed')
+        self.assertGreater(console.last_update,0)
+
+    def test_progress_records_wire_target_separately_without_controlling_motor(self):
+        from scripts.factory_test.measurements import record_progress
+        motor=Mock();motor.diagnostic_snapshot.return_value={'last_submitted':{'can_id':0x401,'data':'wire-data'}}
+        log=Mock();sample=NS(torque=.03,velocity=0.,received_at=10.)
+        with patch('scripts.factory_test.diagnostics.current_log',return_value=log):
+            record_progress('kt',motor,sample,NS(torque=.04,speed=0.),30.)
+            self.assertEqual(log.sample.call_args.kwargs['target'],30.)
+            self.assertEqual(log.sample.call_args.kwargs['submitted_can_id'],0x401)
+            self.assertEqual(log.sample.call_args.kwargs['motor_torque'],.03)
+            log.sample.side_effect=OSError('log unavailable')
+            record_progress('kt',motor,sample,NS(torque=.04,speed=0.),30.)
+        motor.set_mit.assert_not_called();motor.disable.assert_not_called()
 
 
 if __name__=='__main__':

@@ -21,7 +21,7 @@ def read_motor_sn(args):
 
 
 def execute(args, directory, *, stages=STAGES, identify=read_motor_sn, pause=time.sleep,
-            motor_sn=None):
+            motor_sn=None, after_stage=None):
     """复用入口函数：子脚本负责设备与停机，总测负责顺序、身份核对及归档。"""
     argv = ['--id', str(args.id), '--serial', args.serial, '--torque', str(args.torque)]
     summary = dict(schema_version=1, demo=False, started_at=datetime.now().astimezone().isoformat(),
@@ -50,6 +50,8 @@ def execute(args, directory, *, stages=STAGES, identify=read_motor_sn, pause=tim
                          finished_at=datetime.now().astimezone().isoformat())
             if not completed:
                 raise RuntimeError(f'{name}: {reason}')
+            if after_stage is not None:
+                after_stage(name,summary)
             if i+1 < len(stages):
                 pause(BETWEEN_TESTS_S)
     except (Exception, KeyboardInterrupt) as exc:

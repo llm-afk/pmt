@@ -223,7 +223,7 @@ class MotorChannel:
             span = data["last_tx_at"] - data["first_tx_at"]
             data.update(node_id=self.node_id, name=self.name, target_hz=self._rate_hz,
                         periodic_active=self._active or self._monitoring,
-                        control_active=self._active, monitoring=self._monitoring,
+                        control_active=self._active, monitoring=self._monitoring and not self._active,
                         enabled=self._motor.enabled,
                         actual_tx_hz=(data["tx_count"]-1)/span if span > 0 else 0.0)
             return data

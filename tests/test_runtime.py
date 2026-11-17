@@ -351,6 +351,18 @@ class RuntimeTests(unittest.TestCase):
         self.assertIsNone(bus._io_owner)
         self.assertFalse(any(f.can_id>=0x400 for f in tr.sent))
 
+    def test_status_distinguishes_zero_monitoring_from_active_control(self):
+        transport,bus,runtime=self.make()
+        with runtime.start():
+            channel=runtime.motor('J1');channel.monitor()
+            self.assertTrue(channel.stats()['monitoring'])
+            channel.enable()
+            self.assertTrue(channel.stats()['control_active'])
+            self.assertFalse(channel.stats()['monitoring'])
+            channel.disable()
+            self.assertTrue(channel.stats()['monitoring'])
+            self.assertFalse(channel.stats()['control_active'])
+
     def test_latest_target_continues_without_application_lease(self):
         tr,bus,rt=self.make()
         rt.start()

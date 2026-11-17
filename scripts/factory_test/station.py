@@ -43,7 +43,8 @@ def measurement_evidence(summary):
         if captured in (None, 'SKIPPED'):
             state = 'WAITING'
         elif captured != 'COMPLETED':
-            state = 'INCOMPLETE'
+            state = ('FAILED' if verdict=='FAIL' and summary.get('diagnostic',{}).get('code')=='KT_TORQUE_ERROR_LIMIT'
+                     else 'INCOMPLETE')
         else:
             state = {'PASS':'DONE', 'FAIL':'FAILED', 'PENDING':'PENDING'}.get(verdict, 'INCOMPLETE')
         states[name] = state
@@ -110,8 +111,8 @@ class Services:
                   ports=self.hardware_ports)
         messages = dict(can='周期通信使用中' if policy['can']=='PERIODIC' else
                         '维护通道使用中' if policy['can']=='MAINTENANCE' else '当前工序不使用 CAN',
-                        motor={'MAINTENANCE':'维护操作中；不下发运动目标','CALIBRATION':'准备校准；先确认加载关闭与温度',
-                               'PREPARE':'准备性能测试；先检查新反馈与温度','KT':'准备 KT 测试；就绪后才使能',
+                        motor={'MAINTENANCE':'维护操作中；不下发运动目标','CALIBRATION':'准备校准；先关闭加载并发送全零目标',
+                               'PREPARE':'准备性能测试；先确认零目标与新反馈','KT':'准备 KT 测试；就绪后才使能',
                                'TN':'准备 T-N 测试；就绪后才使能','STOPPED':'性能测试已结束，电机失能结果见回执'}[policy['motor']],
                         dyno='性能测试使用被动扭矩 / 转速反馈' if policy['dyno']=='CAPTURE' else '当前工序不采集扭矩 / 转速',
                         printer='正在检查打印服务并提交标签' if policy['printer']=='PRINT' else '当前工序不提交打印；打印前重新检查服务')
@@ -226,9 +227,18 @@ class Services:
                 self.emit('step', dict(name=_name, status='COLLECTED' if complete else 'INCOMPLETE'))
                 return result
             stages.append((name, SimpleNamespace(main=run), csv))
-        summary = app.execute(args, directory, stages=stages, motor_sn=base_sn)
+        def after_stage(name, summary):
+            if name != 'kt':
+                return
+            section = report.analyze(directory,summary)[0]
+            log_event('test.stage.analysis',stage='kt',status=section['status'],metrics=section['metrics'])
+            if section['status']=='FAIL':
+                target,actual=max(section['points'],key=lambda point:abs(point[1]-point[0]))
+                raise app.kt.TorqueErrorLimit(target,actual,self.config.kt_error_limit_pct,self.config.torque)
+        summary = app.execute(args,directory,stages=stages,motor_sn=base_sn,after_stage=after_stage)
         summary['sections'] = report.analyze(directory, summary)
-        summary['status'] = report.overall(summary['sections'], summary['stages'])
+        summary['status'] = ('FAIL' if summary.get('diagnostic',{}).get('code')=='KT_TORQUE_ERROR_LIMIT'
+                             else report.overall(summary['sections'],summary['stages']))
         return summary
 
     def check_stop(self):

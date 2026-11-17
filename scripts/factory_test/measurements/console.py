@@ -13,6 +13,7 @@ class WindowConsole:
         self._notice = ''
         self.app = self
         self.last_update = 0
+        self.notification_error = None
 
     def __enter__(self):
         return self
@@ -23,8 +24,12 @@ class WindowConsole:
     def invalidate(self, force=False):
         now = time.monotonic()
         if force or now - self.last_update >= .2:
-            print('@panel ' + json.dumps(self._panel + '\n' + self._notice, ensure_ascii=False), flush=True)
-            self.last_update = now
+            try:
+                print('@panel ' + json.dumps(self._panel + '\n' + self._notice, ensure_ascii=False), flush=True)
+            except (OSError,ValueError,RuntimeError) as exc:
+                self.notification_error = str(exc)
+            finally:
+                self.last_update = now
 
     def poll(self):
         return 'quit' if self.cancelled.is_set() else None
