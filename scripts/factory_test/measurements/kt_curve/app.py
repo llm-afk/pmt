@@ -12,7 +12,8 @@ from motor_platform.runtime import MOTOR_FEEDBACK_TIMEOUT_S, start_monitoring
 from motor_platform.components.dynamometer import detect_dynamometers
 from motor_platform.components.power_supply.discovery import resolve_power_port
 from .. import (FeedbackClock, SAMPLE_MAX_GAP_S, power_off, record_shutdown_failure, power_observer,
-                device_snapshot, log_measurement_snapshot, stop_with_ramp, capture_shutdown_error)
+                device_snapshot, log_measurement_snapshot, stop_with_ramp, capture_shutdown_error,
+                check_motor_feedback, wait_temperature_ready, hardware_state, MAX_MOTOR_TEMP_C, MAX_DRIVER_TEMP_C)
 from ..console import WindowConsole as TerminalConsole
 from scripts.factory_test.measurements.smoothing import append_smoothed_columns
 from scripts.factory_test.measurements.csv_streams import pack_streams
@@ -32,8 +33,6 @@ MOTOR_HZ = 1000                 # 周期 CAN 发送目标频率；目标值按�
 TARGET_UPDATE_S = 0.001         # 应用更新目标的间隔；迟到不补发积压命令
 STOP_RAMP_S = 1.0               # 正常结束、用户停止：保持阻尼，线性降扭矩到零
 DYNO_FEEDBACK_TIMEOUT_S = 0.1
-MAX_MOTOR_TEMP_C = 80.0
-MAX_DRIVER_TEMP_C = 80.0
 DYNO_TORQUE_SCALE = 100.0
 DYNO_SPEED_SCALE = 100.0
 SMOOTH_WINDOW_S = 0.30          # 停机后平滑两路扭矩；原始样本不修改
@@ -75,12 +74,7 @@ def ramp_torque(elapsed, maximum):
 
 
 def check_motor(motor):
-    state = motor.state(max_age=MOTOR_FEEDBACK_TIMEOUT_S)
-    stats = motor.stats()
-    if state.error_code or stats['fault']:
-        raise RuntimeError(f'motor fault: {state.error_code}, {stats["fault"]}')
-    if state.motor_temperature >= MAX_MOTOR_TEMP_C or state.board_temperature >= MAX_DRIVER_TEMP_C:
-        raise RuntimeError('motor/driver temperature limit reached')
+    state,stats = check_motor_feedback(motor,MAX_MOTOR_TEMP_C,MAX_DRIVER_TEMP_C)
     if stats.get('recording_dropped', 0):
         raise RuntimeError('motor recording queue overflow')
     return state, stats
@@ -103,11 +97,14 @@ def run(motor, dyno, ui, args, result):
             recorder.add('motor', motors)
             recorder.add('dyno', dynos)
     try:
+        check_motor(motor)
+        dyno.state(max_age=DYNO_FEEDBACK_TIMEOUT_S)
         motor.start_recording()
         dyno.drain()
         dropped_before = dyno.stats()['dropped_samples']
         motor.enable()
         enabled = True
+        hardware_state('motor','使能请求已获回包 · KT 扭矩采集中',motion=True)
         check_motor(motor)
         dyno.state(max_age=DYNO_FEEDBACK_TIMEOUT_S)
         collect()
@@ -183,9 +180,11 @@ def run(motor, dyno, ui, args, result):
             collect()
 
 
-def main(argv=None, *, output_dir, quiet=False):
+def main(argv=None, *, output_dir, quiet=False, power_port=None, dyno_port=None):
     args = parse_args(argv)  # 所有参数校验先于连接和输出操作。
-    matches = detect_dynamometers() if DYNO_PORT == 'auto' else [DYNO_PORT]
+    dyno_port = DYNO_PORT if dyno_port is None else dyno_port
+    power_port = POWER_PORT if power_port is None else power_port
+    matches = detect_dynamometers() if dyno_port == 'auto' else [dyno_port]
     if len(matches) != 1:
         raise RuntimeError(f'Expected one dynamometer, found {matches}; set DYNO_PORT')
     result = {'reason': 'error'}
@@ -198,8 +197,11 @@ def main(argv=None, *, output_dir, quiet=False):
                 with Dynamometer(port=matches[0], torque_scale=DYNO_TORQUE_SCALE,
                                  speed_scale=DYNO_SPEED_SCALE) as dyno:
                     dyno.receive_state(timeout=1)
+                    hardware_state('dyno',matches[0]+' · 已收到有效扭矩 / 转速反馈')
                     # 先占用被动测功机串口，再探测 SCPI 电源。
-                    with PowerSupply(port=resolve_power_port(POWER_PORT), observer=power_observer()) as power:
+                    port = resolve_power_port(power_port)
+                    result.update(power_port=port,dynamometer_port=matches[0])
+                    with PowerSupply(port=port, observer=power_observer()) as power:
                         try:
                             power.disable()
                             power.set_current(0)
@@ -210,9 +212,15 @@ def main(argv=None, *, output_dir, quiet=False):
                                 with Bench(transport=Canable(args.serial), motor_ids=[args.id], rate_hz=MOTOR_HZ) as bench:
                                     with bench.start() as control:
                                         motor = control.motor(args.id)
+                                        motor.disable()  # 确认失能后才进入监视和温度等待。
                                         start_monitoring(motor,cancelled=TerminalConsole.cancelled.is_set,
                                                          wait=TerminalConsole.cancelled.wait)
                                         try:
+                                            wait_temperature_ready(motor,phase='kt.preflight',cancelled=TerminalConsole.cancelled.is_set,
+                                                wait=TerminalConsole.cancelled.wait,idle=dyno.drain,
+                                                motor_limit=MAX_MOTOR_TEMP_C,driver_limit=MAX_DRIVER_TEMP_C)
+                                            check_motor(motor)
+                                            dyno.state(max_age=DYNO_FEEDBACK_TIMEOUT_S)
                                             power.enable()  # 建立阻尼期间保持零目标监视。
                                             time.sleep(LOAD_SETTLE_S)
                                             run(motor, dyno, ui, args, result)

@@ -360,6 +360,19 @@ class Maintenance:
         self.wait_sn(sn)
         log_event('motor.sn.verified',node_id=node,sn=sn)
 
+    def wait_temperature(self, node=None):
+        from motor_platform.runtime import start_monitoring
+        from .measurements import wait_temperature_ready
+        node = self.config.require_target_id() if node is None else node
+        with self.connect(node) as bench:
+            motor = bench.motor(node)
+            motor.disable()
+            log_event('motor.disable.ack',node_id=node,reason='temperature_preflight')
+            with bench.start() as runtime:
+                channel = runtime.motor(node)
+                start_monitoring(channel,cancelled=self.cancelled)
+                return wait_temperature_ready(channel,phase='before_calibration',cancelled=self.cancelled)
+
     def calibrate(self, node=None):
         node = self.config.require_target_id() if node is None else node
         with self.connect(node) as bench:
@@ -382,6 +395,8 @@ class Maintenance:
                 raise RuntimeError('GD 固件未暴露本次校准进度；已有校准的电机需补完成协议，不能仅凭 ACK 放行')
             try:
                 self.write(bench, node, 0x2002, 2, 0xF1)
+                from .measurements import hardware_state
+                hardware_state('motor','校准指令已确认，等待固件完成',motion=True)
                 deadline = time.monotonic()+self.config.calibration_timeout
                 stable = 0
                 while time.monotonic() < deadline:
@@ -397,6 +412,7 @@ class Maintenance:
                         log_event('motor.disable.request',node_id=node,reason='after_calibration')
                         motor.disable()
                         log_event('calibration.confirmed',node_id=node,stable_samples=stable,disable_ack=True)
+                        hardware_state('motor','校准已完成，失能回执已确认',state='STANDBY',stopped=True)
                         if adm:
                             settings = {}
                             for index, size, name in ((0x2000,2,'error_code'),

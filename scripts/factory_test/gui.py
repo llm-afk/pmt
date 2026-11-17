@@ -606,13 +606,15 @@ class FactoryWindow:
             return
         self.device_display[name]=(state,detail)
         titles={'READY':'已连接','OFFLINE':'未连接','ERROR':'连接异常','SIMULATED':'模拟就绪',
-                'CHECKING':'检测中','IN_USE':'测试使用中','UNKNOWN':'待确认','WAITING':'等待检测'}
+                'CHECKING':'检测中','IN_USE':'测试使用中','UNKNOWN':'待确认','WAITING':'等待检测','STANDBY':'工序待用'}
         colors={'READY':'#138365','SIMULATED':'#138365','ERROR':'#C13F50','OFFLINE':'#8491A4',
-                'CHECKING':'#2563EB','IN_USE':'#2563EB','UNKNOWN':'#B27813'}
+                'CHECKING':'#2563EB','IN_USE':'#2563EB','UNKNOWN':'#B27813','STANDBY':'#8491A4'}
         route=str(detail)
-        if name in ('dyno','power') and state=='READY':
+        if name in ('dyno','power') and state in ('READY','IN_USE'):
             route=route.split(' · ',1)[0]
-            if name=='power': route+=' · '+('输出开启' if '输出开启' in str(detail) else '输出关闭')
+            if name=='power':
+                route+=' · '+('输出开启' if any(item in str(detail) for item in ('输出开启','输出已开启')) else
+                              '输出关闭' if any(item in str(detail) for item in ('输出关闭','输出已关闭')) else '输出待回读')
         title=READINESS_LABELS.get(name,name)
         self.status_log('device.'+name,(state,route),f'[{title}] '+titles.get(state,state)+'；'+str(detail),
             level='ERROR' if state=='ERROR' else 'WARNING' if state in ('OFFLINE','UNKNOWN') else 'INFO')
@@ -1578,6 +1580,22 @@ class FactoryWindow:
                 else:
                     self.stopping=False
                     self.last_health=0
+            elif kind=='hardware_state':
+                directory = getattr(self,'latest_result',None)
+                if (not self.busy or self.closing or self.page!='production' or self.terminal_prompt
+                        or directory is None or value.get('session')!=Path(directory).name):
+                    continue
+                if value.get('name') in self.device_widgets:
+                    self.device_state(value['name'],value.get('state','IN_USE'),value['detail'])
+                if 'waiting' in value and not self.stopping:
+                    if value['waiting']:
+                        self.set_prompt('请等待电机冷却',value['detail']+'；磁粉加载关闭、未使能，降温后自动继续。','#B27813')
+                    else:
+                        self.set_prompt('温度已满足要求，继续测试',value['detail'],'#2563EB')
+                elif value.get('motion') and not self.stopping:
+                    self.set_prompt('电机可能转动，请勿触碰',value['detail'],'#2563EB')
+                elif value.get('stopped') and not self.stopping:
+                    self.set_prompt('本项正在收尾，请等待',value['detail'],'#2563EB')
             elif kind=='step':
                 name,state=value['name'],value['status']
                 if self.steps.exists(name):
@@ -1662,6 +1680,10 @@ class FactoryWindow:
         if step=='print' and (value.get('status')=='UNKNOWN' or code in
                               ('PRINT_OUTCOME_UNKNOWN','PRINT_ACK_INVALID','PRINT_SERVICE_OUTCOME_UNKNOWN','PRINT_ACK_CONFLICT')):
             return '打印结果未确认，请隔离本件','勿补打或贴标。请工程人员核对实体标签和打印记录。'
+        if code == 'CANCELLED':
+            return '本次测试已停止','停止结果和加载关闭回执已保存；确认设备停止后再取件。'
+        if code == 'MOTOR_TEMPERATURE_LIMIT':
+            return '请等待电机冷却','本次测试达到温度门限，已停止并关闭磁粉加载。冷却后再测试，具体温度见日志。'
         if code == 'MOTOR_FEEDBACK_STALE':
             return '请取下并隔离本件电机','电机反馈中断，本件测试已停止。请勿贴合格标签，联系工程人员查看日志。'
         stage=value.get('step_label') or dict(STEPS).get(step,'本件测试')

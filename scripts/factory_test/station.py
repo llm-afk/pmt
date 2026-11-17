@@ -57,6 +57,22 @@ def emit_measurement_steps(emit, summary):
         emit('step', dict(name=name, status=state))
 
 
+HARDWARE_PHASES = {
+    'firmware': dict(can='MAINTENANCE',motor='MAINTENANCE',load='OFF',dyno='WAIT',printer='WAIT'),
+    'assign_id': dict(can='MAINTENANCE',motor='MAINTENANCE',load='OFF',dyno='WAIT',printer='WAIT'),
+    'base_sn': dict(can='MAINTENANCE',motor='MAINTENANCE',load='OFF',dyno='WAIT',printer='WAIT'),
+    'calibrate': dict(can='MAINTENANCE',motor='CALIBRATION',load='OFF',dyno='WAIT',printer='WAIT'),
+    'measure': dict(can='PERIODIC',motor='PREPARE',load='CONTROLLED',dyno='CAPTURE',printer='WAIT'),
+    'kt': dict(can='PERIODIC',motor='KT',load='CONTROLLED',dyno='CAPTURE',printer='WAIT'),
+    'tn': dict(can='PERIODIC',motor='TN',load='CONTROLLED',dyno='CAPTURE',printer='WAIT'),
+    'allocate': dict(can='WAIT',motor='STOPPED',load='OFF',dyno='WAIT',printer='WAIT'),
+    'write_sn': dict(can='MAINTENANCE',motor='MAINTENANCE',load='OFF',dyno='WAIT',printer='WAIT'),
+    'print': dict(can='WAIT',motor='STOPPED',load='OFF',dyno='WAIT',printer='PRINT'),
+    'report': dict(can='WAIT',motor='STOPPED',load='OFF',dyno='WAIT',printer='WAIT'),
+    'upload': dict(can='WAIT',motor='STOPPED',load='OFF',dyno='WAIT',printer='WAIT'),
+}
+
+
 class MeasurementFailed(RuntimeError):
     def __init__(self, summary):
         super().__init__(summary.get('error') or '测试未通过或未完成；不会申请正式 SN')
@@ -86,6 +102,29 @@ class Services:
         self.delivery = delivery
         self.firmware_sha256 = firmware_sha256
         self.hardware_ports = dict(hardware_ports or {})
+
+    def enter_phase(self, name):
+        from .measurements import hardware_state
+        policy = HARDWARE_PHASES[name]
+        log_event('hardware.phase','本工序硬件调用计划；实际状态以回读为准',phase=name,policy=policy,
+                  ports=self.hardware_ports)
+        messages = dict(can='周期通信使用中' if policy['can']=='PERIODIC' else
+                        '维护通道使用中' if policy['can']=='MAINTENANCE' else '当前工序不使用 CAN',
+                        motor={'MAINTENANCE':'维护操作中；不下发运动目标','CALIBRATION':'准备校准；先确认加载关闭与温度',
+                               'PREPARE':'准备性能测试；先检查新反馈与温度','KT':'准备 KT 测试；就绪后才使能',
+                               'TN':'准备 T-N 测试；就绪后才使能','STOPPED':'性能测试已结束，电机失能结果见回执'}[policy['motor']],
+                        dyno='性能测试使用被动扭矩 / 转速反馈' if policy['dyno']=='CAPTURE' else '当前工序不采集扭矩 / 转速',
+                        printer='正在检查打印服务并提交标签' if policy['printer']=='PRINT' else '当前工序不提交打印；打印前重新检查服务')
+        for device, detail in messages.items():
+            usage = policy['can'] if device=='can' else policy[device]
+            hardware_state(device,detail,state='STANDBY' if usage in ('WAIT','STOPPED') else 'IN_USE')
+
+    def prepare_phase(self, name):
+        policy = HARDWARE_PHASES[name]
+        if policy['load']=='OFF':
+            self.disable_load('before_production' if name=='firmware' else 'before_'+name)
+        if policy['motor']=='CALIBRATION':
+            self.motor.wait_temperature()
 
     def disable_load(self, reason):
         """Production owns the fixture now: turn off magnetic loading with readback."""
@@ -136,7 +175,7 @@ class Services:
         self.disable_load('production_aborted')
 
     def firmware(self, node, expected_sn):
-        self.disable_load('before_production')
+        self.prepare_phase('firmware')
         from .firmware import check_firmware
         return check_firmware(self.config,self.motor,node,expected_sn,
                               lambda message:self.emit('firmware_progress',message), expected_sha256=self.firmware_sha256)
@@ -154,7 +193,7 @@ class Services:
         return self.motor.probe()
 
     def calibrate(self):
-        self.disable_load('before_calibration')
+        self.prepare_phase('calibrate')
         self.motor.calibrate()
 
     def measure(self, directory, base_sn):
@@ -172,18 +211,15 @@ class Services:
                           parameters={key:value for key,value in vars(_module).items() if key.isupper() and
                                       key not in ('COLUMNS','OUTPUT_COLUMNS')})
                 self.emit('step', dict(name=_name, status='RUNNING'))
-                previous_ports = (_module.POWER_PORT, _module.DYNO_PORT)
+                self.enter_phase(_name)
                 try:
-                    _module.POWER_PORT, _module.DYNO_PORT = power_port, dyno_port
-                    result = _module.main(*argv, **kwargs)
+                    result = _module.main(*argv, power_port=power_port,dyno_port=dyno_port,**kwargs)
                 except BaseException as exc:
                     log_event('test.stage.failed', level='ERROR', error=exc, stage=_name,
                               output_directory=str(directory/_name),
                               elapsed_s=round(time.perf_counter()-started,4))
                     self.emit('step',dict(name=_name,status='FAILED'))
                     raise
-                finally:
-                    _module.POWER_PORT, _module.DYNO_PORT = previous_ports
                 self.check_stop()
                 complete = result.get('reason') == ('completed' if _name == 'kt' else 'stall_confirmed')
                 log_event('test.stage.end', stage=_name, result=result, complete=complete,
@@ -426,6 +462,9 @@ class StationRunner:
                                   module_sn=self.record.get('module_sn'), base_sn=self.record['base_sn'],
                                   print_job_id=self.record.get('print_job_id')) if target else None):
             try:
+                enter_phase = getattr(self.services,'enter_phase',None)
+                if callable(enter_phase):
+                    enter_phase(name)
                 result = operation()
             except BaseException as exc:
                 log_event('flow.step.failed', level='ERROR', error=exc, step=name,
@@ -443,7 +482,8 @@ class StationRunner:
         record = self.record
         target = self.log.bind(session=record['session'],request_id=record['request_id'],
                                report_directory=record['directory']) if self.log else None
-        with log_scope(target):
+        from .measurements import hardware_scope
+        with log_scope(target),hardware_scope(self.emit):
             started = time.perf_counter()
             log_event('flow.start', '开始执行产测流程', config=record['config'],
                       detected_id=record['detected_id'], detected_sn=record['detected_sn'], base_sn=record['base_sn'])

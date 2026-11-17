@@ -242,7 +242,8 @@ class ConsistencyTests(unittest.TestCase):
         bench.__enter__.return_value = bench
         motor = MagicMock()
         motor.monitor.side_effect = lambda: events.append('monitor')
-        motor.state.side_effect = lambda **kwargs: NS(received_at=time.perf_counter())
+        motor.state.side_effect = lambda **kwargs: state(time.perf_counter())
+        motor.stats.return_value = dict(fault=None,recording_dropped=0)
         bench.start.return_value = nullcontext(NS(motor=lambda node: motor))
         def run(motor, dyno, ui, args, result):
             events.append('run')

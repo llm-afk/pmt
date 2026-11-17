@@ -73,7 +73,7 @@ def build_settings(self):
         parent.columnconfigure(1, weight=1)
         return widget
     self.devices = field(basic, 0, 'adapter_sn', 'CANable SN', [])
-    self.power_port_combo=field(basic,1,'power_port','电源串口',port_options(self.config.power_port))
+    self.power_port_combo=field(basic,1,'power_port','加载电源串口',port_options(self.config.power_port))
     self.dyno_port_combo=field(basic,2,'dyno_port','测功机串口',port_options(self.config.dyno_port))
     self.power_port_combo.configure(postcommand=lambda:self.power_port_combo.configure(values=port_options(self.vars['power_port'].get())))
     self.dyno_port_combo.configure(postcommand=lambda:self.dyno_port_combo.configure(values=port_options(self.vars['dyno_port'].get())))
@@ -278,7 +278,7 @@ def build_view(self):
     device_row=ttk.Frame(production)
     device_row.grid(row=0,column=0,sticky='ew',pady=(0,6))
     self.device_widgets={}
-    for i,(name,title) in enumerate((('can','CAN 适配器'),('motor','待测电机'),('dyno','测功机'),('power','电源'),('printer','标签打印机'))):
+    for i,(name,title) in enumerate((('can','CAN 适配器'),('motor','待测电机'),('dyno','测功机'),('power','磁粉加载电源'),('printer','标签打印机'))):
         card=ttk.Frame(device_row,style='Card.TFrame',padding=(14,6))
         card.grid(row=0,column=i,sticky='nsew',padx=(0,8 if i<4 else 0))
         device_row.columnconfigure(i,weight=1,uniform='devices')

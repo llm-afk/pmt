@@ -184,6 +184,8 @@ class CurveTests(unittest.TestCase):
 
     def test_motor_error_preserved_when_disable_fails(self):
         motor = Mock()
+        motor.state.return_value=SimpleNamespace(error_code=0,motor_temperature=25.,board_temperature=25.)
+        motor.stats.return_value=dict(fault=None,recording_dropped=0)
         motor.enable.side_effect = RuntimeError('enable failed')
         motor.disable.side_effect = RuntimeError('disable failed')
         with self.assertRaisesRegex(RuntimeError, 'enable failed') as caught:

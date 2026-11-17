@@ -18,7 +18,7 @@ DEFAULT_OSS_REGION = 'cn-hangzhou'
 DEFAULT_OSS_PREFIX = 'test-report'
 DEFAULT_PRINTER_NAME = 'Bar Code Printer T-4502 PRO'
 CONFIG_FORMAT = 2
-READINESS_LABELS = dict(can='CAN 适配器',motor='待测电机',dyno='测功机',power='电源',printer='标签打印机',
+READINESS_LABELS = dict(can='CAN 适配器',motor='待测电机',dyno='测功机',power='磁粉加载电源',printer='标签打印机',
                         sn_key='取号 API Key',mes_url='MES 地址',profile='型号测试参数',
                         target_id='产品 / SN 的物料分类未定义目标 ID',firmware='APP 固件',remove='等待换件',stabilizing='等待连接稳定')
 

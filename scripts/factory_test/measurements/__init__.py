@@ -1,11 +1,108 @@
 """上位机内部测量内核、采集记录与离线数据处理。"""
 from contextlib import contextmanager
+from contextvars import ContextVar
 import sys
 import time
 from motor_platform import MitCommand
 
 
 SAMPLE_MAX_GAP_S = 0.1  # 采集连续性和平滑分段阈值，独立于电机断线时间。
+MAX_MOTOR_TEMP_C = 80.0
+MAX_DRIVER_TEMP_C = 80.0
+_hardware_events = ContextVar('production_hardware_events',default=None)
+
+
+@contextmanager
+def hardware_scope(emit):
+    token = _hardware_events.set(emit)
+    try:
+        yield
+    finally:
+        _hardware_events.reset(token)
+
+
+def _hardware_emit(emit, target, name, detail, *, state='IN_USE', **data):
+    if emit is None:
+        return
+    try:
+        context = target.context if target is not None else {}
+        emit('hardware_state',dict(session=context.get('session'),name=name,state=state,detail=detail,**data))
+    except Exception as exc:
+        if target is not None:
+            target.event('hardware.ui.notify_failed',level='WARNING',error=exc)
+
+
+def hardware_state(name, detail, *, state='IN_USE', **data):
+    from ..diagnostics import current_log
+    _hardware_emit(_hardware_events.get(),current_log(),name,detail,state=state,**data)
+
+
+class MotorTemperatureLimit(RuntimeError):
+    diagnostic_code = 'MOTOR_TEMPERATURE_LIMIT'
+    diagnostic_hint = '核对电机和驱动器实际温度与测试门限。关闭磁粉加载、失能并冷却后再测试；不把温度超限归为通信故障。'
+
+    def __init__(self, state, motor_limit, driver_limit):
+        self.diagnostic_context = dict(motor_temperature_c=state.motor_temperature,
+            driver_temperature_c=state.board_temperature,motor_limit_c=motor_limit,driver_limit_c=driver_limit)
+        channels = []
+        if state.motor_temperature >= motor_limit:
+            channels.append(f'电机 {state.motor_temperature:.1f}℃ ≥ {motor_limit:g}℃')
+        if state.board_temperature >= driver_limit:
+            channels.append(f'驱动器 {state.board_temperature:.1f}℃ ≥ {driver_limit:g}℃')
+        super().__init__('测试温度超限：'+'；'.join(channels))
+
+
+def check_temperature(state, motor_limit=MAX_MOTOR_TEMP_C, driver_limit=MAX_DRIVER_TEMP_C):
+    if state.motor_temperature >= motor_limit or state.board_temperature >= driver_limit:
+        raise MotorTemperatureLimit(state,motor_limit,driver_limit)
+
+
+def check_motor_feedback(motor, motor_limit=MAX_MOTOR_TEMP_C, driver_limit=MAX_DRIVER_TEMP_C):
+    from motor_platform.runtime import MOTOR_FEEDBACK_TIMEOUT_S
+    state = motor.state(max_age=MOTOR_FEEDBACK_TIMEOUT_S)
+    stats = motor.stats()
+    if state.error_code or stats['fault']:
+        raise RuntimeError(f'motor fault: {state.error_code}, {stats["fault"]}')
+    check_temperature(state,motor_limit,driver_limit)
+    return state,stats
+
+
+def wait_temperature_ready(motor, *, phase, cancelled=None, wait=None, idle=None,
+                           motor_limit=MAX_MOTOR_TEMP_C, driver_limit=MAX_DRIVER_TEMP_C):
+    """Wait with monitoring only. The caller has confirmed load OFF and motor disabled."""
+    from motor_platform.runtime import MOTOR_FEEDBACK_TIMEOUT_S
+    from ..diagnostics import log_event
+    wait = time.sleep if wait is None else wait
+    began = time.perf_counter()
+    next_notice = next_log = began
+    cooling = False
+    while True:
+        if cancelled is not None and cancelled():
+            log_event('hardware.cooling.cancelled',phase=phase,elapsed_s=time.perf_counter()-began)
+            raise InterruptedError('已停止温度等待')
+        state = motor.state(max_age=MOTOR_FEEDBACK_TIMEOUT_S)
+        now = time.perf_counter()
+        values = dict(phase=phase,motor_temperature_c=state.motor_temperature,
+                      driver_temperature_c=state.board_temperature,motor_limit_c=motor_limit,
+                      driver_limit_c=driver_limit,elapsed_s=round(now-began,2))
+        try:
+            check_temperature(state,motor_limit,driver_limit)
+        except MotorTemperatureLimit as exc:
+            cooling = True
+            if now >= next_notice:
+                hardware_state('motor',str(exc),waiting=True,**values)
+                next_notice = now+1
+            if now >= next_log:
+                log_event('hardware.cooling.wait','磁粉加载关闭、电机未使能，等待温度回落',**values)
+                next_log = now+5
+            if idle is not None:
+                idle()
+            wait(.1)
+        else:
+            log_event('hardware.temperature.ready','温度检查通过',was_cooling=cooling,**values)
+            hardware_state('motor',f'零目标监视 · 电机 {state.motor_temperature:.1f}℃ / 驱动器 {state.board_temperature:.1f}℃',
+                           waiting=False,**values)
+            return state
 
 
 class FeedbackClock:
@@ -64,8 +161,12 @@ def stop_with_ramp(motor, torque, ramp_seconds, on_step, *, on_error=None):
         raise
     finally:
         try:
+            disabled = False
             with record_shutdown_failure('电机失能'):
                 motor.disable()
+                disabled = True
+            if disabled:
+                hardware_state('motor','失能回执已确认，正在结束本项测试',state='STANDBY',stopped=True)
         except Exception as exc:
             if on_error is not None:
                 try:
@@ -91,7 +192,37 @@ def power_observer():
     # Capture the workpiece context before a load-control executor changes threads.
     from ..diagnostics import current_log
     target = current_log()
-    return target.event if target is not None else None
+    emit = _hardware_events.get()
+    if target is None and emit is None:
+        return None
+    settings = {}
+    def observe(event, message='', **details):
+        if target is not None:
+            if message:
+                target.event(event,message,**details)
+            else:
+                target.event(event,**details)
+        if emit is None:
+            return
+        if event == 'power.command.confirmed':
+            command = details.get('command','')
+            if command.startswith('OUTP '):
+                settings['output'] = bool(details['readback'])
+            elif command.startswith('SOUR:VOLT '):
+                settings['voltage'] = details['readback']
+            elif command.startswith('SOUR:CURR '):
+                settings['current'] = details['readback']
+            parts = [('磁粉输出已开启（回读）' if settings['output'] else '磁粉输出已关闭（回读）')
+                     if 'output' in settings else '磁粉输出待回读']
+            if 'voltage' in settings: parts.append(f'设定 {settings["voltage"]:g} V')
+            if 'current' in settings: parts.append(f'限流 {settings["current"]:g} A')
+            _hardware_emit(emit,target,'power',' · '.join(parts))
+        elif event == 'power.command.failed':
+            _hardware_emit(emit,target,'power','磁粉加载操作未获确认',state='ERROR')
+        elif event == 'power.connection.closed':
+            state_text = '最近已确认关闭' if settings.get('output') is False else '输出状态需重新读取'
+            _hardware_emit(emit,target,'power','加载串口已释放 · '+state_text,state='STANDBY')
+    return observe
 
 
 def device_snapshot(motor, dyno, *, target, loop_at):
