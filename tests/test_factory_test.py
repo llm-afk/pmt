@@ -52,15 +52,11 @@ class FactoryTests(unittest.TestCase):
         self.assertEqual(report.metric('error',5,hi=5)['status'],'PASS')
 
 
-    def test_kt_report_uses_logged_sample_gap_and_actual_capture_window(self):
-        result = dict(config=dict(RAMP_DURATION_S=.2, SAMPLE_MAX_GAP_S=.1,
-                                  MOTOR_FEEDBACK_TIMEOUT_S=1.), capture_duration_s=.8)
-        summary = dict(target_torque=10, stages={'kt': {'result': result}})
-        rows = [dict(time_ms=i*10, motor_torque=i, motor_application_target_torque=i/8,
-                     dyno_torque_smooth_nm=i/8) for i in range(81)]
-        self.assertEqual(len(report.kt_target_curve(rows, summary)[0]), 81)
-        with self.assertRaisesRegex(ValueError, '覆盖不足'):
-            report.kt_target_curve(rows[:10] + rows[-10:], summary)
+    def test_kt_accepts_sparse_pairs_and_does_not_impose_capture_gap_limits(self):
+        rows=[dict(time_ms='0',motor_application_target_torque='0',dyno_torque_smooth_nm='0'),
+              dict(time_ms='2900',motor_application_target_torque='29',dyno_torque_smooth_nm='29')]
+        summary=dict(target_torque=30,stages={'kt':{'result':{'config':{'RAMP_DURATION_S':3,'SAMPLE_MAX_GAP_S':.1}}}})
+        self.assertEqual(report.kt_target_curve(rows,summary), ([(0.,0.),(29.,29.)],False))
 
     def args(self): return NS(id=1,serial='adapter',torque=30)
 
@@ -78,11 +74,21 @@ class FactoryTests(unittest.TestCase):
         self.assertEqual(identity.call_count,3)
         for name,module,_ in stages:
             module.main.assert_called_once_with(
-                ['--id', '1', '--serial', 'adapter', '--torque', '30'],
+                ['--id', '1', '--serial', 'adapter', '--torque', '30']+(['--error-limit-pct','5.0'] if name=='kt' else []),
                 output_dir=Path('output') / name,
                 quiet=True,
             )
             self.assertEqual(result['stages'][name]['status'],'COMPLETED')
+
+    def test_online_torque_error_stops_sequence_and_is_classified(self):
+        from scripts.factory_test.measurements.kt_curve.app import TorqueErrorLimit
+        stages=self.stages()
+        stages[0][1].main.side_effect=TorqueErrorLimit(15.,10.,5.,30.)
+        result=app.execute(self.args(),Path('output'),stages=stages,identify=lambda _:'same')
+        stages[1][1].main.assert_not_called()
+        self.assertEqual(result['diagnostic']['code'],'KT_TORQUE_ERROR_LIMIT')
+        self.assertEqual(result['stages']['tn']['status'],'SKIPPED')
+        self.assertEqual(report.analyze(Path('output'),result)[0]['status'],'FAIL')
 
     def test_fault_or_sn_change_prevents_next_test(self):
         for mismatch in (False,True):
@@ -158,7 +164,7 @@ class FactoryTests(unittest.TestCase):
                     with path.open('w', encoding='utf-8',newline='') as f:
                         wr=csv.DictWriter(f,rows[0].keys());wr.writeheader();wr.writerows(rows)
                     sections=report.analyze(root,summary)
-                    expected='PASS' if case in ('complete','historical') else 'INCOMPLETE'
+                    expected='INCOMPLETE' if case in ('missing','missing_header') else 'PASS'
                     self.assertEqual(report.overall(sections,summary['stages']),expected)
                     if expected=='INCOMPLETE': self.assertTrue(sections[0]['note'])
                     if case=='historical': self.assertEqual(sections[0]['target_source'],'reconstructed_ramp')

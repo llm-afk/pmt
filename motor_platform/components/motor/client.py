@@ -76,8 +76,6 @@ class MotorBus:
                 motor.last_state = parse_state(frame, motor.node_id, time.perf_counter())
                 with motor._samples_lock:
                     if motor._samples is not None:
-                        if len(motor._samples) == motor._samples.maxlen:
-                            motor._dropped_samples += 1
                         motor._samples.append(motor.last_state)
                 return motor.last_state
 
@@ -207,18 +205,16 @@ class Motor:
             raise SdoError(f"motor SN is not a programmed 26-character ASCII value: {raw.hex()}")
         return value.decode('ascii')
 
-    def start_recording(self, capacity=8192):
+    def start_recording(self):
         """启用逐帧队列，供应用记录；state/last_state 仍只表示最新状态。
 
         一条反馈只入队一次，包括等待使能/失能期间收到的反馈。
-        队列只允许一个消费者；溢出计数可通过 recording_dropped 查询。
+        队列只允许一个消费者；按实际样本增长，消费后立即释放。
         """
-        if type(capacity) is not int or capacity <= 0:
-            raise ValueError('capacity must be a positive integer')
         with self._samples_lock:
             if self._samples is not None:
                 raise RuntimeError('motor recording already started')
-            self._samples = deque(maxlen=capacity)
+            self._samples = deque()
             self._dropped_samples = 0
 
     def drain_states(self):
@@ -239,10 +235,10 @@ class Motor:
     def node_id(self):
         return self._node_id
 
-    def enable(self, timeout=0.5):
+    def enable(self, timeout=3.0):
         return self._bus._enable(self.node_id, timeout)
 
-    def disable(self, timeout=0.5, *, wait_ack=True):
+    def disable(self, timeout=3.0, *, wait_ack=True):
         if wait_ack:
             try:
                 self._bus._disable(self.node_id, timeout)

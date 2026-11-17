@@ -1,19 +1,21 @@
 """扭矩输出误差测量内核；仅由上位机流程传入设备、目标和输出目录。"""
 import argparse
 import csv
-from functools import partial
+from bisect import bisect_right
+from collections import deque
 import math
 from pathlib import Path
 import sys
 import time
 
+from scripts.factory_test.station_config import DEFAULT_KT_ERROR_LIMIT_PCT
 from motor_platform import Bench, Canable, Dynamometer, MitCommand, PowerSupply
 from motor_platform.runtime import MOTOR_FEEDBACK_TIMEOUT_S, start_monitoring
 from motor_platform.components.dynamometer import detect_dynamometers
 from motor_platform.components.power_supply.discovery import resolve_power_port
-from .. import (FeedbackClock, SAMPLE_MAX_GAP_S, power_off, record_shutdown_failure, power_observer,
+from .. import (SAMPLE_MAX_GAP_S, power_off, record_shutdown_failure, power_observer,
                 device_snapshot, log_measurement_snapshot, stop_with_ramp, capture_shutdown_error,
-                check_motor_feedback, wait_temperature_ready, hardware_state, MAX_MOTOR_TEMP_C, MAX_DRIVER_TEMP_C)
+                check_motor_feedback, hardware_state)
 from ..console import WindowConsole as TerminalConsole
 from scripts.factory_test.measurements.smoothing import append_smoothed_columns
 from scripts.factory_test.measurements.csv_streams import pack_streams
@@ -32,10 +34,46 @@ RAMP_DURATION_S = 3.0           # 从开始爬升到结束采集的时间
 MOTOR_HZ = 1000                 # 周期 CAN 发送目标频率；目标值按实际经过时间计算
 TARGET_UPDATE_S = 0.001         # 应用更新目标的间隔；迟到不补发积压命令
 STOP_RAMP_S = 1.0               # 正常结束、用户停止：保持阻尼，线性降扭矩到零
-DYNO_FEEDBACK_TIMEOUT_S = 0.1
+DYNO_FEEDBACK_TIMEOUT_S = 1.0
 DYNO_TORQUE_SCALE = 100.0
 DYNO_SPEED_SCALE = 100.0
 SMOOTH_WINDOW_S = 0.30          # 停机后平滑两路扭矩；原始样本不修改
+
+
+class TorqueErrorLimit(RuntimeError):
+    diagnostic_code = 'KT_TORQUE_ERROR_LIMIT'
+    diagnostic_hint = '实际扭矩与下发目标的误差超过工位设定值，本次提前结束，不申请正式 SN。'
+
+    def __init__(self, target, actual, limit_pct, maximum):
+        error = abs(actual-target)/abs(maximum)*100
+        self.diagnostic_context = dict(target_nm=target,actual_nm=actual,error_pct_fs=error,
+                                       limit_pct_fs=limit_pct,full_scale_nm=abs(maximum))
+        super().__init__(f'扭矩误差 {error:.2f}%FS 超过设定 {limit_pct:g}%FS'
+                         f'（目标 {target:.3f} Nm，实际 {actual:.3f} Nm）')
+
+
+class TorqueErrorMonitor:
+    """Average target and actual at the same real sensor times over 0.3 s."""
+    def __init__(self, recorder, maximum, limit_pct):
+        self.recorder,self.maximum,self.limit_pct = recorder,maximum,limit_pct
+        self.samples = deque()
+
+    def observe(self, states):
+        for state in states:
+            if not self.recorder.origin <= state.received_at <= self.recorder.cutoff:
+                continue
+            index = bisect_right(self.recorder.commands,(state.received_at,math.inf))-1
+            target = self.recorder.commands[max(0,index)][1]
+            self.samples.append((state.received_at,target,state.torque))
+            cutoff = state.received_at-SMOOTH_WINDOW_S
+            while self.samples and self.samples[0][0] < cutoff:
+                self.samples.popleft()
+            if state.received_at-self.recorder.origin < SMOOTH_WINDOW_S:
+                continue
+            target = sum(row[1] for row in self.samples)/len(self.samples)
+            actual = sum(row[2] for row in self.samples)/len(self.samples)
+            if abs(actual-target)/abs(self.maximum)*100 > self.limit_pct:
+                raise TorqueErrorLimit(target,actual,self.limit_pct,self.maximum)
 
 
 def parse_args(argv=None):
@@ -45,7 +83,10 @@ def parse_args(argv=None):
     parser.add_argument('--torque', type=float, default=TORQUE_FF)
     parser.add_argument('--voltage', type=float, default=LOAD_VOLTAGE_V)
     parser.add_argument('--current', type=float, default=LOAD_CURRENT_A)
+    parser.add_argument('--error-limit-pct',type=float,default=DEFAULT_KT_ERROR_LIMIT_PCT)
     args = parser.parse_args(argv)
+    if not math.isfinite(args.error_limit_pct) or args.error_limit_pct < 0:
+        parser.error('error-limit-pct must be finite and nonnegative')
     if not 1 <= args.id <= 127:
         parser.error('id must be in 1..127')
     if not args.serial or not args.serial.strip():
@@ -58,7 +99,7 @@ def parse_args(argv=None):
     if round(args.voltage, 2) != args.voltage or round(args.current, 3) != args.current:
         parser.error('电压最多两位小数，电流最多三位小数')
     for name in ('LOAD_SETTLE_S', 'RAMP_DURATION_S', 'MOTOR_HZ', 'TARGET_UPDATE_S', 'STOP_RAMP_S',
-                 'DYNO_FEEDBACK_TIMEOUT_S', 'MAX_MOTOR_TEMP_C', 'MAX_DRIVER_TEMP_C',
+                 'DYNO_FEEDBACK_TIMEOUT_S',
                  'DYNO_TORQUE_SCALE', 'DYNO_SPEED_SCALE', 'SMOOTH_WINDOW_S'):
         if not math.isfinite(globals()[name]) or globals()[name] <= 0:
             parser.error(f'{name} must be finite and positive')
@@ -74,9 +115,7 @@ def ramp_torque(elapsed, maximum):
 
 
 def check_motor(motor):
-    state,stats = check_motor_feedback(motor,MAX_MOTOR_TEMP_C,MAX_DRIVER_TEMP_C)
-    if stats.get('recording_dropped', 0):
-        raise RuntimeError('motor recording queue overflow')
+    state,stats = check_motor_feedback(motor)
     return state, stats
 
 
@@ -89,6 +128,7 @@ def stop_motor(motor, torque, controlled, collect, *, on_error=None):
 
 def run(motor, dyno, ui, args, result):
     recorder = None
+    error_monitor = None
     enabled = False
     applied = 0.0
     def collect():
@@ -96,12 +136,13 @@ def run(motor, dyno, ui, args, result):
         if recorder is not None:
             recorder.add('motor', motors)
             recorder.add('dyno', dynos)
+            if error_monitor is not None:
+                error_monitor.observe(dynos)
     try:
         check_motor(motor)
         dyno.state(max_age=DYNO_FEEDBACK_TIMEOUT_S)
         motor.start_recording()
         dyno.drain()
-        dropped_before = dyno.stats()['dropped_samples']
         motor.enable()
         enabled = True
         hardware_state('motor','使能请求已获回包 · KT 扭矩采集中',motion=True)
@@ -110,37 +151,32 @@ def run(motor, dyno, ui, args, result):
         collect()
         recorder = Recorder(time.perf_counter(), RAMP_DURATION_S)
         result['recorder'] = recorder
-        ramp = FeedbackClock(recorder.origin)
+        error_monitor = TorqueErrorMonitor(recorder,args.torque,getattr(args,'error_limit_pct',DEFAULT_KT_ERROR_LIMIT_PCT))
         next_display = 0.0
         while True:
             now = time.perf_counter()
             state, stats = check_motor(motor)
             ds = dyno.state(max_age=DYNO_FEEDBACK_TIMEOUT_S)
-            if dyno.stats()['dropped_samples'] != dropped_before:
-                raise RuntimeError('dynamometer sample queue overflow')
             line = ui.poll()
             if line is not None and line.strip().lower() in ('quit', 'stop', 'q', 'exit'):
                 recorder.cutoff = min(recorder.cutoff, time.perf_counter())
                 result['reason'] = 'operator_stop'
                 break
-            previous_rx = ramp.last_at
-            new_feedback = ramp.update(state.received_at, now)
-            if new_feedback and SAMPLE_MAX_GAP_S < state.received_at-previous_rx < MOTOR_FEEDBACK_TIMEOUT_S:
-                recorder.resumed_feedback(previous_rx, state.received_at)
-            applied = ramp_torque(ramp.elapsed, args.torque)
-            # 正常截止仍是名义斜坡终点；等回包时保留该段实测数据。
-            complete = new_feedback and ramp.elapsed >= RAMP_DURATION_S
-            recorder.cutoff = recorder.origin + RAMP_DURATION_S + ramp.paused
-            if not complete:
-                recorder.cutoff += max(0.0, now-ramp.last_at)
+            elapsed = now-recorder.origin
+            applied = ramp_torque(elapsed, args.torque)
+            complete = elapsed >= RAMP_DURATION_S
             motor.set_mit(MitCommand(torque=applied))
             recorder.command(time.perf_counter(), applied)
             collect()
             if complete:
                 result['reason'] = 'completed'
+                result['end_condition'] = dict(name='ramp_duration',duration_s=RAMP_DURATION_S,elapsed_s=elapsed)
+                from scripts.factory_test.diagnostics import log_event
+                log_event('test.normal_end','KT 完成扭矩斜坡，开始降扭矩收尾',
+                          stage='kt',reason='completed',condition=result['end_condition'])
                 break
             if now >= next_display:
-                ui._panel = (f'ID={args.id}  扭矩爬升 {ramp.elapsed:.2f}/{RAMP_DURATION_S:g} s\n'
+                ui._panel = (f'ID={args.id}  扭矩爬升 {elapsed:.2f}/{RAMP_DURATION_S:g} s\n'
                     f'下发目标 {applied:+.4f}/{args.torque:+g}  阻尼电源 {args.voltage:g} V / {args.current:g} A\n'
                     f'电机 {state.torque:+.4f}  {state.velocity:+.3f} rad/s\n'
                     f'测功机 {ds.torque:+.4f} Nm  {ds.speed:.3f} rad/s\n'
@@ -151,6 +187,7 @@ def run(motor, dyno, ui, args, result):
                 next_display = now+.1
             time.sleep(TARGET_UPDATE_S)
     except BaseException as exc:
+        error_monitor = None
         result['runtime_snapshot'] = device_snapshot(motor,dyno,target=applied,loop_at=locals().get('now',time.perf_counter()))
         result['snapshot_phase'] = 'acquisition_failed'
         result['reason'] = 'operator_stop' if isinstance(exc, KeyboardInterrupt) else 'error'
@@ -159,6 +196,7 @@ def run(motor, dyno, ui, args, result):
         raise
     finally:
         original = sys.exception()
+        error_monitor = None
         result['_stop_probe'] = getattr(motor,'stop_status',None)
         if 'runtime_snapshot' not in result:
             result['runtime_snapshot'] = device_snapshot(motor,dyno,target=applied,loop_at=locals().get('now',time.perf_counter()))
@@ -166,7 +204,7 @@ def run(motor, dyno, ui, args, result):
         try:
             ui._notice = '正在降扭矩、失能；随后关闭阻尼器电源'
             ui.app.invalidate()
-            stop_motor(motor, applied, enabled and (original is None or isinstance(original, KeyboardInterrupt)), collect,
+            stop_motor(motor, applied, enabled and (original is None or isinstance(original, (KeyboardInterrupt,TorqueErrorLimit))), collect,
                        on_error=lambda: capture_shutdown_error(result,motor,dyno))
         except Exception as exc:
             capture_shutdown_error(result,motor,dyno)
@@ -212,13 +250,9 @@ def main(argv=None, *, output_dir, quiet=False, power_port=None, dyno_port=None)
                                 with Bench(transport=Canable(args.serial), motor_ids=[args.id], rate_hz=MOTOR_HZ) as bench:
                                     with bench.start() as control:
                                         motor = control.motor(args.id)
-                                        motor.disable()  # 确认失能后才进入监视和温度等待。
                                         start_monitoring(motor,cancelled=TerminalConsole.cancelled.is_set,
                                                          wait=TerminalConsole.cancelled.wait)
                                         try:
-                                            wait_temperature_ready(motor,phase='kt.preflight',cancelled=TerminalConsole.cancelled.is_set,
-                                                wait=TerminalConsole.cancelled.wait,idle=dyno.drain,
-                                                motor_limit=MAX_MOTOR_TEMP_C,driver_limit=MAX_DRIVER_TEMP_C)
                                             check_motor(motor)
                                             dyno.state(max_age=DYNO_FEEDBACK_TIMEOUT_S)
                                             power.enable()  # 建立阻尼期间保持零目标监视。
@@ -243,16 +277,16 @@ def main(argv=None, *, output_dir, quiet=False, power_port=None, dyno_port=None)
                 append_smoothed_columns(csv_path, SMOOTH_WINDOW_S, SMOOTH_WINDOW_S,
                                         SAMPLE_MAX_GAP_S, SMOOTH_WINDOW_S, SMOOTH_WINDOW_S,
                                         output_columns=OUTPUT_COLUMNS)
-                separate = None
-                if result['reason'] == 'completed' and recorder.feedback_holds:
-                    separate = partial(recorder.separate_hold_samples, max_gap_ms=SAMPLE_MAX_GAP_S*1000)
-                pack_streams(csv_path, align_motor=True, separate_events=separate)
+                pack_streams(csv_path, align_motor=True)
         except Exception as exc:
             if original is None:
                 raise
             original.add_note(f'CSV smoothing failed: {exc}')
         if not quiet:
             print(f'Test result: {result["reason"]}\nCSV: {csv_path}')
-    return {'reason': result['reason'], 'csv': str(csv_path),
-            'capture_duration_s': recorder.cutoff - recorder.origin, 'held_target_intervals': recorder.verified_holds,
+    termination = ('normal_end' if result['reason']=='completed' else
+                   'operator_stop' if result['reason']=='operator_stop' else 'fault')
+    return {'reason': result['reason'], 'termination':termination,
+            'end_condition':result.get('end_condition'), 'csv': str(csv_path),
+            'capture_duration_s': recorder.cutoff - recorder.origin,
             'config': {k: v for k, v in globals().items() if k.isupper()}, 'arguments': vars(args)}

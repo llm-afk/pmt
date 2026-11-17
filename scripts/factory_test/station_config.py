@@ -32,7 +32,8 @@ HARDWARE_D = {}
 HARDWARE_FIELDS = {'A': HARDWARE_A, 'B': HARDWARE_B, 'C': HARDWARE_C, 'D': HARDWARE_D}
 # Production mapping confirmed by the fixture owner: swing / hip / knee.
 JOINT_NODE_IDS = {'HIPX': 1, 'HIPY': 2, 'KNEE': 3}
-TEST_TORQUE_BY_BC = {'11': 30.0, '22': 30.0, '13': 50.0, '14': 50.0}
+DEFAULT_TEST_TORQUE_NM = 30.0
+DEFAULT_KT_ERROR_LIMIT_PCT = 5.0
 
 
 def validate_report_url(value):
@@ -51,8 +52,8 @@ def validate_report_url(value):
 
 
 def hardware_torque_limit(hardware):
-    """Torque belongs to platform/motor BC; A/D revisions are not a whitelist."""
-    return TEST_TORQUE_BY_BC.get(hardware[1:3]) if isinstance(hardware,str) and len(hardware)==4 else None
+    """Current production setting: every valid ABCD combination uses 30 Nm."""
+    return DEFAULT_TEST_TORQUE_NM if isinstance(hardware,str) and re.fullmatch(r'[0-9]{4}',hardware) else None
 MATERIALS = {
     'C2': {'HIPX': ['LFRR', 'LRRF'], 'HIPY': ['LFXX', 'RFXX', 'LRXX', 'RRXX'],
            'KNEE': ['0STD', '0PRO']},
@@ -141,6 +142,7 @@ class StationConfig:
     api_key_env: str = 'MIRRORME_MES_API_KEY'
     printer_url: str = 'http://127.0.0.1:9876'
     printer_name: str = DEFAULT_PRINTER_NAME
+    kt_error_limit_pct: float = DEFAULT_KT_ERROR_LIMIT_PCT
     calibration_timeout: float = 120.0
     report_upload_url: str = DEFAULT_REPORT_URL  # 显式清空后仍可沿用外置配置的 mes_url。
     upload_config: str = ''     # 可指定旧版上传配置文件，不在工位配置中复制密钥。
@@ -197,6 +199,8 @@ class StationConfig:
                 datetime.strptime(self.production_date, '%y%m%d')
             except ValueError:
                 raise ValueError('生产日期不是有效的日历日期') from None
+        if not math.isfinite(self.kt_error_limit_pct) or self.kt_error_limit_pct < 0:
+            raise ValueError('扭矩误差上限须为有限非负数，单位 %满量程')
         if not math.isfinite(self.calibration_timeout) or self.calibration_timeout <= 0:
             raise ValueError('校准超时必须为有限正数')
         for name in ('mes_url','printer_url','report_upload_url','oss_endpoint'):

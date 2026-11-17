@@ -33,17 +33,15 @@ class Dynamometer:
             return list(_port_owners.values())
 
     def __init__(self, *, port, baudrate=115200, torque_scale=100.0,
-                 speed_scale=100.0, capacity=4096, transport=None):
+                 speed_scale=100.0, transport=None):
         self.torque_scale, self.speed_scale = positive(torque_scale), positive(speed_scale)
-        if type(capacity) is not int or capacity <= 0:
-            raise ValueError('capacity must be a positive integer')
         self.port = port
         self._port_key = port.strip().casefold()
         self._transport = transport if transport is not None else SerialStream(port, baudrate=baudrate)
         self._transport_open = self._opening = False
         self._close_error = None
         self._close_lock = threading.Lock()
-        self._samples = deque(maxlen=capacity)
+        self._samples = deque()
         self._condition = threading.Condition()
         self._stop = threading.Event()
         self._thread = None
@@ -132,8 +130,6 @@ class Dynamometer:
                     self._bytes += len(data)
                     self._discarded = parser.discarded_bytes
                     for state in states:
-                        if len(self._samples) == self._samples.maxlen:
-                            self._dropped += 1
                         self._samples.append(state)
                         self._latest = state
                         self._count += 1

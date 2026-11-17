@@ -46,6 +46,19 @@ class PowerSupply:
         if not self._opened:
             raise RuntimeError('open power supply before use')
 
+    def _confirm(self, query, parse, matches):
+        readings = []
+        stable = 0
+        for attempt in range(5):
+            actual = parse(self._transport.query(query))
+            readings.append(actual)
+            stable = stable+1 if matches(actual) else 0
+            if stable >= 2:
+                return actual,readings
+            if attempt < 4:
+                time.sleep(.05)
+        raise PowerSupplyError(f'{query} readback differs from requested state after 5 reads: {readings}')
+
     def _set(self, command, value, digits, query):
         text = f'{number(value):.{digits}f}'
         with self._lock:
@@ -53,13 +66,12 @@ class PowerSupply:
             self._notify('power.command.request', command=f'{command} {text}')
             try:
                 self._transport.write(f'{command} {text}')
-                actual = parse_number(self._transport.query(query))
-                if abs(actual - float(text)) > 0.5 * 10**(-digits) + 1e-9:
-                    raise PowerSupplyError(f'{query} readback {actual} differs from requested {text}')
+                actual,readings = self._confirm(query,parse_number,
+                    lambda value: abs(value-float(text)) <= 0.5*10**(-digits)+1e-9)
             except BaseException as exc:
                 self._notify('power.command.failed', level='ERROR', error=exc, snapshot=self.diagnostic_snapshot())
                 raise
-            self._notify('power.command.confirmed', command=f'{command} {text}', readback=actual)
+            self._notify('power.command.confirmed', command=f'{command} {text}', readback=actual, readbacks=readings)
             return actual
 
     def set_voltage(self, voltage):
@@ -78,13 +90,11 @@ class PowerSupply:
             self._notify('power.command.request', command=command)
             try:
                 self._transport.write(command)
-                actual = parse_output(self._transport.query('OUTP?'))
-                if actual != enabled:
-                    raise PowerSupplyError('output readback differs from requested state')
+                actual,readings = self._confirm('OUTP?',parse_output,lambda value: value==enabled)
             except BaseException as exc:
                 self._notify('power.command.failed', level='ERROR', error=exc, snapshot=self.diagnostic_snapshot())
                 raise
-            self._notify('power.command.confirmed', command=command, readback=actual,
+            self._notify('power.command.confirmed', command=command, readback=actual, readbacks=readings,
                          snapshot=self.diagnostic_snapshot())
             return actual
 

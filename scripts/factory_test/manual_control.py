@@ -21,7 +21,7 @@ from .waveform import WaveformPlot, FRAME_INTERVAL, FEEDBACK_COLOR, TARGET_COLOR
 class ManualSession:
     def __init__(self, config, node, emit, diagnostics=None):
         self.config, self.node, self.emit = config, node, emit
-        self.commands = queue.Queue(maxsize=16)
+        self.commands = queue.Queue()
         self.stop = threading.Event()
         self.thread = None
         self.connected = self.enabled = False
@@ -72,11 +72,7 @@ class ManualSession:
             raise RuntimeError('未识别芯片平台，无法确定标零/校准协议；不影响通用使能和控制')
         if kind in ('clear_error','zero','calibrate'):
             self.maintenance_busy=True
-        try:
-            self.commands.put_nowait((kind, target))
-        except queue.Full:
-            self.maintenance_busy=False
-            raise
+        self.commands.put_nowait((kind, target))
 
     @property
     def pending_target(self):
@@ -133,7 +129,7 @@ class ManualSession:
                     self.config=replace(self.config,model=sn[13:16],hardware_version=sn[12:16])
                     self.profile_known=sn[13] in ('1','2')  # Only the chip platform selects maintenance protocol.
             self.firmware=str(Maintenance.read(bench,self.node,0x2100,2))
-            channel=bench.start(rate_hz=1000,command_timeout=.25).motor(self.node)
+            channel=bench.start(rate_hz=1000).motor(self.node)
             start_monitoring(channel,cancelled=self.stop.is_set,wait=self.stop.wait)
             log_event('debug.monitor.started',node_id=self.node,target_hz=1000,
                       request_can_id=hex(0x100+self.node),feedback_can_id=hex(0x190+self.node),

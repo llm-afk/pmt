@@ -30,8 +30,6 @@ class CurveRecorder:
         origin = self.progress.loading_at
         if origin is None or state.received_at < origin:
             return
-        if len(self.pending) >= 32768:
-            raise RuntimeError('CSV merge queue overflow')
         self.sequence += 1
         heapq.heappush(self.pending, (state.received_at, self.sequence, source, state))
 

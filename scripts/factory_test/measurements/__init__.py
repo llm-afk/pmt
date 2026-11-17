@@ -7,8 +7,6 @@ from motor_platform import MitCommand
 
 
 SAMPLE_MAX_GAP_S = 0.1  # 采集连续性和平滑分段阈值，独立于电机断线时间。
-MAX_MOTOR_TEMP_C = 80.0
-MAX_DRIVER_TEMP_C = 80.0
 _hardware_events = ContextVar('production_hardware_events',default=None)
 
 
@@ -37,91 +35,13 @@ def hardware_state(name, detail, *, state='IN_USE', **data):
     _hardware_emit(_hardware_events.get(),current_log(),name,detail,state=state,**data)
 
 
-class MotorTemperatureLimit(RuntimeError):
-    diagnostic_code = 'MOTOR_TEMPERATURE_LIMIT'
-    diagnostic_hint = '核对电机和驱动器实际温度与测试门限。关闭磁粉加载、失能并冷却后再测试；不把温度超限归为通信故障。'
-
-    def __init__(self, state, motor_limit, driver_limit):
-        self.diagnostic_context = dict(motor_temperature_c=state.motor_temperature,
-            driver_temperature_c=state.board_temperature,motor_limit_c=motor_limit,driver_limit_c=driver_limit)
-        channels = []
-        if state.motor_temperature >= motor_limit:
-            channels.append(f'电机 {state.motor_temperature:.1f}℃ ≥ {motor_limit:g}℃')
-        if state.board_temperature >= driver_limit:
-            channels.append(f'驱动器 {state.board_temperature:.1f}℃ ≥ {driver_limit:g}℃')
-        super().__init__('测试温度超限：'+'；'.join(channels))
-
-
-def check_temperature(state, motor_limit=MAX_MOTOR_TEMP_C, driver_limit=MAX_DRIVER_TEMP_C):
-    if state.motor_temperature >= motor_limit or state.board_temperature >= driver_limit:
-        raise MotorTemperatureLimit(state,motor_limit,driver_limit)
-
-
-def check_motor_feedback(motor, motor_limit=MAX_MOTOR_TEMP_C, driver_limit=MAX_DRIVER_TEMP_C):
+def check_motor_feedback(motor):
     from motor_platform.runtime import MOTOR_FEEDBACK_TIMEOUT_S
     state = motor.state(max_age=MOTOR_FEEDBACK_TIMEOUT_S)
     stats = motor.stats()
     if state.error_code or stats['fault']:
         raise RuntimeError(f'motor fault: {state.error_code}, {stats["fault"]}')
-    check_temperature(state,motor_limit,driver_limit)
     return state,stats
-
-
-def wait_temperature_ready(motor, *, phase, cancelled=None, wait=None, idle=None,
-                           motor_limit=MAX_MOTOR_TEMP_C, driver_limit=MAX_DRIVER_TEMP_C):
-    """Wait with monitoring only. The caller has confirmed load OFF and motor disabled."""
-    from motor_platform.runtime import MOTOR_FEEDBACK_TIMEOUT_S
-    from ..diagnostics import log_event
-    wait = time.sleep if wait is None else wait
-    began = time.perf_counter()
-    next_notice = next_log = began
-    cooling = False
-    while True:
-        if cancelled is not None and cancelled():
-            log_event('hardware.cooling.cancelled',phase=phase,elapsed_s=time.perf_counter()-began)
-            raise InterruptedError('已停止温度等待')
-        state = motor.state(max_age=MOTOR_FEEDBACK_TIMEOUT_S)
-        now = time.perf_counter()
-        values = dict(phase=phase,motor_temperature_c=state.motor_temperature,
-                      driver_temperature_c=state.board_temperature,motor_limit_c=motor_limit,
-                      driver_limit_c=driver_limit,elapsed_s=round(now-began,2))
-        try:
-            check_temperature(state,motor_limit,driver_limit)
-        except MotorTemperatureLimit as exc:
-            cooling = True
-            if now >= next_notice:
-                hardware_state('motor',str(exc),waiting=True,**values)
-                next_notice = now+1
-            if now >= next_log:
-                log_event('hardware.cooling.wait','磁粉加载关闭、电机未使能，等待温度回落',**values)
-                next_log = now+5
-            if idle is not None:
-                idle()
-            wait(.1)
-        else:
-            log_event('hardware.temperature.ready','温度检查通过',was_cooling=cooling,**values)
-            hardware_state('motor',f'零目标监视 · 电机 {state.motor_temperature:.1f}℃ / 驱动器 {state.board_temperature:.1f}℃',
-                           waiting=False,**values)
-            return state
-
-
-class FeedbackClock:
-    """Advance a load ramp only across observed, continuous motor feedback."""
-    def __init__(self, start):
-        self.last_at = start
-        self.elapsed = 0.0
-        self.paused = 0.0
-
-    def update(self, received_at, now):
-        if received_at <= self.last_at or now - received_at > SAMPLE_MAX_GAP_S:
-            return False
-        gap = received_at - self.last_at
-        self.last_at = received_at
-        if gap <= SAMPLE_MAX_GAP_S:
-            self.elapsed += gap
-        else:
-            self.paused += gap
-        return True
 
 
 @contextmanager

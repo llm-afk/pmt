@@ -681,6 +681,8 @@ class FactoryWindow:
             if values['production_date'].lower() in ('auto','自动当天'):
                 values['production_date'] = ''
             values['model'] = values['hardware_version'][1:]
+            if 'kt_error_limit_pct' in values:
+                values['kt_error_limit_pct'] = float(values['kt_error_limit_pct'])
             if 'printer_copies' in values:
                 values['printer_copies'] = int(values['printer_copies'])
             config = replace(self.config, **values, automatic=self.auto.get(),
@@ -1587,12 +1589,7 @@ class FactoryWindow:
                     continue
                 if value.get('name') in self.device_widgets:
                     self.device_state(value['name'],value.get('state','IN_USE'),value['detail'])
-                if 'waiting' in value and not self.stopping:
-                    if value['waiting']:
-                        self.set_prompt('请等待电机冷却',value['detail']+'；磁粉加载关闭、未使能，降温后自动继续。','#B27813')
-                    else:
-                        self.set_prompt('温度已满足要求，继续测试',value['detail'],'#2563EB')
-                elif value.get('motion') and not self.stopping:
+                if value.get('motion') and not self.stopping:
                     self.set_prompt('电机可能转动，请勿触碰',value['detail'],'#2563EB')
                 elif value.get('stopped') and not self.stopping:
                     self.set_prompt('本项正在收尾，请等待',value['detail'],'#2563EB')
@@ -1682,8 +1679,9 @@ class FactoryWindow:
             return '打印结果未确认，请隔离本件','勿补打或贴标。请工程人员核对实体标签和打印记录。'
         if code == 'CANCELLED':
             return '本次测试已停止','停止结果和加载关闭回执已保存；确认设备停止后再取件。'
-        if code == 'MOTOR_TEMPERATURE_LIMIT':
-            return '请等待电机冷却','本次测试达到温度门限，已停止并关闭磁粉加载。冷却后再测试，具体温度见日志。'
+        if code == 'KT_TORQUE_ERROR_LIMIT':
+            detail=value.get('message') or '扭矩误差超过工位设定值'
+            return '扭矩误差超限，请隔离本件',detail+'；已提前结束，不申请正式 SN，请勿贴合格标签。'
         if code == 'MOTOR_FEEDBACK_STALE':
             return '请取下并隔离本件电机','电机反馈中断，本件测试已停止。请勿贴合格标签，联系工程人员查看日志。'
         stage=value.get('step_label') or dict(STEPS).get(step,'本件测试')

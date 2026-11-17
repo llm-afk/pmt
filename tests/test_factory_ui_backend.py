@@ -313,7 +313,7 @@ class ManualTests(unittest.TestCase):
         self.assertEqual(factory.call_args.kwargs['motor_ids'],[7])
         self.assertIs(connected,bench)
         self.assertIs(channel,bench.start.return_value.motor.return_value)
-        bench.start.assert_called_once_with(rate_hz=1000,command_timeout=.25)
+        bench.start.assert_called_once_with(rate_hz=1000)
         channel.monitor.assert_called_once()
         channel.enable.assert_not_called()
         self.assertEqual(config.model,'221')  # 不修改固定工位的产品选择。

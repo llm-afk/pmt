@@ -123,8 +123,6 @@ class Services:
         policy = HARDWARE_PHASES[name]
         if policy['load']=='OFF':
             self.disable_load('before_production' if name=='firmware' else 'before_'+name)
-        if policy['motor']=='CALIBRATION':
-            self.motor.wait_temperature()
 
     def disable_load(self, reason):
         """Production owns the fixture now: turn off magnetic loading with readback."""
@@ -197,7 +195,8 @@ class Services:
         self.motor.calibrate()
 
     def measure(self, directory, base_sn):
-        args = SimpleNamespace(id=self.config.target_id, serial=self.config.adapter_sn, torque=self.config.torque)
+        args = SimpleNamespace(id=self.config.target_id, serial=self.config.adapter_sn, torque=self.config.torque,
+                               kt_error_limit_pct=self.config.kt_error_limit_pct)
         stages = []
         power_port = self.hardware_ports.get('power') or self.config.power_port
         dyno_port = self.hardware_ports.get('dyno') or self.config.dyno_port

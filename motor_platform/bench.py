@@ -15,13 +15,11 @@ class Bench:
     使用 bench.start() 启动运行时后，通过运行时的 motor(id) 操作电机。
     """
     def __init__(self, *, transport, motor_ids, bitrate=1_000_000, data_bitrate=4_000_000,
-                 sample_point=75.0, data_sample_point=64.0, rate_hz=1000,
-                 command_timeout=0.25):
+                 sample_point=75.0, data_sample_point=64.0, rate_hz=1000):
         self._transport = transport
         self.config = BenchConfig(motor_ids=tuple(motor_ids), bitrate=bitrate,
                                   data_bitrate=data_bitrate, sample_point=sample_point,
-                                  data_sample_point=data_sample_point, rate_hz=rate_hz,
-                                  command_timeout=command_timeout)
+                                  data_sample_point=data_sample_point, rate_hz=rate_hz)
         self._bus = None
         self._motors = {}
         self._runtime = None
@@ -52,7 +50,7 @@ class Bench:
             raise RuntimeError("bench is closed")
         return self._bus.poll(timeout)
 
-    def start(self, rate_hz=None, command_timeout=None):
+    def start(self, rate_hz=None):
         """Start one shared I/O worker; opt into monitor() or explicit enable()."""
         from .runtime import ControlRuntime
         if self._bus is None:
@@ -60,8 +58,7 @@ class Bench:
         if self._runtime is not None:
             raise RuntimeError("this bench already created a runtime")
         runtime = ControlRuntime(self._bus, self._motors,
-                                 self.config.rate_hz if rate_hz is None else rate_hz,
-                                 self.config.command_timeout if command_timeout is None else command_timeout)
+                                 self.config.rate_hz if rate_hz is None else rate_hz)
         self._runtime = runtime.start()
         return self._runtime
 

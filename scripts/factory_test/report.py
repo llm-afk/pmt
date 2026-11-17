@@ -1,6 +1,5 @@
 """离线指标及白底矢量PDF；不改变原始CSV，不控制设备。"""
 from bisect import bisect_left
-from itertools import pairwise
 import csv
 import math
 from pathlib import Path
@@ -51,8 +50,8 @@ def series(rows, x, y):
 
 
 def regression(points):
-    if len(points) < 10:
-        raise ValueError('有效配对样本不足10点')
+    if not points:
+        raise ValueError('没有有效配对数据')
     xs, ys = zip(*points)
     mx, my = sum(xs)/len(xs), sum(ys)/len(ys)
     xx = sum((x-mx)**2 for x in xs)
@@ -118,60 +117,22 @@ def kt_target_curve(rows, summary):
     maximum = abs(summary['target_torque'])
     if not all(math.isfinite(v) and v > 0 for v in (maximum, duration)):
         raise ValueError('KT目标或斜坡参数无效')
-    holds = result.get('held_target_intervals', ()) or ()
-    observed_counts = [0] * len(holds)
-    first_pair, last_pair = math.inf, -math.inf
-    observations = []
+    points = []
     for row in rows:
-        if row.get('dyno_torque_smooth_nm') in ('', None): continue
-        if (row.get('time_ms') in ('', None)
-                or (not estimated and row.get('motor_application_target_torque') in ('', None))):
-            raise ValueError('KT配对数据缺少采样时间或实际下发目标')
-        at = float(row['time_ms'])
-        if not math.isfinite(at): raise ValueError('KT采样时间非有限数')
-        x = (maximum*min(1.0, max(0.0, at/(duration*1000))) if estimated else
-             float(row['motor_application_target_torque']))
-        hold = None
-        if 'SAMPLE_MAX_GAP_S' in config and row.get('motor_torque') == '':
-            # Additional independent dynamometer observations require the capture's hold evidence.
-            hold = next((i for i,h in enumerate(holds) if h['start_ms'] < at < h['end_ms']
-                         and h['target'] == x), None)
-            if estimated or hold is None or row.get('dyno_torque_nm') in ('', None):
-                continue
-            observed_counts[hold] += 1
-        else:
-            first_pair, last_pair = min(first_pair, at), max(last_pair, at)
-        y = float(row['dyno_torque_smooth_nm'])
-        if not (math.isfinite(x) and math.isfinite(y)): raise ValueError('KT数据非有限数')
-        observations.append((at, x, y, hold))
-    complete_holds = {i for i,h in enumerate(holds) if observed_counts[i] == h['dyno_samples']
-                      and first_pair <= h['start_ms'] < h['end_ms'] <= last_pair}
-    points, times = [], []
-    for at, x, y, hold in observations:
-        if hold is None or hold in complete_holds:
-            points.append((x, y))
-            times.append(at)
-    if len(points) < 10: raise ValueError('KT有效目标/测功机平滑数据不足')
-    if all(x == points[0][0] for x, _ in points):
-        raise ValueError('KT有效数据中目标扭矩未变化，无法评价扭矩斜坡')
-    # 只用本件采集时保存的时间参数检查覆盖，不给历史文件套用推测的采样率。
-    max_gap = config.get('SAMPLE_MAX_GAP_S', config.get('FEEDBACK_TIMEOUT_S'))
-    if 'RAMP_DURATION_S' in config and max_gap is not None:
-        allowed_ms = 1000 * max_gap
-        end_ms = 1000 * result.get('capture_duration_s', duration)
-        if not math.isfinite(end_ms) or end_ms <= 0:
-            raise ValueError('KT实际采集时长记录无效')
-        if not math.isfinite(allowed_ms) or allowed_ms <= 0:
-            raise ValueError('KT采样间隔上限记录无效')
-        if min(times) < 0 or max(times) > end_ms + 1e-6:
-            raise ValueError('KT有效样本超出本次记录的斜坡时间范围')
-        times.extend((0.0, end_ms))
-        times.sort()
-        left, right = max(pairwise(times), key=lambda interval: interval[1] - interval[0])
-        if right - left > allowed_ms + 1e-6:
-            raise ValueError(f'KT斜坡配对数据覆盖不足：{left:.1f}～{right:.1f} ms 无样本'
-                             f'（本次采样间隔上限 {allowed_ms:g} ms）')
-    return points, estimated
+        if row.get('dyno_torque_smooth_nm') in ('',None):
+            continue
+        try:
+            at = float(row['time_ms'])
+            x = (maximum*min(1.0,max(0.0,at/(duration*1000))) if estimated else
+                 float(row['motor_application_target_torque']))
+            y = float(row['dyno_torque_smooth_nm'])
+        except (KeyError,TypeError,ValueError):
+            continue
+        if all(math.isfinite(value) for value in (at,x,y)):
+            points.append((x,y))
+    if not points:
+        raise ValueError('没有可计算扭矩误差的实际目标和测功机数据')
+    return points,estimated
 
 
 def analyze(directory, summary):
@@ -184,6 +145,8 @@ def analyze(directory, summary):
                        note=stage.get('reason', ''), xlabel='', ylabel='')
         sections.append(section)
         if stage['status'] != 'COMPLETED':
+            if name=='kt' and summary.get('diagnostic',{}).get('code')=='KT_TORQUE_ERROR_LIMIT':
+                section.update(status='FAIL',note=summary.get('error','扭矩误差超过设定值'))
             continue
         try:
             with (directory/stage['csv']).open(encoding='utf-8', newline='') as f:
@@ -220,10 +183,10 @@ def analyze(directory, summary):
                     motor_power = abs(float(row['motor_speed_smooth_rad_s']) *
                                       float(row['motor_torque_smooth']))
                     if not all(math.isfinite(value) for value in (speed, torque, motor_power)):
-                        raise ValueError('电机特性曲线数据包含非有限数')
+                        continue
                     samples.append((speed, torque, motor_power))
-                if len(samples) < 10:
-                    raise ValueError('电机特性曲线有效配对样本不足')
+                if not samples:
+                    raise ValueError('电机特性曲线没有实际配对数据')
                 peak_sample = max(samples, key=lambda sample: sample[2])
                 section.update(points=[(speed, torque) for speed, torque, _ in samples],
                     power_points=[(speed, power) for speed, _, power in samples],

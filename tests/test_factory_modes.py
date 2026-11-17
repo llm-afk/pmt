@@ -312,7 +312,7 @@ class DebugMonitoringTests(unittest.TestCase):
             session.start()
             try:
                 wait_for(lambda:session.connected)
-                bench.start.assert_called_once_with(rate_hz=1000,command_timeout=.25)
+                bench.start.assert_called_once_with(rate_hz=1000)
                 channel.monitor.assert_called_once()
                 channel.enable.assert_not_called()
                 channel.set_mit.assert_not_called()

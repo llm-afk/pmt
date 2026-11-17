@@ -11,7 +11,6 @@ class BenchConfig:
     sample_point: float = 75.0
     data_sample_point: float = 64.0
     rate_hz: float = 1000.0
-    command_timeout: float = 0.25
 
     def __post_init__(self):
         object.__setattr__(self, "motor_ids", tuple(self.motor_ids))
@@ -26,6 +25,6 @@ class BenchConfig:
         for value in (self.sample_point, self.data_sample_point):
             if type(value) not in (int,float) or not math.isfinite(value) or not 0 < value < 100:
                 raise ValueError("invalid sample point")
-        for value in (self.rate_hz, self.command_timeout):
+        for value in (self.rate_hz,):
             if type(value) not in (int,float) or not math.isfinite(value) or value <= 0:
-                raise ValueError("rate and timeout must be finite and positive")
+                raise ValueError("rate must be finite and positive")

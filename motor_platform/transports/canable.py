@@ -14,7 +14,6 @@ import time
 from ..core.can import CanFrame
 
 DLC_LENGTHS = (*range(9), 12, 16, 20, 24, 32, 48, 64)
-CAN_ERROR_WARNING_COUNT = 96  # Elmue GS_ErrorWarning
 PROTOCOL_ERROR_FLAGS = (
     (0x01, 'bit'), (0x02, 'form'), (0x04, 'stuff'),
     (0x08, 'bit_dominant'), (0x10, 'bit_recessive'),
@@ -128,7 +127,7 @@ class _Usb:
             raise OSError(f"short USB control transfer: {n.value}/{size}")
         return buf.raw
 
-    def transfer(self, pipe, data=None, timeout=0.1):
+    def transfer(self, pipe, data=None, timeout=1.0):
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("USB timeout must be finite and positive")
         if data is None:
@@ -381,7 +380,7 @@ class Canable:
         if not self._started:
             raise RuntimeError("CANable is not open")
         self._echo = self._echo % 255 + 1
-        self._usb.transfer(self._usb.output, encode_usb(frame, self._echo), timeout=0.1)
+        self._usb.transfer(self._usb.output, encode_usb(frame, self._echo), timeout=1.0)
 
     def recv(self, timeout=0.1):
         if not self._started:
@@ -411,7 +410,7 @@ class Canable:
                             continue
                         if self._record_transient(frame, time.perf_counter()):
                             # Bounded draining: an error-report stream must not starve
-                            # the periodic worker's feedback-age and lease checks.
+                            # the periodic worker's one-second feedback check.
                             if time.perf_counter() >= deadline:
                                 return None
                             continue
@@ -434,54 +433,25 @@ class Canable:
     def set_feedback_supervision(self, enabled):
         """Memory-only policy switch, owned by the periodic runtime.
 
-        Outside it, maintenance/OTA keeps the original strict report budget.
+        Maintenance and periodic traffic share the same CAN report budget.
         """
         if type(enabled) is not bool:
             raise ValueError('feedback supervision must be bool')
         self._feedback_supervised = enabled
 
     def _record_transient(self, frame, now):
-        # Transient bus-error notifications are not motor feedback. During
-        # periodic operation, the runtime's per-node feedback deadline decides continuity.
-        # The firmware-specific CRC ID comes from Elmue candlelight_def.h and
-        # buf_store_error(), where ERID_CRC_Error is 0x200 in legacy mode too.
+        # A CAN notification is not a lost motor reply. Maintenance and periodic
+        # control use the same rolling budget: tolerate 20 reports in one second.
+        # A real missing motor reply is independently supervised for one second.
         if not (frame.is_error and not frame.is_fd and not frame.brs
                 and not frame.is_extended and not frame.is_remote
                 and len(frame.data) == 8):
             return False
-        peak_count = max(frame.data[6:])
-        if not self._feedback_supervised and peak_count > 8:
-            return False
-        if self._feedback_supervised:
-            # Protocol/ACK/CRC and controller-state bits can share a report.
-            # Warning/passive counters describe bus health; real TPDO5s prove continuity.
-            # Buffer overflow, transceiver faults, bus-off and restart stay fatal.
-            if (not frame.can_id or frame.can_id & ~0x22C or frame.data[0]
-                    or frame.data[1] & ~0x7C or frame.data[4:6] != bytes(2)):
-                return False
-            if frame.data[1] and not frame.can_id & 0x4:
-                return False
-            kinds = []
-            if frame.can_id & 0x8:
-                if not frame.data[2]:
-                    return False
-                kinds.extend(name for mask, name in PROTOCOL_ERROR_FLAGS if frame.data[2] & mask)
-            elif frame.data[2:4] != bytes(2):
-                return False
-            if frame.can_id & 0x4:
-                kinds.append('controller')
-            if frame.can_id & 0x20:
-                kinds.append('ack')
-            if frame.can_id & 0x200:
-                kinds.append('crc')
-            kind = '+'.join(kinds)
-        elif frame.can_id == 0x200 and frame.data[:6] == bytes(6):
-            kind = 'crc'
-        elif (frame.can_id == 0x8 and frame.data[:2] == bytes(2)
-                and frame.data[2] in (2, 4) and frame.data[4:6] == bytes(2)):
-            kind = 'form' if frame.data[2] == 2 else 'stuff'
-        else:
-            return False
+        kinds = [name for mask,name in PROTOCOL_ERROR_FLAGS if frame.can_id & 0x8 and frame.data[2] & mask]
+        for mask,name in ((0x4,'controller'),(0x20,'ack'),(0x40,'bus_off'),(0x200,'crc')):
+            if frame.can_id & mask:
+                kinds.append(name)
+        kind = '+'.join(kinds) or f'can_error_0x{frame.can_id:X}'
         self.protocol_reports += 1
         self.last_protocol_report = dict(can_id=frame.can_id, data=frame.data.hex(), received_at=now,
             kind=kind, location=frame.data[3], controller_status=frame.data[1],
@@ -490,7 +460,8 @@ class Canable:
         while self._recent_protocol_reports and now-self._recent_protocol_reports[0] >= 1:
             self._recent_protocol_reports.popleft()
         self._recent_protocol_reports.append(now)
-        return self._feedback_supervised or len(self._recent_protocol_reports) < 3
+        self.last_protocol_report.update(reports_in_second=len(self._recent_protocol_reports),tolerance=20)
+        return len(self._recent_protocol_reports) <= 20
 
     def close(self):
         usb, self._usb = self._usb, None
@@ -514,5 +485,4 @@ def is_counter_report(frame, *, supervised=False):
     """
     return (frame.is_error and frame.can_id == 0 and not frame.is_fd and not frame.brs
             and not frame.is_extended and not frame.is_remote
-            and len(frame.data) == 8 and frame.data[:6] == bytes(6)
-            and (supervised or max(frame.data[6:]) < CAN_ERROR_WARNING_COUNT))
+            and len(frame.data) == 8 and frame.data[:6] == bytes(6))

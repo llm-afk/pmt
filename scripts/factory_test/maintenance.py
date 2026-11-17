@@ -360,26 +360,13 @@ class Maintenance:
         self.wait_sn(sn)
         log_event('motor.sn.verified',node_id=node,sn=sn)
 
-    def wait_temperature(self, node=None):
-        from motor_platform.runtime import start_monitoring
-        from .measurements import wait_temperature_ready
-        node = self.config.require_target_id() if node is None else node
-        with self.connect(node) as bench:
-            motor = bench.motor(node)
-            motor.disable()
-            log_event('motor.disable.ack',node_id=node,reason='temperature_preflight')
-            with bench.start() as runtime:
-                channel = runtime.motor(node)
-                start_monitoring(channel,cancelled=self.cancelled)
-                return wait_temperature_ready(channel,phase='before_calibration',cancelled=self.cancelled)
-
     def calibrate(self, node=None):
         node = self.config.require_target_id() if node is None else node
         with self.connect(node) as bench:
             motor = bench.motor(node)
-            log_event('motor.disable.request',node_id=node,reason='before_calibration')
-            motor.disable()
-            log_event('motor.disable.ack',node_id=node,reason='before_calibration')
+            motor.request_feedback()  # 0x100: position/velocity/torque/KP/KD 均为零。
+            log_event('motor.neutral.sent',node_id=node,reason='before_calibration',
+                      position=0,velocity=0,torque=0,kp=0,kd=0)
             initial = self.read(bench, node, 0x2000, 2)
             if initial & ~0x4000:
                 raise CalibrationFault(node,initial,before=True)

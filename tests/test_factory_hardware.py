@@ -10,8 +10,7 @@ from unittest.mock import Mock, patch
 from motor_platform import Bench
 from scripts.factory_test.diagnostics import DiagnosticLogs, error_details, log_scope
 from scripts.factory_test.maintenance import Maintenance
-from scripts.factory_test.measurements import (MotorTemperatureLimit, check_temperature,
-    hardware_scope, power_observer, wait_temperature_ready)
+from scripts.factory_test.measurements import check_motor_feedback, hardware_scope, power_observer
 from scripts.factory_test.station import Services
 from scripts.factory_test.station_config import StationConfig
 from tests import test_runtime as runtime_tests
@@ -22,60 +21,19 @@ def state(at=100., motor=25., driver=30.):
     return NS(received_at=at,motor_temperature=motor,board_temperature=driver,error_code=0)
 
 
-class ThermalReadinessTests(unittest.TestCase):
-    def test_hot_motor_waits_passively_then_returns_new_cooled_values(self):
-        clock=[100.];events=[]
-        motor=Mock();idle=Mock()
-        motor.state.side_effect=lambda **_:state(clock[0],90.5 if clock[0]<100.3 else 79.)
-        def wait(seconds): clock[0]+=seconds
-        with patch('scripts.factory_test.measurements.time.perf_counter',lambda:clock[0]), \
-             hardware_scope(lambda kind,value:events.append((kind,value))):
-            result=wait_temperature_ready(motor,phase='kt.preflight',wait=wait,idle=idle)
-        self.assertEqual(result.motor_temperature,79.)
-        self.assertGreaterEqual(clock[0],100.3)
-        motor.enable.assert_not_called();motor.set_mit.assert_not_called()
-        self.assertTrue(idle.called)
-        self.assertTrue(events[0][1]['waiting']);self.assertFalse(events[-1][1]['waiting'])
-        self.assertIn('90.5',events[0][1]['detail'])
+class FeedbackPolicyTests(unittest.TestCase):
+    def test_temperature_is_telemetry_and_does_not_block(self):
+        motor=Mock();motor.state.return_value=state(motor=120,driver=110)
+        motor.stats.return_value=dict(fault=None)
+        self.assertEqual(check_motor_feedback(motor)[0].motor_temperature,120)
+        motor.state.assert_called_once_with(max_age=1.)
 
-    def test_hot_wait_cancel_does_not_enable_or_mask_disconnect(self):
-        for mode in ('cancel','disconnect'):
-            with self.subTest(mode=mode):
-                clock=[0.];motor=Mock()
-                def sample(**kwargs):
-                    if mode=='disconnect' and clock[0]>=.2:raise TimeoutError('real feedback interruption')
-                    return state(clock[0],90.5)
-                motor.state.side_effect=sample
-                def wait(seconds):clock[0]+=seconds
-                with patch('scripts.factory_test.measurements.time.perf_counter',lambda:clock[0]):
-                    with self.assertRaises(InterruptedError if mode=='cancel' else TimeoutError):
-                        wait_temperature_ready(motor,phase='preflight',wait=wait,
-                            cancelled=lambda:mode=='cancel' and clock[0]>=.2)
-                motor.enable.assert_not_called();motor.set_mit.assert_not_called()
-                self.assertAlmostEqual(clock[0],.2)
-
-    def test_temperature_fault_identifies_the_sensor_and_threshold(self):
-        with self.assertRaises(MotorTemperatureLimit) as caught:
-            check_temperature(state(motor=90.5,driver=70.8))
-        error=caught.exception
-        self.assertEqual(error_details(error)['code'],'MOTOR_TEMPERATURE_LIMIT')
-        self.assertEqual(error.diagnostic_context['motor_temperature_c'],90.5)
-        self.assertEqual(error.diagnostic_context['driver_temperature_c'],70.8)
-        self.assertEqual(error.diagnostic_context['motor_limit_c'],80.)
-        self.assertIn('90.5',str(error));self.assertIn('80',str(error))
-
-    def test_calibration_preflight_sends_neutral_monitor_frames_without_enable(self):
-        class Transport(runtime_tests.Transport):
-            def open(self,*args):return self
-        transport=Transport()
-        config=StationConfig(category='HIPX',model='223',hardware_version='0223')
-        maintenance=Maintenance(config,bench_factory=lambda **_:Bench(transport=transport,motor_ids=[1]))
-        result=maintenance.wait_temperature()
-        self.assertEqual(result.motor_temperature,25.)
-        self.assertTrue(any(frame.can_id==0x101 for frame in transport.sent))
-        self.assertFalse(any(frame.can_id==0x401 for frame in transport.sent))
-        self.assertFalse(any(frame.can_id==0x601 and frame.data[1:3]==b'\x02\x20'
-                             and frame.data[4]==1 for frame in transport.sent))
+    def test_driver_fault_and_real_feedback_timeout_still_propagate(self):
+        motor=Mock();motor.state.return_value=state();motor.state.return_value.error_code=0x4400
+        motor.stats.return_value=dict(fault=None)
+        with self.assertRaisesRegex(RuntimeError,'motor fault'):check_motor_feedback(motor)
+        motor.state.side_effect=TimeoutError('no response for 1 s')
+        with self.assertRaises(TimeoutError):check_motor_feedback(motor)
 
 
 class HardwareEventTests(unittest.TestCase):
@@ -127,12 +85,18 @@ class HardwareEventTests(unittest.TestCase):
         FactoryWindow.device_state(host,'power','IN_USE','磁粉输出已关闭（回读） · 限流 0 A')
         self.assertEqual(host.write_log.call_count,2)
 
-    def test_cooling_motion_and_stop_have_distinct_worker_prompts(self):
+    def test_operator_sees_torque_error_and_no_sn_action(self):
+        from scripts.factory_test.gui import FactoryWindow
+        title,hint=FactoryWindow.failure_prompt(dict(message='误差 16.7%FS 超过设定 5%FS',
+            diagnostic={'code':'KT_TORQUE_ERROR_LIMIT'}))
+        self.assertIn('超限',title)
+        self.assertIn('16.7%FS',hint)
+        self.assertIn('不申请正式 SN',hint)
+
+    def test_motion_and_stop_have_distinct_worker_prompts(self):
         host=self.host()
         base=dict(session='piece-B',name='motor',state='IN_USE',detail='motor feedback')
-        for data,title in ((dict(waiting=True),'请等待电机冷却'),
-                           (dict(waiting=False),'温度已满足要求，继续测试'),
-                           (dict(motion=True),'电机可能转动，请勿触碰'),
+        for data,title in ((dict(motion=True),'电机可能转动，请勿触碰'),
                            (dict(stopped=True),'本项正在收尾，请等待')):
             host.events.put(('hardware_state',dict(base,**data)));host.process_events()
             self.assertEqual(host.set_prompt.call_args.args[0],title)
@@ -203,43 +167,18 @@ class MeasurementReadyOrderTests(unittest.TestCase):
                             output_dir=root,quiet=True,power_port='COM19',dyno_port='COM18')
         return events
 
-    def test_both_measurements_wait_for_cooling_before_loading_or_enable(self):
+    def test_both_measurements_start_with_hot_telemetry_without_cooling_delay(self):
         from scripts.factory_test.measurements.kt_curve import app as kt
         from scripts.factory_test.measurements.tn_curve import app as tn
         for module in (kt,tn):
             with self.subTest(module=module.__name__),tempfile.TemporaryDirectory() as root:
                 events=self.exercise(module,Path(root)/'result',cancel=False)
                 on=next(at for event,at in events if event=='load.on')
-                enable=next(at for event,at in events if event=='motor.enable')
-                self.assertGreaterEqual(on,100.3)
-                self.assertGreaterEqual(enable,on)
-                self.assertEqual(events[0][0],'off')
-                self.assertEqual(events[-1][0],'off')
+                self.assertEqual(on,100.)
+                self.assertTrue(any(event=='motor.enable' for event,_ in events))
+                self.assertEqual(events[0][0],'off');self.assertEqual(events[-1][0],'off')
 
-    def test_hot_feedback_immediately_before_enable_stops_both_measurements(self):
-        from scripts.factory_test.measurements.kt_curve import app as kt
-        from scripts.factory_test.measurements.tn_curve import app as tn
-        for module in (kt,tn):
-            with self.subTest(module=module.__name__):
-                motor=Mock();motor.state.return_value=state(motor=90.5)
-                motor.stats.return_value=dict(fault=None,recording_dropped=0)
-                with self.assertRaises(MotorTemperatureLimit):
-                    if module is kt:
-                        module.run(motor,Mock(),Mock(),NS(torque=30.),{})
-                    else:
-                        module.run(motor,Mock(),Mock(),Mock(),Mock(),Mock(),{})
-                motor.enable.assert_not_called()
-                motor.disable.assert_called_once()
 
-    def test_cancelling_either_temperature_wait_never_starts_load_or_motor(self):
-        from scripts.factory_test.measurements.kt_curve import app as kt
-        from scripts.factory_test.measurements.tn_curve import app as tn
-        for module in (kt,tn):
-            with self.subTest(module=module.__name__),tempfile.TemporaryDirectory() as root:
-                events=self.exercise(module,Path(root)/'result',cancel=True)
-                self.assertTrue(any(event=='monitor' for event,_ in events))
-                self.assertFalse(any(event in ('load.on','motor.enable','run') for event,_ in events))
-                self.assertEqual(events[-1][0],'off')
 
 
 if __name__=='__main__':

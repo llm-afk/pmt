@@ -1,4 +1,4 @@
-"""One I/O worker per CAN bus; latest-value targets, bounded control queue.
+"""One I/O worker per CAN bus; latest-value targets and queued control actions.
 
 Python/Windows scheduling is best effort. No catch-up bursts or hard real-time guarantee.
 """
@@ -48,7 +48,7 @@ class RuntimeShutdownError(RuntimeError):
 
 class MotorFeedbackTimeout(TimeoutError):
     diagnostic_code = 'MOTOR_FEEDBACK_STALE'
-    diagnostic_hint = '电机反馈超过允许间隔；核对故障快照的反馈年龄、收发数量、USB耗时、工作线程及指令租约。已停止本次测试。'
+    diagnostic_hint = '电机反馈超过允许间隔；核对故障快照的反馈年龄、收发数量、USB耗时及工作线程。已停止本次测试。'
 
     def __init__(self, message, snapshot, limit):
         super().__init__(message)
@@ -94,7 +94,7 @@ class MotorChannel:
         self._source = self._on_sent = None
         self._active = False
         self._monitoring = False
-        self._expires = self._next = 0.0
+        self._next = 0.0
         self._requests_since_feedback = 0
         self._last_rx = 0.0
         self._idle_request_at = 0.0
@@ -123,15 +123,13 @@ class MotorChannel:
             self._runtime._check()
             self._target = command
             self._source = self._on_sent = None
-            self._expires = time.perf_counter() + self._runtime.command_timeout
 
     def set_mit_source(self, source, *, on_sent=None):
         """Evaluate source(monotonic_time) on each actual periodic send.
 
         Both callbacks run on the CAN worker: keep them bounded and free of I/O.
         on_sent(sent_at, command) runs only after a successful USB write; this
-        is not proof of motor execution. Refresh this call within the normal
-        application lease. set_mit() and enable() restore constant targets.
+        is not proof of motor execution. set_mit() and enable() restore constant targets.
         Callback/command errors stop the worker and trigger its normal cleanup.
         """
         if not callable(source) or (on_sent is not None and not callable(on_sent)):
@@ -139,17 +137,16 @@ class MotorChannel:
         with self._runtime._lock:
             self._runtime._check()
             self._source, self._on_sent = source, on_sent
-            self._expires = time.perf_counter() + self._runtime.command_timeout
 
-    def enable(self, timeout=MOTOR_FEEDBACK_TIMEOUT_S):
+    def enable(self, timeout=3.0):
         """Send the neutral enabling RPDO; start periodic TX after TPDO feedback.
 
-        Resets prior target to neutral. Call set_mit after enable, then keep refreshing it.
+        Resets prior target to neutral. Call set_mit after enable, the latest target remains active until changed or stopped.
         """
         self._disable_receipt = None
         return self._runtime._call(self, True, positive(timeout))
 
-    def disable(self, timeout=0.5):
+    def disable(self, timeout=3.0):
         timeout = positive(timeout)
         try:
             result = self._runtime._call(self, False, timeout)
@@ -198,9 +195,9 @@ class MotorChannel:
                                            self.diagnostic_snapshot(), max_age)
             return state
 
-    def start_recording(self, capacity=8192):
+    def start_recording(self):
         """应用可选逐帧记录；必须在使能前调用，不改变 CAN 发送频率。"""
-        self._motor.start_recording(capacity)
+        self._motor.start_recording()
 
     def drain_states(self):
         return self._motor.drain_states()
@@ -222,8 +219,7 @@ class MotorChannel:
             feedback = self._motor.last_state
             data.update(feedback_age_ms=(now-feedback.received_at)*1000 if feedback else None,
                         last_tx_age_ms=(now-data['last_tx_at'])*1000 if data['tx_count'] else None,
-                        requests_since_feedback=self._requests_since_feedback,
-                        lease_remaining_ms=(self._expires-now)*1000 if self._active else None)
+                        requests_since_feedback=self._requests_since_feedback)
             span = data["last_tx_at"] - data["first_tx_at"]
             data.update(node_id=self.node_id, name=self.name, target_hz=self._rate_hz,
                         periodic_active=self._active or self._monitoring,
@@ -250,13 +246,13 @@ class MotorChannel:
 
 
 class ControlRuntime:
-    def __init__(self, bus, motors, rate_hz=1000, command_timeout=0.25):
-        self.rate_hz, self.command_timeout = positive(rate_hz), positive(command_timeout)
+    def __init__(self, bus, motors, rate_hz=1000):
+        self.rate_hz = positive(rate_hz)
         self._bus = bus
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._ready = threading.Event()
-        self._queue = queue.Queue(maxsize=32)
+        self._queue = queue.Queue()
         self._error = None
         self._cleanup_error = None
         self._cleanup_results = {}
@@ -321,7 +317,6 @@ class ControlRuntime:
                 with self._lock:
                     channel._target = MitCommand()
                     channel._source = channel._on_sent = None
-                    channel._expires = time.perf_counter() + self.command_timeout
                     channel._next = time.perf_counter()
                     channel._requests_since_feedback = 0
                     channel._idle_request_at = 0.0
@@ -348,23 +343,13 @@ class ControlRuntime:
             with self._lock:
                 if not (channel._active or channel._monitoring): continue
                 controlling = channel._active
-                if controlling and now >= channel._expires:
-                    channel._active = False
-                    channel._stats.fault = "application command lease expired"
-                    expired = True
-                else:
-                    expired = False
-                    waiting_since = max(channel._last_rx, channel._idle_request_at)
-                    if channel._requests_since_feedback and now - waiting_since >= MOTOR_FEEDBACK_TIMEOUT_S:
-                        raise MotorFeedbackTimeout(f"{channel.name}: no valid motor feedback for 1 s",
-                                                   channel.diagnostic_snapshot(), MOTOR_FEEDBACK_TIMEOUT_S)
-                    if now < channel._next: continue
-                    target, due, period = channel._target, channel._next, 1/channel._rate_hz
-                    source, on_sent = (channel._source, channel._on_sent) if controlling else (None, None)
-            if expired:
-                # Do not wait for an ACK while other motors have scheduled traffic.
-                channel._motor.disable(wait_ack=False)
-                continue
+                waiting_since = max(channel._last_rx, channel._idle_request_at)
+                if channel._requests_since_feedback and now - waiting_since >= MOTOR_FEEDBACK_TIMEOUT_S:
+                    raise MotorFeedbackTimeout(f"{channel.name}: no valid motor feedback for 1 s",
+                                               channel.diagnostic_snapshot(), MOTOR_FEEDBACK_TIMEOUT_S)
+                if now < channel._next: continue
+                target, due, period = channel._target, channel._next, 1/channel._rate_hz
+                source, on_sent = (channel._source, channel._on_sent) if controlling else (None, None)
             generated = time.perf_counter()
             if source is not None:
                 target = source(generated)
@@ -421,7 +406,7 @@ class ControlRuntime:
                     else: future.set_result(None)
                 self._tick(time.perf_counter())
                 with self._lock:
-                    deadlines = [min(c._next,c._expires) if c._active else c._next
+                    deadlines = [c._next
                                  for c in self._channels.values() if c._active or c._monitoring]
                 remaining = min(0.005, max(0.000001, min(deadlines)-time.perf_counter())) if deadlines else 0.005
                 poll_started = self._poll_started = time.perf_counter()
@@ -451,7 +436,7 @@ class ControlRuntime:
                 with self._lock: channel._active = channel._monitoring = False
                 if channel.node_id in self._touched:
                     try:
-                        channel._motor.disable(timeout=0.1)
+                        channel._motor.disable(timeout=3.0)
                         self._cleanup_results[channel.node_id] = dict(confirmed=True, confirmed_at=time.perf_counter())
                     except BaseException as exc:
                         self._cleanup_results[channel.node_id] = dict(confirmed=False, error=repr(exc))

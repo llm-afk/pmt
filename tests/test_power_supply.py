@@ -66,8 +66,8 @@ class PowerSupplyTests(unittest.TestCase):
         self.power.remote()
         self.power.local()
         self.assertEqual(self.stream.writes[1:], [
-            b'SOUR:VOLT 12.34\n', b'VOLT?\n', b'SOUR:CURR 1.234\n', b'CURR?\n',
-            b'OUTP ON\n', b'OUTP?\n', b'OUTP OFF\n', b'OUTP?\n',
+            b'SOUR:VOLT 12.34\n', b'VOLT?\n', b'VOLT?\n', b'SOUR:CURR 1.234\n', b'CURR?\n', b'CURR?\n',
+            b'OUTP ON\n', b'OUTP?\n', b'OUTP?\n', b'OUTP OFF\n', b'OUTP?\n', b'OUTP?\n',
             b'SOUR:VOLT:PROT 13.00\n', b'SOUR:CURR:PROT 2.000\n', b'SYST:REM\n', b'SYST:LOC\n'])
 
     def test_state_is_fresh_and_mode_is_not_cached(self):
@@ -95,6 +95,14 @@ class PowerSupplyTests(unittest.TestCase):
             self.power.set_voltage(20)
         with self.assertRaises(PowerSupplyError):
             self.power.enable()
+
+    def test_output_transition_uses_repeated_readback_without_replaying_on(self):
+        self.power.open()
+        replies=iter((b'OFF\n',b'ON\n',b'OFF\n',b'ON\n',b'ON\n'))
+        self.stream.read_until=lambda *args:next(replies)
+        self.assertTrue(self.power.enable())
+        self.assertEqual(self.stream.writes.count(b'OUTP ON\n'),1)
+        self.assertEqual(self.stream.writes.count(b'OUTP?\n'),5)
 
     def test_wrong_device_releases_serial(self):
         self.stream.replies[b'*IDN?\n'] = b'OTHER DEVICE\n'

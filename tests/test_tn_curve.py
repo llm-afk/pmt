@@ -17,7 +17,7 @@ class CurveTests(unittest.TestCase):
             self.assertEqual(values[-1], 1.0)
             increments = [round(b-a, 3) for a,b in zip(values, values[1:])]
             self.assertEqual(set(increments), {.012, .013})
-            self.assertEqual(app.load_target(10000), app.MAX_CURRENT_A)
+            self.assertEqual(app.load_target(10000),125.)
     def test_load_period_includes_serial_transaction(self):
         power = Mock()
         power.set_current.return_value = .01
@@ -78,18 +78,11 @@ class CurveTests(unittest.TestCase):
         self.assertFalse(p.update(state(4.02, 0)))
         self.assertTrue(p.update(state(4.101, 0)))
 
-    def test_feedback_gap_cannot_complete_settle_or_bridge_a_stall(self):
-        progress = app.Progress(0)
-        for i in range(61):
-            self.assertFalse(progress.update(state(i * .01, 8)))
-        self.assertFalse(progress.update(state(1.2, 8)))
-        for i in range(1, 100):
-            self.assertFalse(progress.update(state(1.2 + i * .01, 8)))
-        self.assertTrue(progress.update(state(2.201, 8)))
-        progress.loading_at = 2.201
-        for t in (2.21, 2.27, 2.8, 2.86):
-            self.assertFalse(progress.update(state(t, 0)))
-        self.assertTrue(progress.update(state(2.91, 0)))
+    def test_feedback_gap_does_not_restart_settle_but_cached_frames_are_not_new(self):
+        progress=app.Progress(0)
+        self.assertFalse(progress.update(state(.6,8)))
+        self.assertTrue(progress.update(state(1.2,8)))
+        self.assertFalse(progress.update(state(1.2,8)))
 
     def test_cached_feedback_does_not_advance_hold(self):
         p = app.Progress(0)
@@ -110,7 +103,7 @@ class CurveTests(unittest.TestCase):
         with patch.object(app, 'TORQUE_FF', None):
             with self.assertRaises(ValueError): app.validate()
 
-    def test_sparse_feedback_bounds_both_preparation_phases(self):
+    def test_sparse_feedback_does_not_freeze_preparation_ramp(self):
         for phase, continuous_until in (('扭矩爬升', 0.), ('最大扭矩保持', .1)):
             with self.subTest(phase=phase):
                 clock, last, summary = [0.], [0.], {}
@@ -128,19 +121,20 @@ class CurveTests(unittest.TestCase):
                 dyno.drain.return_value = []
                 dyno.state.return_value = SimpleNamespace(torque=0., speed=0., power=0.)
                 ui.poll.side_effect = lambda: 'quit' if clock[0] >= 2. else None
+                power.set_current.side_effect=lambda value:value
+                pool.submit.side_effect=lambda fn,*args:SimpleNamespace(done=lambda:True,result=lambda:fn(*args))
                 def sleep(_):
                     clock[0] += .01
                 with patch.object(app.time, 'perf_counter', lambda: clock[0]), patch.object(app.time, 'sleep', sleep), \
-                     patch.object(app, 'TEST_TIMEOUT_S', 1.), patch.object(app, 'TORQUE_RAMP_S', .03), \
+                     patch.object(app, 'TORQUE_RAMP_S', .03), \
                      patch.object(app, 'STOP_TORQUE_RAMP_S', .01):
                     reason = app.run(motor, dyno, power, pool, ui, Mock(), summary)
-                self.assertIn('准备超时', reason)
-                self.assertEqual(summary['reason_code'], 'TN_PREPARE_TIMEOUT')
-                self.assertEqual(summary['prepare_phase'], phase)
-                self.assertIsNone(summary['loading_at'])
+                self.assertEqual(reason,'operator_stop')
+                self.assertEqual(summary['termination'],'operator_stop')
+                self.assertIsNotNone(summary['loading_at'])
                 self.assertTrue(summary['controlled_stop_completed'])
-                self.assertLess(summary['prepare_elapsed_s'], 1.02)
-                pool.submit.assert_not_called()
+                self.assertNotIn('TN_PREPARE_TIMEOUT',summary.get('reason_code',''))
+                self.assertTrue(pool.submit.called)
                 motor.disable.assert_called_once()
                 power.disable.assert_called_once()
 
@@ -178,8 +172,46 @@ class CurveTests(unittest.TestCase):
              patch.object(app, 'STALL_HOLD_S', .003), ThreadPoolExecutor(max_workers=1) as pool:
             reason = app.run(motor, dyno, power, pool, ui, Mock(), summary)
         self.assertEqual(reason, 'stall_confirmed')
+        self.assertEqual(summary['termination'],'normal_end')
+        self.assertEqual(summary['end_condition']['name'],'sustained_low_speed')
         motor.disable.assert_called_once()
         self.assertEqual(power.set_current.call_args_list[0].args, (app.load_target(1),))
+        power.disable.assert_called_once()
+
+    def test_long_loading_above_five_amps_still_ends_at_normal_low_speed_condition(self):
+        # Virtual clock and fake devices: verify the test endpoint, not physical ratings.
+        from concurrent.futures import Future
+        clock=[0.];last=[None]
+        motor=Mock(node_id=1)
+        motor.stats.return_value={'fault':None,'actual_tx_hz':1000}
+        def feedback(**_):
+            last[0]=SimpleNamespace(received_at=clock[0],velocity=10. if clock[0]<130. else 0.,
+                torque=30.,motor_temperature=100.,board_temperature=90.,error_code=0)
+            return last[0]
+        motor.state.side_effect=feedback
+        motor.drain_states.side_effect=lambda:[] if last[0] is None else [last[0]]
+        dyno=Mock()
+        dyno.stats.return_value={'dropped_samples':0}
+        dyno.state.return_value=SimpleNamespace(torque=30.,speed=10.,power=300.)
+        dyno.drain.side_effect=lambda:[SimpleNamespace(received_at=clock[0],torque=30.,speed=10.,power=300.)]
+        power=Mock();power.set_current.side_effect=lambda value:value
+        def submit(fn,*args):
+            task=Future();task.set_result(fn(*args));return task
+        pool=SimpleNamespace(submit=submit)
+        ui=SimpleNamespace(poll=lambda:None,app=SimpleNamespace(invalidate=lambda:None))
+        writer=SimpleNamespace(writerow=lambda row:None)
+        summary={}
+        with patch.object(app.time,'perf_counter',lambda:clock[0]),patch.object(app.time,'sleep',lambda dt:clock.__setitem__(0,clock[0]+.01)),patch.object(app,'CURRENT_STEP_S',1.),patch.object(app,'CURRENT_STEP_A',.05),patch.object(app,'STOP_TORQUE_RAMP_S',.01):
+            reason=app.run(motor,dyno,power,pool,ui,writer,summary)
+        self.assertEqual(reason,'stall_confirmed')
+        self.assertEqual(summary['termination'],'normal_end')
+        self.assertGreater(summary['end_condition']['confirmed_feedback_at'],130.)
+        self.assertGreater(summary['end_condition']['last_confirmed_load_current_a'],5.)
+        self.assertEqual(summary['end_condition']['speed_threshold_rad_s'],.5)
+        self.assertEqual(summary['end_condition']['hold_s'],.1)
+        self.assertGreater(summary['rows'],100)
+        self.assertEqual(motor.set_mit.call_args.args[0].torque,0.)
+        motor.disable.assert_called_once()
         power.disable.assert_called_once()
 
     def test_motor_error_preserved_when_disable_fails(self):

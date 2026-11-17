@@ -13,7 +13,7 @@ class RuntimeSourceTests(unittest.TestCase):
         bus = MotorBus(transport)
         runtime = ControlRuntime(bus, {'J1': bus.motor(1)}, rate_hz=1000)
         channel = runtime.motor('J1')
-        channel._active, channel._expires, channel._next = True, 10, 1
+        channel._active, channel._next = True, 1
         return transport, runtime, channel
 
     def test_source_uses_current_time_and_observer_only_follows_successful_write(self):
@@ -61,13 +61,11 @@ class RuntimeSourceTests(unittest.TestCase):
         self.assertEqual(len(tr.sent), 3)
 
     def test_source_is_not_evaluated_when_inactive_expired_or_monitoring(self):
-        for mode in ('inactive', 'expired', 'monitoring'):
+        for mode in ('inactive', 'monitoring'):
             tr, rt, channel = self.prepare()
             channel._source = lambda now: self.fail('source should not run')
             if mode == 'inactive':
                 channel._active = False
-            elif mode == 'expired':
-                channel._expires = .9
             else:
                 channel._active=False
                 channel._monitoring=True

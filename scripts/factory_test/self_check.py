@@ -290,7 +290,7 @@ def check_debug_monitor():
         def close(self): pass
     peer=Peer()
     bus=MotorBus(peer)
-    runtime=ControlRuntime(bus,{3:bus.motor(3)},rate_hz=1000,command_timeout=.025).start()
+    runtime=ControlRuntime(bus,{3:bus.motor(3)},rate_hz=1000).start()
     try:
         channel=runtime.motor(3)
         channel.set_mit(MitCommand(torque=8,kp=20))
@@ -628,7 +628,12 @@ def run(destination):
             window.hardware_changed('D')
             assert window.config.hardware_version==previous_hardware
             assert window.apply_config(commit_services=True) is True
-            assert window.config.hardware_version == '0132' and window.config.torque == 50
+            assert window.config.hardware_version == '0132' and window.config.torque == 30
+            window.vars['kt_error_limit_pct'].set('7.5')
+            assert window.apply_config(commit_services=True) is True
+            assert window.config.kt_error_limit_pct == load_config(config_path).kt_error_limit_pct == 7.5
+            window.vars['kt_error_limit_pct'].set('5')
+            assert window.apply_config(commit_services=True) is True
             assert window.hardware_vars['B'].get() == '1'
             assert load_config(config_path).hardware_version == '0132'
             previous = asdict(window.config)
@@ -654,7 +659,7 @@ def run(destination):
             window.hardware_vars['A'].set('1')
             window.hardware_vars['D'].set('3')
             assert window.apply_config(commit_services=True) is True and window.config.hardware_version == '1133'
-            assert window.config.test_profile_available and window.config.torque==50  # A/D are revisions, not a whitelist.
+            assert window.config.test_profile_available and window.config.torque==30  # A/D are revisions, not a whitelist.
             window.vars['project'].set('c2')
             window.vars['category'].set(config.category)
             window.vars['subcategory'].set(config.subcategory)

@@ -74,20 +74,22 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaises(ValueError): hardware_parts(invalid)
 
     def test_revision_numbers_are_not_a_test_profile_whitelist(self):
-        for value,torque in (('0112',30),('0222',30),('0132',50),('0142',50),('0223',30),('9229',30)):
+        for value,torque in (('0112',30),('0222',30),('0132',30),('0142',30),('0223',30),('9229',30)):
             config=StationConfig(hardware_version=value,model=value[1:])
             config.validate()
             self.assertEqual(config.torque,torque)
 
-    def test_known_hardware_without_test_profile_is_remembered_but_cannot_run(self):
-        config=StationConfig(hardware_version='0151',model='151')
+    def test_all_hardware_combinations_use_the_current_30_nm_profile(self):
+        for hardware in ('0151','0269','0999','1111'):
+            config=StationConfig(hardware_version=hardware,model=hardware[1:])
+            config.validate()
+            self.assertTrue(config.test_profile_available)
+            self.assertEqual(config.torque,30.)
         with tempfile.TemporaryDirectory() as folder:
             path=Path(folder)/'station.json'
+            config=StationConfig(kt_error_limit_pct=8.5)
             save_config(config,path)
-            self.assertEqual(load_config(path).hardware_version,'0151')
-            self.assertFalse(config.test_profile_available)
-            with self.assertRaisesRegex(ValueError,'产测参数'): config.validate(live=True)
-            with self.assertRaisesRegex(ValueError,'产测参数'): _=config.torque
+            self.assertEqual(load_config(path).kt_error_limit_pct,8.5)
 
     def test_load_derives_legacy_model_from_single_hardware_field(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -384,13 +386,15 @@ class MaintenanceTests(unittest.TestCase):
                          [0x2000,0x205B,0x2044])
         snapshot=next(call.kwargs for call in log.call_args_list if call.args[0]=='motor.settings.snapshot')
         self.assertEqual(snapshot['settings']['torque_limit_nm']['value'],30.)
-        self.assertEqual(motor.disable.call_count,2)
+        self.assertEqual(motor.disable.call_count,1)
+        motor.request_feedback.assert_called_once_with()
 
     def test_optional_settings_read_failure_does_not_undo_confirmed_calibration(self):
         maintenance,motor,_=self.calibration_fixture([0,0,0,0,0,1,0,1,SdoError('unsupported')])
         with patch('scripts.factory_test.maintenance.log_event') as log:
             maintenance.calibrate()
-        self.assertEqual(motor.disable.call_count,2)
+        self.assertEqual(motor.disable.call_count,1)
+        motor.request_feedback.assert_called_once_with()
         self.assertTrue(any(call.args[0]=='motor.settings.unavailable' for call in log.call_args_list))
         self.assertEqual(maintenance.write.call_count,2)
 
@@ -440,7 +444,7 @@ class ProductionLoadTests(unittest.TestCase):
             service.firmware(1,'incoming')
             service.calibrate()
         self.assertEqual(events.count('OUTP OFF'),2)
-        self.assertEqual(events.count('OUTP?'),2)
+        self.assertEqual(events.count('OUTP?'),4)
         self.assertEqual(events.count('load.closed'),2)
         first,second = [i for i,value in enumerate(events) if value=='OUTP OFF']
         self.assertLess(first,events.index('OUTP?'))
@@ -459,7 +463,7 @@ class ProductionLoadTests(unittest.TestCase):
                 with patch('scripts.factory_test.station.PowerSupply',side_effect=factory), \
                      patch('scripts.factory_test.firmware.check_firmware') as firmware, \
                      patch('motor_platform.transports.serial_scpi.time.sleep'):
-                    with self.assertRaisesRegex(RuntimeError,'output readback'):
+                    with self.assertRaisesRegex(RuntimeError,'readback'):
                         service.firmware(1,'incoming') if operation=='firmware' else service.calibrate()
                 firmware.assert_not_called();service.motor.calibrate.assert_not_called()
                 self.assertNotIn('OUTP ON',events)
@@ -475,7 +479,7 @@ class ProductionLoadTests(unittest.TestCase):
             try:
                 raise RuntimeError('original calibration error')
             except RuntimeError:
-                with self.assertRaisesRegex(LoadOutputUnconfirmed,'output readback'):
+                with self.assertRaisesRegex(LoadOutputUnconfirmed,'readback'):
                     service.abort()
         self.assertFalse(any(call.args[0]=='load.off.confirmed' for call in target.event.call_args_list))
         self.assertIn('OUTP OFF',events)

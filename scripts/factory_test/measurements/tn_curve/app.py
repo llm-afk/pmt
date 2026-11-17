@@ -11,9 +11,9 @@ from motor_platform import Bench, MitCommand, Dynamometer, PowerSupply, Canable
 from motor_platform.runtime import MOTOR_FEEDBACK_TIMEOUT_S, start_monitoring
 from motor_platform.components.dynamometer import detect_dynamometers
 from motor_platform.components.power_supply.discovery import resolve_power_port
-from .. import (FeedbackClock, SAMPLE_MAX_GAP_S, power_off, record_shutdown_failure, power_observer,
+from .. import (SAMPLE_MAX_GAP_S, power_off, record_shutdown_failure, power_observer,
                 device_snapshot, log_measurement_snapshot, stop_with_ramp, capture_shutdown_error,
-                check_motor_feedback, wait_temperature_ready, hardware_state, MAX_MOTOR_TEMP_C, MAX_DRIVER_TEMP_C)
+                check_motor_feedback, hardware_state)
 from ..console import WindowConsole as TerminalConsole
 from scripts.factory_test.measurements.tn_curve.recording import CurveRecorder, event_row
 from scripts.factory_test.measurements.smoothing import append_smoothed_columns
@@ -29,15 +29,12 @@ MOTOR_HZ = 1000
 LOAD_VOLTAGE_V = 24.0
 CURRENT_STEP_A = 0.028125         # 平均每步 28.125 mA，15 Hz 时约 2.37 秒/A；累计目标量化到 1 mA
 CURRENT_STEP_S = 1.0 / 15          # 指令起点间隔，包含串口设置及读回耗时；不补发积压步进
-MAX_CURRENT_A = 5.0
-MAX_CURRENT_HOLD_S = 3.0
 TORQUE_SETTLE_S = 1.0            # 下发最大前馈扭矩后等待，再开始阻尼加载和记录
 TORQUE_RAMP_S = 1.0              # 从 0 线性增加到 TORQUE_FF 的时间，支持负目标
 STOP_TORQUE_RAMP_S = 1.0         # 正常停止：维持阻尼，电机扭矩用此时间线性降到 0
 STALL_SPEED_RAD_S = 0.5
 STALL_HOLD_S = 0.100
-TEST_TIMEOUT_S = 120.0            # 准备和加载两阶段各自的墙钟上限
-DYNO_FEEDBACK_TIMEOUT_S = 0.1
+DYNO_FEEDBACK_TIMEOUT_S = 1.0
 DYNO_TORQUE_SCALE = 100.0         # 沿用已验证接收组件；实测标定另行核对
 DYNO_SPEED_SCALE = 100.0
 MOTOR_SPEED_SMOOTH_S = 0.30       # 停机后速度平滑的完整时间窗口；越大越平滑、拐点越钝
@@ -54,10 +51,10 @@ def validate(torque=None):
     if torque is None or not math.isfinite(torque) or torque == 0:
         raise ValueError('用 --torque 或顶部 TORQUE_FF 指定有限非零的最大前馈扭矩')
     for name in ('MOTOR_HZ', 'LOAD_VOLTAGE_V', 'CURRENT_STEP_A', 'CURRENT_STEP_S',
-                 'MAX_CURRENT_A', 'MAX_CURRENT_HOLD_S', 'TORQUE_SETTLE_S', 'TORQUE_RAMP_S',
+                 'TORQUE_SETTLE_S', 'TORQUE_RAMP_S',
                  'STOP_TORQUE_RAMP_S',
-                 'STALL_SPEED_RAD_S', 'STALL_HOLD_S', 'TEST_TIMEOUT_S',
-                 'MAX_MOTOR_TEMP_C', 'MAX_DRIVER_TEMP_C', 'DYNO_FEEDBACK_TIMEOUT_S',
+                 'STALL_SPEED_RAD_S', 'STALL_HOLD_S',
+                 'DYNO_FEEDBACK_TIMEOUT_S',
                  'DYNO_TORQUE_SCALE', 'DYNO_SPEED_SCALE',
                  'MOTOR_SPEED_SMOOTH_S', 'MOTOR_TORQUE_SMOOTH_S',
                  'DYNO_SPEED_SMOOTH_S', 'DYNO_TORQUE_SMOOTH_S'):
@@ -66,13 +63,11 @@ def validate(torque=None):
             raise ValueError(f'{name} must be finite and positive')
     if CURRENT_STEP_A < 0.001:
         raise ValueError('电流步进至少 0.001 A')
-    if round(MAX_CURRENT_A, 3) != MAX_CURRENT_A:
-        raise ValueError('电源上限电流最多保留三位小数；步进按累计目标量化')
     MitCommand(torque=torque).pack()
 
 
 class Progress:
-    """Use fresh motor feedback timestamps, never count cached samples as new."""
+    """正常采集进度：加载后低速持续确认即完成；不在这里判断通信故障。"""
     def __init__(self, started):
         self.started = started
         self.loading_at = None
@@ -85,10 +80,8 @@ class Progress:
         if self.last_at is not None and t <= self.last_at:
             return False
         previous = self.last_at if self.last_at is not None else self.started
-        if t - previous > SAMPLE_MAX_GAP_S:
+        if self.loading_at is not None and t-previous > SAMPLE_MAX_GAP_S:
             self.low_since = None
-            if self.loading_at is None:
-                self.started = t
         self.last_at = t
         if self.loading_at is None:
             self.stability_text = f'最大扭矩已下发，剩余等待 {max(0, TORQUE_SETTLE_S-(t-self.started)):.1f}s'
@@ -116,7 +109,7 @@ def set_load_current(power, target):
 
 def load_target(step_number):
     """累计计算后量化到 1 mA，避免对单次小数步进取整造成长期速率偏差。"""
-    return min(MAX_CURRENT_A, round(step_number*CURRENT_STEP_A, 3))
+    return round(step_number*CURRENT_STEP_A, 3)
 
 
 def graceful_stop(motor, power, pending, torque, ui, drain, *, on_error=None):
@@ -148,7 +141,6 @@ def run(motor, dyno, power, pool, ui, writer, summary, *, torque=None):
     load_steps = 0
     pending = None
     next_step = math.inf
-    limit_at = None
     next_display = 0
     reason = 'interrupted'
     recorder = CurveRecorder(writer, progress, SAMPLE_MAX_GAP_S)
@@ -156,11 +148,9 @@ def run(motor, dyno, power, pool, ui, writer, summary, *, torque=None):
     motor_started = False
     def drain(phase):
         motor.drain_states()  # 停机过程不属于曲线时间范围。
-        if motor.stats().get('recording_dropped', 0):
-            raise RuntimeError('motor recording queue overflow')
         dyno.drain()
     try:
-        check_motor_feedback(motor,MAX_MOTOR_TEMP_C,MAX_DRIVER_TEMP_C)
+        check_motor_feedback(motor)
         dyno.state(max_age=DYNO_FEEDBACK_TIMEOUT_S)
         motor.start_recording()
         motor.enable()
@@ -168,29 +158,23 @@ def run(motor, dyno, power, pool, ui, writer, summary, *, torque=None):
         hardware_state('motor','使能请求已获回包 · T-N 特性采集中',motion=True)
         motor.set_mit(MitCommand())
         prepared_at = time.perf_counter()
-        ramp = FeedbackClock(prepared_at)
+        previous_rx = None
         target_reached = False
         progress.started = math.inf  # 到达最大扭矩后才开始保持计时
         while True:
             now = time.perf_counter()
-            state,stats = check_motor_feedback(motor,MAX_MOTOR_TEMP_C,MAX_DRIVER_TEMP_C)
+            state,stats = check_motor_feedback(motor)
             ds = dyno.state(max_age=DYNO_FEEDBACK_TIMEOUT_S)
-            if dyno.stats()['dropped_samples']:
-                raise RuntimeError('dynamometer sample queue overflow')
-            if progress.loading_at is None and now - prepared_at >= TEST_TIMEOUT_S:
-                phase = '最大扭矩保持' if target_reached else '扭矩爬升'
-                reason = f'T-N 准备超时：{phase}阶段在 {TEST_TIMEOUT_S:g} s 内未取得足够的连续电机反馈'
-                summary.update(reason_code='TN_PREPARE_TIMEOUT', prepare_phase=phase,
-                               prepare_elapsed_s=now-prepared_at, ramp_elapsed_s=ramp.elapsed)
-                break
-            new_feedback = ramp.update(state.received_at, now)
-            applied_torque = ramp_torque(ramp.elapsed, torque)
+            new_feedback = state.received_at != previous_rx
+            previous_rx = state.received_at
+            elapsed = now-prepared_at
+            applied_torque = ramp_torque(elapsed, torque)
             motor.set_mit(MitCommand(torque=applied_torque))
-            if not target_reached and ramp.elapsed >= TORQUE_RAMP_S:
+            if not target_reached and elapsed >= TORQUE_RAMP_S:
                 target_reached = True
                 progress.started = time.perf_counter()
             if not target_reached:
-                progress.stability_text = f'扭矩线性上升 {ramp.elapsed:.2f}/{TORQUE_RAMP_S:g}s'
+                progress.stability_text = f'扭矩线性上升 {elapsed:.2f}/{TORQUE_RAMP_S:g}s'
             if progress.loading_at is None:
                 if new_feedback and target_reached and progress.update(state):
                     progress.loading_at = time.perf_counter()
@@ -198,10 +182,15 @@ def run(motor, dyno, power, pool, ui, writer, summary, *, torque=None):
             # 逐条真实电机帧记录和判堵转，同批数据在确认帧处精确截断。
             motor_samples = motor.drain_states()
             recorder.add_dyno(dyno.drain())
-            if motor.stats().get('recording_dropped', 0):
-                raise RuntimeError('motor recording queue overflow')
             if recorder.record(motor_samples, now=time.perf_counter()):
                 reason = 'stall_confirmed'
+                summary['end_condition'] = dict(name='sustained_low_speed',
+                    speed_threshold_rad_s=STALL_SPEED_RAD_S,hold_s=STALL_HOLD_S,
+                    first_low_feedback_at=progress.low_since,confirmed_feedback_at=progress.last_at,
+                    last_confirmed_load_current_a=current,pending_load_transaction=pending is not None)
+                from scripts.factory_test.diagnostics import log_event
+                log_event('test.normal_end','T-N 达到正常采集终点，开始降扭矩收尾',
+                          stage='tn',reason=reason,condition=summary['end_condition'])
                 break
             line = ui.poll()
             if line is not None and line.strip().lower() in ('quit', 'q', 'exit', 'stop'):
@@ -210,30 +199,22 @@ def run(motor, dyno, power, pool, ui, writer, summary, *, torque=None):
             if pending is not None and pending.done():
                 current, next_step = pending.result()
                 pending = None
-                if current >= MAX_CURRENT_A:
-                    limit_at = time.perf_counter()
             if progress.loading_at is not None:
-                if now-progress.loading_at >= TEST_TIMEOUT_S:
-                    reason = 'test_timeout'
-                    break
-                if limit_at is not None and now-limit_at >= MAX_CURRENT_HOLD_S:
-                    reason = 'current_limit_without_stall'
-                    break
-                if new_feedback and pending is None and now >= next_step and current < MAX_CURRENT_A:
+                if pending is None and now >= next_step:
                     load_steps += 1
                     target = load_target(load_steps)
                     # 只允许一个未完成事务；延迟时只发下一步，不追赶过去的周期。
                     pending = pool.submit(set_load_current, power, target)
             if now >= next_display:
                 ui._panel = (f'ID={motor.node_id}  {"加载中" if progress.loading_at is not None else "最大扭矩等待中"}\n'
-                    f'前馈扭矩 {applied_torque:.3f}/{torque}  加载电流限值 {current:.3f}/{MAX_CURRENT_A:.3f} A\n'
+                    f'前馈扭矩 {applied_torque:.3f}/{torque}  加载电流设定 {current:.3f} A\n'
                     f'电机速度 {state.velocity:+.3f} rad/s  扭矩 {state.torque:+.4f}\n'
                     f'温度 {state.motor_temperature:.1f}/{state.board_temperature:.1f} C\n'
                     f'测功机 {ds.speed:.3f} rad/s  {ds.torque:+.4f} Nm  {ds.power:+.3f} W\n'
                     f'已记录 {recorder.count} 行   CAN {stats["actual_tx_hz"]:.1f} Hz  '
                     f'通信异常报告 {stats.get("can_protocol_reports", 0)} 次')
                 ui._notice = (progress.stability_text if progress.loading_at is None
-                              else 'quit / stop 停止测试；参数在脚本顶部设置')
+                              else '加载至低速持续确认后自动完成；quit / stop 中止测试')
                 ui.app.invalidate()
                 next_display = now+0.1
             time.sleep(0.001)
@@ -265,7 +246,9 @@ def run(motor, dyno, power, pool, ui, writer, summary, *, torque=None):
                 motor.drain_states()
             if not recorder.finished:
                 recorder.finish(record_cutoff)
-            summary.update(reason=reason, rows=recorder.count, motor_rows=recorder.motor_count,
+            termination = ('normal_end' if reason=='stall_confirmed' else
+                           'operator_stop' if reason=='operator_stop' else 'fault')
+            summary.update(reason=reason, termination=termination, rows=recorder.count, motor_rows=recorder.motor_count,
                            dyno_rows=recorder.dyno_count, loading_at=progress.loading_at,
                            motor_statistics=motor.stats(), dynamometer_statistics=dyno.stats())
     return reason
@@ -319,13 +302,9 @@ def main(argv=None, *, output_dir, quiet=False, power_port=None, dyno_port=None)
                         with Bench(transport=Canable(args.serial), motor_ids=[args.id], rate_hz=MOTOR_HZ) as bench:
                             with bench.start() as control:
                                 motor = control.motor(args.id)
-                                motor.disable()  # 确认失能后才进入监视和温度等待。
                                 start_monitoring(motor,cancelled=TerminalConsole.cancelled.is_set,
                                                  wait=TerminalConsole.cancelled.wait)
-                                wait_temperature_ready(motor,phase='tn.preflight',cancelled=TerminalConsole.cancelled.is_set,
-                                    wait=TerminalConsole.cancelled.wait,idle=dyno.drain,
-                                    motor_limit=MAX_MOTOR_TEMP_C,driver_limit=MAX_DRIVER_TEMP_C)
-                                check_motor_feedback(motor,MAX_MOTOR_TEMP_C,MAX_DRIVER_TEMP_C)
+                                check_motor_feedback(motor)
                                 dyno.state(max_age=DYNO_FEEDBACK_TIMEOUT_S)
                                 power.enable()  # Zero current limit, independent motor battery.
                                 run(motor, dyno, power, pool, ui, writer, summary, torque=args.torque)

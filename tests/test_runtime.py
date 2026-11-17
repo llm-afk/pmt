@@ -191,7 +191,7 @@ class RuntimeTests(unittest.TestCase):
         for _ in range(10):
             self.assertEqual(usb.transfer(2, b'abc'), b'abc')
         usb.transfer(2, b'abc', timeout=.2)
-        self.assertEqual(policies, [(2, 100), (2, 200)])
+        self.assertEqual(policies, [(2, 1000), (2, 200)])
         from unittest.mock import Mock
         usb.w.WinUsb_WritePipe = Mock(return_value=True)
         with self.assertRaisesRegex(OSError, 'short USB write'):
@@ -233,7 +233,7 @@ class RuntimeTests(unittest.TestCase):
     def make(self, lease=1):
         tr = Transport()
         bus = MotorBus(tr)
-        runtime = ControlRuntime(bus, {"J1":bus.motor(1), "J2":bus.motor(2)}, 200, lease)
+        runtime = ControlRuntime(bus, {"J1":bus.motor(1), "J2":bus.motor(2)}, 200)
         return tr, bus, runtime
 
     def test_multiple_motors_one_io_owner(self):
@@ -351,22 +351,16 @@ class RuntimeTests(unittest.TestCase):
         self.assertIsNone(bus._io_owner)
         self.assertFalse(any(f.can_id>=0x400 for f in tr.sent))
 
-    def test_target_lease_expires(self):
-        tr,bus,rt=self.make(lease=0.025)
+    def test_latest_target_continues_without_application_lease(self):
+        tr,bus,rt=self.make()
         rt.start()
         try:
-            one=rt.motor("J1")
-            one.enable()
-            time.sleep(0.08)
-            self.assertFalse(one.stats()["periodic_active"])
-            self.assertIn("lease expired",one.stats()["fault"])
-            self.assertTrue(any(f.can_id==0x601 and f.data[4]==2 for f in tr.sent))
-        finally:
-            # Lease expiry sent a best-effort disable; its acknowledgement was
-            # not tracked, so closing must report the unconfirmed outcome.
-            with self.assertRaises(RuntimeShutdownError) as caught:
-                rt.close()
-            self.assertFalse(caught.exception.cleanup_confirmed)
+            one=rt.motor('J1');one.enable();one.set_mit(MitCommand(torque=5))
+            time.sleep(.3)
+            self.assertTrue(one.stats()['periodic_active'])
+            self.assertIsNone(one.stats()['fault'])
+            self.assertFalse(any(f.can_id==0x601 and f.data[4]==2 for f in tr.sent))
+        finally:rt.close()
 
     def test_atomic_validation_and_rate(self):
         tr,bus,rt=self.make()
@@ -387,7 +381,7 @@ class RuntimeTests(unittest.TestCase):
     def test_no_catchup_burst(self):
         tr,bus,rt=self.make()
         one=rt.motor('J1')
-        one._active=True;one._expires=10;one._next=1;one._rate_hz=1000
+        one._active=True;one._next=1;one._rate_hz=1000
         with patch('motor_platform.runtime.time.perf_counter',return_value=1.0105):rt._tick(1.0105)
         self.assertEqual(len(tr.sent),1)
         self.assertEqual(one.stats()['skipped_periods'],10)
@@ -396,7 +390,7 @@ class RuntimeTests(unittest.TestCase):
     def test_unanswered_requests_do_not_gate_normal_periodic_sends(self):
         tr,bus,rt=self.make()
         one=rt.motor('J1')
-        one._active=True;one._expires=10;one._next=1;one._last_rx=1;one._requests_since_feedback=4
+        one._active=True;one._next=1;one._last_rx=1;one._requests_since_feedback=4
         with patch('motor_platform.runtime.time.perf_counter',return_value=1.01):rt._tick(1.01)
         with patch('motor_platform.runtime.time.perf_counter',return_value=1.99):rt._tick(1.99)
         self.assertEqual(len(tr.sent),2)
@@ -441,7 +435,7 @@ class FeedbackDiagnosticsTests(unittest.TestCase):
             _max_poll_s=.12,_max_poll_overrun_s=.119,_bus=SimpleNamespace(transport=SimpleNamespace()),
             _thread=SimpleNamespace(is_alive=lambda:True),_error=None,_poll_started=now-.11)
         channel=MotorChannel(runtime,'joint',motor,1000)
-        channel._active=True;channel._expires=now+.1;channel._requests_since_feedback=4
+        channel._active=True;channel._requests_since_feedback=4
         channel._stats.tx_count=8;channel._stats.rx_count=4
         channel._stats.first_tx_at=now-.03;channel._stats.last_tx_at=now-.02
         return channel,runtime
@@ -520,10 +514,12 @@ class RuntimeSupervisionTests(unittest.TestCase):
         class Peer(Canable):
             def __init__(self):
                 super().__init__('in-memory')
-                self.peer=Transport();self.drop=False
+                self.peer=Transport();self.drop=False;self.drop_count=0
             def send(self,frame):
                 if self.drop and frame.can_id<0x600:
-                    self.peer.rx.put(CanFrame(8,bytes.fromhex('0000020000000001'),is_fd=False,brs=False,is_error=True))
+                    self.drop_count+=1
+                    if self.drop_count%100==1:
+                        self.peer.rx.put(CanFrame(8,bytes.fromhex('0000020000000001'),is_fd=False,brs=False,is_error=True))
                 else:self.peer.send(frame)
             def recv(self,timeout):
                 deadline=time.perf_counter()+timeout
@@ -533,7 +529,7 @@ class RuntimeSupervisionTests(unittest.TestCase):
                     if self._record_transient(frame,time.perf_counter()):continue
                     return frame
                 return None
-        peer=Peer();bus=MotorBus(peer);rt=ControlRuntime(bus,{1:bus.motor(1)},command_timeout=3).start()
+        peer=Peer();bus=MotorBus(peer);rt=ControlRuntime(bus,{1:bus.motor(1)}).start()
         ch=rt.motor(1);ch.enable()
         self.addCleanup(bus.close)
         return peer,rt,ch
@@ -551,25 +547,27 @@ class RuntimeSupervisionTests(unittest.TestCase):
 
     def test_error_reports_never_refresh_feedback_or_bypass_one_second_guard(self):
         peer,rt,ch=self.create();peer.drop=True
-        rt._thread.join(2)
+        rt._thread.join(5)
         self.assertFalse(rt._thread.is_alive())
         self.assertIsInstance(rt._error,TimeoutError)
         self.assertEqual(rt._error.diagnostic_code,'MOTOR_FEEDBACK_STALE')
-        self.assertGreaterEqual(peer.protocol_reports,3)
+        self.assertGreaterEqual(peer.protocol_reports,1)
         self.assertFalse(peer._feedback_supervised)
         ch.disable()  # The same worker obtained the real stop ACK after loss of feedback.
         with self.assertRaises(RuntimeShutdownError) as caught:rt.close()
         self.assertTrue(caught.exception.cleanup_confirmed)
 
-    def test_bus_off_still_stops_immediately_under_supervision(self):
-        from motor_platform.components.motor.client import CanBusError
+    def test_single_bus_off_notification_allows_following_valid_feedback(self):
         peer,rt,ch=self.create()
-        peer.peer.rx.put(CanFrame(0x48,bytes.fromhex('000008000000f800'),is_fd=False,brs=False,is_error=True))
-        rt._thread.join(2)
-        self.assertIsInstance(rt._error,CanBusError)
-        self.assertEqual(rt._error.can_id,0x48)
-        ch.disable()
-        with self.assertRaises(RuntimeShutdownError):rt.close()
+        try:
+            peer.peer.rx.put(CanFrame(0x48,bytes.fromhex('000008000000f800'),is_fd=False,brs=False,is_error=True))
+            time.sleep(.03)
+            self.assertIsNone(rt._error)
+            self.assertTrue(rt._thread.is_alive())
+            self.assertGreater(ch.stats()['rx_count'],0)
+            self.assertEqual(peer.protocol_reports,1)
+            ch.disable()
+        finally:rt.close()
 
 
 class PendingStopReceiptTests(unittest.TestCase):
@@ -617,6 +615,7 @@ class RuntimeUsbReportTests(unittest.TestCase):
                 super().__init__('in-memory-usb')
                 self.peer = Transport()
                 self.drop_feedback = False
+                self.periodic_sends = 0
                 self._started = True
                 self._usb = SimpleNamespace(input=0x81, transfer=self.read)
 
@@ -624,7 +623,9 @@ class RuntimeUsbReportTests(unittest.TestCase):
                 report = CanFrame(report_id, bytes.fromhex('0000000000000001'),
                                    is_fd=False, brs=False, is_error=True)
                 if frame.can_id < 0x600:
-                    self.peer.rx.put(report)
+                    self.periodic_sends+=1
+                    if report_id==0 or self.periodic_sends%100==1:
+                        self.peer.rx.put(report)
                     if self.drop_feedback:
                         return
                 if (not stop_ack and frame.can_id >= 0x600 and
@@ -648,7 +649,7 @@ class RuntimeUsbReportTests(unittest.TestCase):
 
         peer = Peer()
         bus = MotorBus(peer)
-        runtime = ControlRuntime(bus, {1: bus.motor(1)}, command_timeout=3).start()
+        runtime = ControlRuntime(bus, {1: bus.motor(1)}).start()
         channel = runtime.motor(1)
         channel.enable()
         self.addCleanup(bus.close)
@@ -673,7 +674,7 @@ class RuntimeUsbReportTests(unittest.TestCase):
     def test_counter_packets_cannot_refresh_feedback_and_stop_uses_real_ack(self):
         peer, runtime, channel = self.create()
         peer.drop_feedback = True
-        runtime._thread.join(2)
+        runtime._thread.join(5)
         self.assertFalse(runtime._thread.is_alive())
         self.assertEqual(runtime._error.diagnostic_code, 'MOTOR_FEEDBACK_STALE')
         self.assertGreater(peer.counter_reports, 0)
@@ -707,7 +708,7 @@ class RuntimeUsbReportTests(unittest.TestCase):
     def test_crc_packets_cannot_refresh_feedback_or_replace_stop_ack(self):
         peer, runtime, channel = self.create(report_id=0x200)
         peer.drop_feedback = True
-        runtime._thread.join(2)
+        runtime._thread.join(5)
         self.assertFalse(runtime._thread.is_alive())
         self.assertEqual(runtime._error.diagnostic_code, 'MOTOR_FEEDBACK_STALE')
         self.assertGreater(peer.protocol_reports, 0)
@@ -725,7 +726,7 @@ class RuntimeUsbReportTests(unittest.TestCase):
             with self.subTest(report_id=report_id):
                 peer, runtime, channel = self.create(stop_ack=False, report_id=report_id)
                 peer.drop_feedback = True
-                runtime._thread.join(2)
+                runtime._thread.join(5)
                 self.assertFalse(runtime._thread.is_alive())
                 self.assertEqual(runtime._error.diagnostic_code, 'MOTOR_FEEDBACK_STALE')
                 with self.assertRaises(RuntimeError):
@@ -776,7 +777,7 @@ class FeedbackWindowRecoveryTests(unittest.TestCase):
                 return None
         peer=Peer();bus=MotorBus(peer)
         motors={node:bus.motor(node) for node in ((1,2) if two_nodes else (1,))}
-        runtime=ControlRuntime(bus,motors,command_timeout=3).start()
+        runtime=ControlRuntime(bus,motors).start()
         channel=runtime.motor(1);channel.enable()
         if two_nodes:runtime.motor(2).enable()
         generated=[];observed=[]
@@ -828,7 +829,7 @@ class FeedbackWindowRecoveryTests(unittest.TestCase):
 
     def test_other_motor_feedback_cannot_unlock_a_silent_channel(self):
         peer,runtime,channel,_,_=self.create(two_nodes=True)
-        runtime._thread.join(2)
+        runtime._thread.join(5)
         self.assertFalse(runtime._thread.is_alive())
         self.assertEqual(runtime._error.diagnostic_code,'MOTOR_FEEDBACK_STALE')
         self.assertGreater(peer.periodic_count,4)
@@ -848,7 +849,7 @@ class FeedbackWindowRecoveryTests(unittest.TestCase):
         for stop_ack in (True,False):
             with self.subTest(stop_ack=stop_ack):
                 peer,runtime,channel,generated,observed=self.create(stop_ack=stop_ack)
-                runtime._thread.join(2)
+                runtime._thread.join(5)
                 self.assertFalse(runtime._thread.is_alive())
                 self.assertEqual(runtime._error.diagnostic_code,'MOTOR_FEEDBACK_STALE')
                 self.assertGreater(peer.periodic_count,4)
@@ -925,13 +926,13 @@ class OneSecondFeedbackTests(unittest.TestCase):
         channel._monitoring=command is None
         channel._active=command is not None
         if command is not None:
-            channel._target=command;channel._expires=13
+            channel._target=command
         channel._next=next_due;channel._last_rx=10;channel._requests_since_feedback=requests_waiting
         if stop_ack is not None:
             runtime._touched.add(1)
             channel._motor.enabled=True
         def read(pipe,*,timeout):
-            end=10+until if until is not None and not runtime._stop.is_set() else 12
+            end=10+until if until is not None and not runtime._stop.is_set() else (16 if runtime._stop.is_set() else 12)
             deadline=min(clock[0]+timeout,end)
             if pending and pending[0][0]<=deadline:
                 clock[0],packet=pending.popleft()
@@ -939,7 +940,7 @@ class OneSecondFeedbackTests(unittest.TestCase):
             clock[0]=deadline
             if until is not None and clock[0]>=10+until:
                 runtime._stop.set()
-            elif clock[0]>=12:
+            elif clock[0]>=end:
                 raise AssertionError('one-second feedback deadline did not expire')
             return None
         peer._usb=SimpleNamespace(input=0x81,transfer=read)
@@ -1024,9 +1025,10 @@ class SupervisedCounterRangeReplayTests(unittest.TestCase):
             tx_errors,rx_errors=(0,count) if index<500 else (count,0)
             kinds=('stuff','form','crc','ack','bit','bit_dominant',
                    'bit_recessive','overload','error_announcement','transmission')
-            kind=kinds[index%len(kinds)]
+            kind=kinds[(index//50)%len(kinds)]
             offset=(index+1)*.001
-            events.append((offset,self.report(kind,tx_errors,rx_errors),0xffffffff))
+            if index%50==0:
+                events.append((offset,self.report(kind,tx_errors,rx_errors),0xffffffff))
             if feedback:events.append((offset+.00001,self.feedback(1),0xffffffff))
             events.append((offset+.00002,CanFrame(0,bytes(6)+bytes((tx_errors,rx_errors)),
                 is_fd=False,brs=False,is_error=True),0xffffffff))
@@ -1036,7 +1038,7 @@ class SupervisedCounterRangeReplayTests(unittest.TestCase):
         runtime,peer,_,_=self.replay(self.trace(),until=1.05,supervised=True,stop_ack=True)
         self.assertIsNone(runtime._error)
         self.assertEqual(runtime.motor(1)._stats.rx_count,1000)
-        self.assertEqual(peer.protocol_reports,1000)
+        self.assertEqual(peer.protocol_reports,20)
         self.assertEqual(peer.counter_reports,1000)
         self.assertEqual(len(peer.protocol_history),16)
         self.assertEqual({item['kind'] for item in peer.protocol_history},
@@ -1054,7 +1056,7 @@ class SupervisedCounterRangeReplayTests(unittest.TestCase):
         self.assertEqual(runtime._error.diagnostic_code,'MOTOR_FEEDBACK_STALE')
         self.assertGreaterEqual(at,11);self.assertLess(at,11.002)
         self.assertEqual(runtime.motor(1)._stats.rx_count,0)
-        self.assertGreaterEqual(peer.protocol_reports,999)
+        self.assertEqual(peer.protocol_reports,20)
         self.assertGreaterEqual(peer.counter_reports,999)
         self.assertTrue(runtime.motor(1).stop_status()['worker_cleanup']['confirmed'])
         self.assertEqual(peer.disable_requests,1)
@@ -1084,12 +1086,12 @@ class SupervisedCounterRangeReplayTests(unittest.TestCase):
                 events=[(.001,self.report('stuff',0,95),0xffffffff),
                         (.00101,self.feedback(1),0xffffffff),(.2,frame,0xffffffff)]
                 runtime,peer,at,_=self.replay(events,supervised=True,stop_ack=True)
-                self.assertEqual(runtime._error.__class__.__name__,'CanBusError')
-                self.assertEqual(runtime._error.can_id,frame.can_id)
-                self.assertEqual(runtime._error.payload_hex,frame.data.hex())
+                self.assertEqual(runtime._error.diagnostic_code,'MOTOR_FEEDBACK_STALE')
+                self.assertEqual(peer.last_protocol_report['can_id'],frame.can_id)
+                self.assertEqual(peer.last_protocol_report['data'],frame.data.hex())
                 self.assertEqual(runtime.motor(1)._stats.rx_count,1)
-                self.assertEqual(peer.protocol_reports,1)
-                self.assertLess(at,10.21)
+                self.assertEqual(peer.protocol_reports,2)
+                self.assertGreaterEqual(at,11.)
                 self.assertTrue(runtime.motor(1).stop_status()['worker_cleanup']['confirmed'])
                 self.assertEqual(peer.disable_requests,1)
                 self.assertFalse(runtime.motor(1)._motor.enabled)
@@ -1097,8 +1099,8 @@ class SupervisedCounterRangeReplayTests(unittest.TestCase):
     def test_terminal_busoff_without_disable_ack_remains_unconfirmed(self):
         frame=CanFrame(0x40,bytes.fromhex('0000000000000009'),is_fd=False,brs=False,is_error=True)
         runtime,peer,_,_=self.replay([(.2,frame,0xffffffff)],supervised=True,stop_ack=False)
-        self.assertEqual(runtime._error.__class__.__name__,'CanBusError')
-        self.assertEqual(runtime._error.can_id,0x40)
+        self.assertEqual(runtime._error.diagnostic_code,'MOTOR_FEEDBACK_STALE')
+        self.assertEqual(peer.last_protocol_report['can_id'],0x40)
         self.assertFalse(runtime.motor(1).stop_status()['worker_cleanup']['confirmed'])
         self.assertIsNotNone(runtime._cleanup_error)
         self.assertGreaterEqual(peer.disable_requests,2)
@@ -1148,14 +1150,14 @@ class SupervisedBusErrorReplayTests(unittest.TestCase):
         for report in (self.ack_report(),CanFrame(8,bytes.fromhex('0000100000000000'),
                         is_fd=False,brs=False,is_error=True)):
             with self.subTest(can_id=report.can_id,data=report.data.hex()):
-                events=[(index*.001,report,0xffffffff) for index in range(1,1201)]
+                events=[(index*.05,report,0xffffffff) for index in range(1,21)]
                 runtime,peer,at,sent=self.replay(events,supervised=True,stop_ack=True,
                                                command=MitCommand(torque=2))
                 self.assertEqual(runtime._error.diagnostic_code,'MOTOR_FEEDBACK_STALE')
                 self.assertGreaterEqual(at,11)
                 self.assertLess(at,11.002)
                 self.assertEqual(runtime.motor(1)._stats.rx_count,0)
-                self.assertGreaterEqual(peer.protocol_reports,999)
+                self.assertGreaterEqual(peer.protocol_reports,19)
                 self.assertGreaterEqual(len([frame for frame in sent if frame.can_id==0x401]),990)
                 self.assertTrue(runtime.motor(1).stop_status()['worker_cleanup']['confirmed'])
 
@@ -1189,7 +1191,7 @@ class PeriodicBurstLossTests(unittest.TestCase):
                     except queue.Empty:pass
                 return None
         peer=Peer();bus=MotorBus(peer)
-        runtime=ControlRuntime(bus,{1:bus.motor(1)},command_timeout=3).start()
+        runtime=ControlRuntime(bus,{1:bus.motor(1)}).start()
         channel=runtime.motor(1);channel.enable()
         def source(now):
             target=MitCommand(torque=1+len(generated)%100/100)

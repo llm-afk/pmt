@@ -140,15 +140,15 @@ class DynamometerTests(unittest.TestCase):
         self.assertIsNone(snapshot['feedback_age_ms'])
         self.assertEqual(snapshot['statistics']['rx_count'],0)
 
-    def test_worker_keeps_every_frame_and_reports_overflow(self):
+    def test_worker_keeps_every_frame_without_capacity_drops(self):
         transport = Transport()
-        with Dynamometer(port='COM_TEST', transport=transport, capacity=3) as d:
+        with Dynamometer(port='COM_TEST', transport=transport) as d:
             transport.incoming.put(b''.join(frame(i) for i in range(10)))
             wait_for(lambda: d.stats()['rx_count'] == 10)
             self.assertEqual(d.state().torque, -0.09)
             self.assertEqual(d.diagnostic_snapshot()['last_raw_frame'],frame(9).hex())
-            self.assertEqual(d.stats()['dropped_samples'], 7)
-            self.assertEqual([s.raw_torque for s in d.drain()], [7, 8, 9])
+            self.assertEqual(d.stats()['dropped_samples'], 0)
+            self.assertEqual([s.raw_torque for s in d.drain()], list(range(10)))
             self.assertEqual(d.drain(), [])
             self.assertEqual(d.stats()['rx_count'], 10)
             with self.assertRaises(TimeoutError):
@@ -177,8 +177,6 @@ class DynamometerTests(unittest.TestCase):
         self.assertFalse(transport.opened)
 
     def test_invalid_configuration_and_independent_scales(self):
-        with self.assertRaises(ValueError):
-            Dynamometer(port='COM_TEST', capacity=0)
         for scale in (0, -1, float('inf'), True):
             with self.assertRaises(ValueError):
                 Dynamometer(port='COM_TEST', torque_scale=scale)

@@ -96,13 +96,13 @@ class RecordingTests(unittest.TestCase):
     def test_receive_queue_preserves_each_dispatch_once(self):
         bus = MotorBus(Mock())
         motor = bus.motor(1)
-        motor.start_recording(capacity=2)
+        motor.start_recording()
         frame = Mock(is_error=False, is_extended=False, is_remote=False, can_id=0x191)
         with patch('motor_platform.components.motor.client.parse_state', side_effect=[
                 feedback(1, 1), feedback(2, 2), feedback(3, 3)]):
             for _ in range(3): bus._dispatch(frame)
-        self.assertEqual(motor.recording_dropped, 1)
-        self.assertEqual([s.torque for s in motor.drain_states()], [2, 3])
+        self.assertEqual(motor.recording_dropped, 0)
+        self.assertEqual([s.torque for s in motor.drain_states()], [1, 2, 3])
         self.assertEqual(motor.drain_states(), [])
 
     def test_stop_ramps_torque_before_disabling_and_unloading(self):

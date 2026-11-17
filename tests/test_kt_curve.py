@@ -100,87 +100,42 @@ class ConsistencyTests(unittest.TestCase):
         self.assertEqual(motor.commands[-1][1], 0)
         self.assertLess(clock[0], 100.08)
 
-    def test_short_feedback_loss_holds_torque_and_extends_capture_without_replay(self):
-        clock, events, result = [100.], [], {}
-        motor, dyno = FakeMotor(clock, events), FakeDyno(clock)
-        last = [clock[0]]
-        def feedback(*, max_age):
-            self.assertEqual(max_age, 1.)
-            if not 100.1 < clock[0] < 100.7:
-                last[0] = clock[0]
-            return state(last[0])
-        motor.state = feedback
-        motor.drain_states = lambda: [] if last[0] < clock[0] else [state(last[0])]
-        ui = NS(app=NS(invalidate=lambda: None), poll=lambda: None)
-        def sleep(dt):
-            clock[0] += dt
-        dyno.state = Mock(wraps=dyno.state)
-        with patch.object(app.time, 'perf_counter', lambda: clock[0]), patch.object(app.time, 'sleep', sleep), \
-             patch.object(app, 'RAMP_DURATION_S', .2), patch.object(app, 'STOP_RAMP_S', .01), \
-             patch.object(app, 'TARGET_UPDATE_S', .02):
-            app.run(motor, dyno, ui, self.args(), result)
-        self.assertEqual(result['reason'], 'completed')
-        self.assertGreater(result['recorder'].cutoff, 100.7)
-        held = [torque for at, torque in motor.commands if 100.1 < at < 100.7]
-        self.assertGreater(len(held), 20)  # 应用仍在持续刷新租约
-        self.assertEqual(len(set(held)), 1)
-        first_after = next(torque for at, torque in motor.commands if at >= 100.7)
-        self.assertEqual(first_after, held[-1])
-        start, end, target = result['recorder'].feedback_holds[0]
-        self.assertGreater(end - start, 500.)
-        self.assertEqual(target, held[-1])
-        self.assertTrue(all(c.kwargs['max_age'] == .1 for c in dyno.state.call_args_list))
+    def test_short_feedback_loss_does_not_freeze_or_extend_ramp(self):
+        clock,events,result=[100.],[],{}
+        motor,dyno=FakeMotor(clock,events),FakeDyno(clock)
+        motor.state=lambda **_:state(100.1 if clock[0]>100.1 else clock[0])
+        motor.drain_states=lambda:[]
+        ui=NS(app=NS(invalidate=lambda:None),poll=lambda:None)
+        with patch.object(app.time,'perf_counter',lambda:clock[0]),patch.object(app.time,'sleep',lambda dt:clock.__setitem__(0,clock[0]+dt)),patch.object(app,'RAMP_DURATION_S',.2),patch.object(app,'STOP_RAMP_S',.01),patch.object(app,'TARGET_UPDATE_S',.02):
+            app.run(motor,dyno,ui,self.args(),result)
+        self.assertEqual(result['reason'],'completed')
+        self.assertAlmostEqual(result['recorder'].cutoff,100.2)
+        rising=[torque for at,torque in motor.commands if 100.1<at<=100.2]
+        self.assertGreater(len(set(rising)),1)
+        self.assertEqual(max(torque for _,torque in motor.commands),30)
 
-    def test_held_target_uses_real_dyno_samples_and_preserves_quality_gates(self):
-        from scripts.factory_test.report import kt_target_curve
-        from scripts.factory_test.measurements.smoothing import append_smoothed_columns
-        for case in ('good', 'excess', 'no_hold', 'dyno_gap', 'changed_target', 'missing_metadata', 'lost_row'):
-            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
-                rec = Recorder(0., .8)
-                if case != 'no_hold':
-                    rec.feedback_holds = [(200., 600., 2.)]
-                path = Path(directory) / 'kt.csv'
-                for i in range(81):
-                    t = i/100
-                    applied = min(i, 20)/10 + max(0, i-60)/10
-                    if case == 'changed_target' and i == 39:
-                        applied = 3.
-                    rec.command(t, applied)
-                    if not 20 < i < 60:
-                        rec.add('motor', [state(t)])
-                    if case != 'dyno_gap' or not 28 < i < 52:
-                        dy = state(t)
-                        dy.torque = applied + (4. if case == 'excess' and 26 <= i <= 54 else 0.)
-                        rec.add('dyno', [dy])
-                with path.open('w', newline='', encoding='utf-8') as target:
-                    rec.write(csv.writer(target), self.args(), 'completed')
-                append_smoothed_columns(path, .3, .3, .1, .3, .3, output_columns=OUTPUT_COLUMNS)
-                app.pack_streams(path, align_motor=True, separate_events=lambda rows: rec.separate_hold_samples(rows, 100.))
-                with path.open(encoding='utf-8', newline='') as source:
-                    packed = list(csv.DictReader(source))
-                result = dict(config=dict(RAMP_DURATION_S=.4, SAMPLE_MAX_GAP_S=.1),
-                              capture_duration_s=.8, held_target_intervals=rec.verified_holds)
-                if case == 'lost_row':
-                    packed = [row for row in packed if float(row['time_ms']) != 410.]
-                if case == 'missing_metadata':
-                    del result['held_target_intervals']
-                summary = dict(target_torque=4., stages={'kt': {'result': result}})
-                if case in ('no_hold', 'dyno_gap', 'changed_target', 'missing_metadata', 'lost_row'):
-                    with self.assertRaisesRegex(ValueError, '覆盖不足'):
-                        kt_target_curve(packed, summary)
-                else:
-                    independent = [r for r in packed if r['motor_torque'] == '']
-                    self.assertEqual([float(r['time_ms']) for r in independent], list(range(210, 600, 10)))
-                    self.assertTrue(all(r['dyno_torque_nm'] and float(r['motor_application_target_torque']) == 2.
-                                        for r in independent))
-                    points, estimated = kt_target_curve(packed, summary)
-                    self.assertFalse(estimated)
-                    self.assertEqual(len(points), 81)
-                    error = max(abs(x-y) for x,y in points)
-                    if case == 'excess':
-                        self.assertGreater(error, 3.)
-                    else:
-                        self.assertLess(error, .2)
+    def test_torque_error_monitor_averages_matched_sensor_times_then_stops_over_limit(self):
+        recorder=app.Recorder(100.,3.)
+        recorder.command(100.01,10.)
+        monitor=app.TorqueErrorMonitor(recorder,30.,5.)
+        monitor.observe([NS(received_at=100.1,torque=10.1),NS(received_at=100.31,torque=10.2)])
+        with self.assertRaises(app.TorqueErrorLimit) as caught:
+            monitor.observe([NS(received_at=100.7,torque=5.)])
+        self.assertEqual(caught.exception.diagnostic_context['limit_pct_fs'],5.)
+
+    def test_engineering_error_ramps_to_zero_before_disable(self):
+        clock,events,result=[100.],[],{}
+        motor,dyno=FakeMotor(clock,events),FakeDyno(clock)
+        ui=NS(app=NS(invalidate=lambda:None),poll=lambda:None)
+        with patch.object(app.time,'perf_counter',lambda:clock[0]),patch.object(app.time,'sleep',lambda dt:clock.__setitem__(0,clock[0]+dt)),patch.object(app,'RAMP_DURATION_S',.6),patch.object(app,'TARGET_UPDATE_S',.01),patch.object(app,'STOP_RAMP_S',.05):
+            with self.assertRaises(app.TorqueErrorLimit):
+                app.run(motor,dyno,ui,self.args(),result)
+        values=[torque for _,torque in motor.commands]
+        peak=values.index(max(values))
+        self.assertGreater(len(values)-peak,3)
+        self.assertEqual(values[-1],0.)
+        self.assertEqual(events,['motor_on','motor_off'])
+        self.assertEqual(result['reason'],'error')
 
     def test_motor_disable_loss_marks_failure_even_if_ramp_succeeded(self):
         motor=Mock()

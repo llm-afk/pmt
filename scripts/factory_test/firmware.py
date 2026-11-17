@@ -117,7 +117,7 @@ def check_firmware(config,motor,node,expected_sn,progress, *, expected_sha256=No
             return info
         progress(f'APP {before} → {target}，正在升级')
         motor.check_stop()
-        bench.motor(node).disable(timeout=1)
+        bench.motor(node).disable(timeout=3)
         log_event('firmware.disable.ack',node_id=node,before=before,target_version=target)
         info['commit_ack'] = transfer(bench._bus.transport,node,image,motor.check_stop,progress)
     progress(f'重连核对 APP {target}')

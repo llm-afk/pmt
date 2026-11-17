@@ -206,11 +206,17 @@ class DeviceHealth:
         keys = ('output','voltage_set','current_set')
         changed = self._power_reading is None or any(values[k] != self._power_reading[k] for k in keys)
         if changed:
-            confirmed = self._power.read_state()
-            next_values = self._power_values(confirmed)
-            if any(values[k] != next_values[k] for k in keys):
-                raise PowerStateUnstable(dict(first=values, second=next_values,
-                                               wire=self._power.diagnostic_snapshot()))
+            readings = [values]
+            for attempt in range(4):
+                time.sleep(.05)
+                confirmed = self._power.read_state()
+                next_values = self._power_values(confirmed)
+                readings.append(next_values)
+                if all(values[k] == next_values[k] for k in keys):
+                    break
+                values = next_values
+            else:
+                raise PowerStateUnstable(dict(readings=readings,wire=self._power.diagnostic_snapshot()))
             if self._power_reading is not None:
                 log_event('power.state.changed', '空闲只读检测发现电源输出或设定变化，连续两次回读一致',
                           level='WARNING', owner='idle_monitor', output_commands_sent=False,
