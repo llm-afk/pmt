@@ -35,6 +35,7 @@ class ManualSession:
         self.diagnostics = diagnostics
         self.motor_sn = None
         self.failure = None
+        self.calibration_status = None
         self.cleanup_confirmed = True
         self.state_change_started = False
 
@@ -149,12 +150,23 @@ class ManualSession:
                     exc.add_note('连接失败后的资源释放也发生异常，详见 debug.connect.cleanup.failed')
             raise
 
-    def _maintain(self, kind):
+    def _calibration_progress(self, message):
+        self.calibration_status = message
+        self._state(message)
+
+    def _calibration_sample(self, state):
+        neutral = asdict(MitCommand())
+        self.emit('control_sample', dict(at=state.received_at, position=state.position,
+                  velocity=state.velocity, torque=state.torque, motor_temperature=state.motor_temperature,
+                  board_temperature=state.board_temperature, error_code=state.error_code,
+                  target=neutral, sent_target=neutral, calibrating=True, enabled=True))
+
+    def _maintain(self, kind, *, bench=None):
         if kind in ('zero','calibrate') and not self.profile_known:
             raise RuntimeError('未识别芯片平台，无法确定标零/校准协议')
-        maintenance=Maintenance(self.config,self.stop.is_set)
+        maintenance=Maintenance(self.config,self.stop.is_set,progress=self._calibration_progress)
         if kind=='calibrate':
-            maintenance.calibrate(self.node)
+            return maintenance.calibrate(self.node,bench=bench,on_feedback=self._calibration_sample)
         else:
             with maintenance.connect(self.node) as bench:
                 if kind=='zero' and self.config.model.startswith('2'):
@@ -162,7 +174,7 @@ class ManualSession:
                     maintenance.write(bench,self.node,0x2070,2,0)
                 else:
                     maintenance.write(bench,self.node,0x2002,2,0xFF if kind=='clear_error' else 3)
-                error=maintenance.read(bench,self.node,0x2000,2)
+                error=maintenance.fresh_feedback(bench.motor(self.node)).error_code
                 if error:
                     raise RuntimeError(f'操作后驱动器仍报告错误 0x{error:04X}')
 
@@ -232,11 +244,24 @@ class ManualSession:
                         self.state_change_started = True
                         if self.enabled:
                             raise RuntimeError('维护操作前电机必须失能')
-                        self._state('正在'+{'clear_error':'清除错误','zero':'标零','calibrate':'校准'}[kind])
+                        if kind=='calibrate':
+                            result_text='编码器校准完成'
+                            self._calibration_progress('正在准备编码器校准，尚未发送校准指令')
+                        else:
+                            self._state('正在'+{'clear_error':'清除错误','zero':'标零'}[kind])
                         if self.config.simulation:
                             if kind=='calibrate' and self.stop.wait(1):
                                 break
                             if kind=='zero': p=v=0.0
+                        elif kind=='calibrate':
+                            bench.stop_runtime()
+                            channel=None
+                            if not self._maintain(kind,bench=bench):
+                                result_text='电机已校准，本次跳过重复校准'
+                            if not self.stop.is_set():
+                                self._calibration_progress(result_text+'，正在恢复实时波形')
+                                channel=bench.start(rate_hz=1000).motor(self.node)
+                                start_monitoring(channel,cancelled=self.stop.is_set,wait=self.stop.wait)
                         else:
                             bench.close()  # 先停止周期 I/O，再打开独立 SDO 维护会话。
                             bench=channel=None
@@ -244,7 +269,11 @@ class ManualSession:
                             if not self.stop.is_set(): bench,channel=self._open_hardware()
                         self.maintenance_busy=False
                         self.state_change_started=False
-                        self._state('维护操作完成 · 电机未使能')
+                        if kind=='calibrate':
+                            if not self.stop.is_set():
+                                self._state(result_text+' · 实时波形已恢复')
+                        else:
+                            self._state('维护操作完成 · 电机未使能')
                     log_event('debug.command.complete',command=kind,node_id=self.node,enabled=self.enabled,
                               elapsed_ms=round((time.perf_counter()-command_at)*1000,1))
                 now = time.perf_counter()
@@ -317,6 +346,8 @@ class ManualSession:
             if unconfirmed_cleanup_notes(notes):
                 self.cleanup_confirmed=False
             failed = '' if cancelled else '；'.join([str(exc),*notes])
+            if failed and command=='calibrate' and self.calibration_status:
+                failed = self.calibration_status+'；'+failed
         finally:
             if channel is not None and self.enabled:
                 try:
@@ -517,7 +548,7 @@ class ControlPage:
             return
         if self.session is not None and not self.session.reconnect_allowed:
             self.want_connection=False
-            self.message.set('连接已停止，请查看错误日志；确认设备状态后可重新连接。')
+            self.message.set(self.session.failure)
             return
         if time.monotonic() >= self.next_connect:
             self.connect(automatic=True)
@@ -706,7 +737,8 @@ class ControlPage:
                 if name in value: status[name]=f'{value[name]:.1f} °C'
             if 'enabled' in value:
                 error=value.get('error_code',0)
-                text=f'故障 0x{error:04X}' if error else '已使能' if value['enabled'] else '已连接 / 未使能'
+                text=('校准中' if value.get('calibrating') else f'故障 0x{error:04X}' if error
+                      else '已使能' if value['enabled'] else '已连接 / 未使能')
                 status['motor']=text
             for name,text in status.items():
                 if self._status_text.get(name)!=text:

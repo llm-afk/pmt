@@ -360,7 +360,7 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual(maintenance.write.call_count,1)
         maintenance.wait_sn.assert_called_once_with(SN,previous_id=1)
 
-    def calibration_fixture(self, reads, model='221'):
+    def calibration_fixture(self, reads, model='221', errors=(0x4000, 0x4000, 0, 0)):
         config=StationConfig(model=model,hardware_version='0'+model)
         maintenance=Maintenance(config)
         motor=Mock()
@@ -372,39 +372,57 @@ class MaintenanceTests(unittest.TestCase):
         maintenance.read=Mock(side_effect=reads)
         maintenance.write=Mock()
         maintenance.wait=Mock()
+        motor.receive_state.side_effect=[NS(error_code=code) for code in errors]
         return maintenance,motor,bench
 
-    def test_adm_completion_requires_reset_flag_and_new_completion_not_only_ack(self):
-        # 初始无错、确认标志已清、进行中、完成两次，最后才失能放行。
-        maintenance,motor,_=self.calibration_fixture([0,0,0,0,0,1,0,1,0,0x41F00000,1])
+    def test_calibration_uses_tpdo_status_and_neutral_control_only(self):
+        # Fresh TPDO5 samples: uncalibrated, in progress, clear, clear.
+        maintenance,motor,_=self.calibration_fixture([0x41F00000,1])
         with patch('scripts.factory_test.maintenance.log_event') as log:
             maintenance.calibrate()
         self.assertEqual([call.args[2:5] for call in maintenance.write.call_args_list],
-                         [(0x2072,2,0),(0x2002,2,0xF1)])
-        self.assertEqual(maintenance.read.call_count,11)
-        self.assertEqual([call.args[2] for call in maintenance.read.call_args_list[-3:]],
-                         [0x2000,0x205B,0x2044])
+                         [(0x2002,2,0xF1)])
+        self.assertEqual(maintenance.read.call_count,2)
+        self.assertEqual([call.args[2] for call in maintenance.read.call_args_list],
+                         [0x205B,0x2044])
         snapshot=next(call.kwargs for call in log.call_args_list if call.args[0]=='motor.settings.snapshot')
         self.assertEqual(snapshot['settings']['torque_limit_nm']['value'],30.)
         self.assertEqual(motor.disable.call_count,1)
         motor.request_feedback.assert_called_once_with()
+        self.assertEqual(motor.send_mit.call_count,3)
+        self.assertTrue(all(call.args[0].pack()==bytes(16) for call in motor.send_mit.call_args_list))
 
     def test_optional_settings_read_failure_does_not_undo_confirmed_calibration(self):
-        maintenance,motor,_=self.calibration_fixture([0,0,0,0,0,1,0,1,SdoError('unsupported')])
+        maintenance,motor,_=self.calibration_fixture([SdoError('unsupported')])
         with patch('scripts.factory_test.maintenance.log_event') as log:
             maintenance.calibrate()
         self.assertEqual(motor.disable.call_count,1)
         motor.request_feedback.assert_called_once_with()
+        self.assertEqual(motor.send_mit.call_count,3)
+        self.assertTrue(all(call.args[0].pack()==bytes(16) for call in motor.send_mit.call_args_list))
         self.assertTrue(any(call.args[0]=='motor.settings.unavailable' for call in log.call_args_list))
-        self.assertEqual(maintenance.write.call_count,2)
+        self.assertEqual(maintenance.write.call_count,1)
 
-    def test_old_gd_calibration_does_not_prove_this_calibration(self):
-        maintenance,_,_=self.calibration_fixture([0],model='111')
-        with self.assertRaisesRegex(RuntimeError,'本次校准进度'): maintenance.calibrate()
-        maintenance.write.assert_not_called()
+    def test_zero_feedback_error_skips_calibration_on_both_platforms(self):
+        for model in ('111','221'):
+            maintenance,motor,_=self.calibration_fixture([],model=model,errors=(0,))
+            self.assertIs(maintenance.calibrate(),False)
+            maintenance.write.assert_not_called()
+            maintenance.read.assert_not_called()
+            motor.send_mit.assert_not_called()
+            motor.disable.assert_not_called()
+
+    def test_debug_stream_receives_calibration_samples_on_existing_connection(self):
+        maintenance,motor,bench=self.calibration_fixture([],errors=(0x4000,0x4000,0,0))
+        maintenance.connect=Mock(side_effect=AssertionError('second CAN owner'))
+        samples=[]
+        self.assertIs(maintenance.calibrate(bench=bench,on_feedback=samples.append),True)
+        self.assertEqual([s.error_code for s in samples],[0x4000,0,0])
+        maintenance.read.assert_not_called()
+        motor.disable.assert_called_once_with()
 
     def test_calibration_fault_stops_without_pretending_disable_ack_is_cancellation(self):
-        maintenance,_,bench=self.calibration_fixture([0,0,0x0400])
+        maintenance,_,bench=self.calibration_fixture([0],errors=(0x4000,0x0400))
         with self.assertRaisesRegex(RuntimeError,'0x0400') as failure:
             maintenance.calibrate()
         self.assertTrue(any('切断工装电源' in note for note in failure.exception.__notes__))

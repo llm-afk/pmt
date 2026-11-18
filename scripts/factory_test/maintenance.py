@@ -1,9 +1,9 @@
 """工装侧 SDO 维护协议，单接收者。只在自动工位实际运行时打开硬件。"""
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import struct
 import time
 
-from motor_platform import Bench, Canable, CanFrame, SdoError
+from motor_platform import Bench, Canable, CanFrame, MitCommand, SdoError
 from motor_platform.components.motor.client import SdoReplyTimeout, CanBusError
 from .diagnostics import current_log, log_event, log_scope, idle_poll, idle_evidence
 
@@ -14,6 +14,8 @@ class CalibrationFault(RuntimeError):
 
     def __init__(self, node, code, *, before=False):
         flags = []
+        if code & 0x0080:
+            flags.append('CAN 心跳超时')
         if code & 0x0400:
             flags.append('编码器运动范围检查失败')
         if code & 0x4000:
@@ -360,39 +362,57 @@ class Maintenance:
         self.wait_sn(sn)
         log_event('motor.sn.verified',node_id=node,sn=sn)
 
-    def calibrate(self, node=None):
+    def fresh_feedback(self, motor, *, calibration=False):
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            self.check_stop()
+            if calibration:
+                motor.send_mit(MitCommand())  # RPDO6, all targets and gains zero
+            else:
+                motor.request_feedback()  # stationary preflight, RPDO5
+            remaining = deadline-time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                return motor.receive_state(timeout=min(.1, remaining))
+            except TimeoutError:
+                pass
+        raise TimeoutError(f'电机 ID {motor.node_id} 连续 1 秒无有效状态回包')
+
+    def calibrate(self, node=None, *, bench=None, on_feedback=None):
         node = self.config.require_target_id() if node is None else node
-        with self.connect(node) as bench:
+        with (self.connect(node) if bench is None else nullcontext(bench)) as bench:
             motor = bench.motor(node)
-            motor.request_feedback()  # 0x100: position/velocity/torque/KP/KD 均为零。
+            initial = self.fresh_feedback(motor).error_code
             log_event('motor.neutral.sent',node_id=node,reason='before_calibration',
                       position=0,velocity=0,torque=0,kp=0,kd=0)
-            initial = self.read(bench, node, 0x2000, 2)
             if initial & ~0x4000:
                 raise CalibrationFault(node,initial,before=True)
             adm = self.config.model[0] == '2'
             log_event('calibration.preflight',node_id=node,initial_error=f'0x{initial:04X}',
                       platform='ADM' if adm else 'GD',timeout_s=self.config.calibration_timeout)
-            if adm:
-                # ADM 的旧 is_calibrated=1 不能冒充本次完成，先清零并读回。
-                self.write(bench, node, 0x2072, 2, 0)
-                if self.read(bench, node, 0x2072, 2) != 0:
-                    raise RuntimeError('未能清除旧校准完成标志')
-            elif not initial & 0x4000:
-                raise RuntimeError('GD 固件未暴露本次校准进度；已有校准的电机需补完成协议，不能仅凭 ACK 放行')
+            if initial == 0:
+                self.progress('电机状态回报已校准，本次跳过重复校准')
+                log_event('calibration.already_calibrated',node_id=node,error_code=0,source='TPDO5')
+                return False
+            self.progress('正在发送编码器校准指令，等待驱动器回执')
             try:
                 self.write(bench, node, 0x2002, 2, 0xF1)
+                self.progress('校准指令已确认，正在等待固件完成')
                 from .measurements import hardware_state
                 hardware_state('motor','校准指令已确认，等待固件完成',motion=True)
                 deadline = time.monotonic()+self.config.calibration_timeout
                 stable = 0
                 while time.monotonic() < deadline:
                     self.check_stop()
-                    error = self.read(bench, node, 0x2000, 2)
+                    state = self.fresh_feedback(motor, calibration=True)
+                    if on_feedback is not None:
+                        on_feedback(state)
+                    error = state.error_code
                     if error & ~0x4000:
                         raise CalibrationFault(node,error)
-                    complete = self.read(bench, node, 0x2072, 2) == 1 if adm else True
-                    stable = stable+1 if complete and error == 0 else 0
+                    complete = error == 0
+                    stable = stable+1 if complete else 0
                     if current_log():
                         current_log().sample('calibration.progress',error_code=error,complete=complete,stable_samples=stable)
                     if stable >= 2:
@@ -400,12 +420,13 @@ class Maintenance:
                         motor.disable()
                         log_event('calibration.confirmed',node_id=node,stable_samples=stable,disable_ack=True)
                         hardware_state('motor','校准已完成，失能回执已确认',state='STANDBY',stopped=True)
-                        if adm:
+                        self.progress('编码器校准已完成，停机回执已确认')
+                        if adm and on_feedback is None:
                             settings = {}
-                            for index, size, name in ((0x2000,2,'error_code'),
-                                                      (0x205B,4,'torque_limit_nm'),
+                            for index, size, name in ((0x205B,4,'torque_limit_nm'),
                                                       (0x2044,2,'heartbeat_consumer_enable')):
-                                self.check_stop()
+                                if self.cancelled():
+                                    break
                                 try:
                                     value = self.read(bench,node,index,size,timeout=.15,diagnostic_probe=True)
                                 except Exception as exc:
@@ -416,7 +437,7 @@ class Maintenance:
                                     value=struct.unpack('<f',value.to_bytes(4,'little'))[0]
                                           if name=='torque_limit_nm' else value)
                             log_event('motor.settings.snapshot',node_id=node,phase='after_calibration',settings=settings)
-                        return
+                        return True
                     self.wait(.2)
                 raise TimeoutError('校准完成等待超时')
             except BaseException as exc:

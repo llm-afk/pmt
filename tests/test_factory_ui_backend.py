@@ -270,7 +270,7 @@ class ManualTests(unittest.TestCase):
                 connection=Mock()
                 maintenance.connect.return_value.__enter__=Mock(return_value=connection)
                 maintenance.connect.return_value.__exit__=Mock(return_value=False)
-                maintenance.read.return_value=0
+                maintenance.fresh_feedback.return_value.error_code=0
                 with patch('scripts.factory_test.manual_control.Maintenance',return_value=maintenance):
                     session._maintain(kind)
                 maintenance.write.assert_called_once_with(connection,3,index,2,value)
@@ -280,7 +280,7 @@ class ManualTests(unittest.TestCase):
         session.profile_known=True
         with patch('scripts.factory_test.manual_control.Maintenance') as factory:
             session._maintain('calibrate')
-            factory.return_value.calibrate.assert_called_once_with(7)
+            factory.return_value.calibrate.assert_called_once_with(7,bench=None,on_feedback=session._calibration_sample)
 
     def test_maintenance_rejected_while_motor_enabled(self):
         session=ManualSession(StationConfig(),3,lambda *_:None)

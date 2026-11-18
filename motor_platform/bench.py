@@ -62,6 +62,12 @@ class Bench:
         self._runtime = runtime.start()
         return self._runtime
 
+    def stop_runtime(self):
+        """Return the open bus to synchronous use after its only worker exits."""
+        if self._runtime is not None:
+            self._runtime.close()
+            self._runtime = None
+
     def close(self):
         try:
             if self._runtime is not None:
