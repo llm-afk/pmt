@@ -280,7 +280,6 @@ def build_view(self):
     self.page_menu.add_command(label='自动产测',command=lambda:self.switch_page('production'))
     self.page_menu.add_command(label='电机调试',command=lambda:self.switch_page('control'))
     self.page_menu.add_command(label='工位配置',command=self.show_settings)
-    self.page_menu.add_command(label='Help',command=self.show_help)
     root.bind('<F1>',self.show_help)
     root.config(menu=self.page_menu)
     self.nav_buttons={}

@@ -10,7 +10,8 @@ import time
 
 from . import app, report
 from motor_platform import PowerSupply
-from .integrations import MesClient, PrinterClient, PendingConfiguration, PrintUnknown, mes_payload
+from .integrations import IntegrationError, MesClient, PrinterClient, PendingConfiguration, PrintUnknown, mes_payload
+from .network_status import NetworkLost
 from .maintenance import Maintenance
 from .station_config import StationConfig, atomic_json, state_root
 from .diagnostics import current_log, log_event, log_scope, error_details
@@ -255,11 +256,29 @@ class Services:
         return summary
 
     def check_stop(self):
+        if getattr(self,'online',None):
+            self.online.check()
         if self.cancelled():
             raise InterruptedError('工位流程已停止')
 
     def allocate(self, payload):
-        return MesClient(self.config).allocate(payload, self.cancelled)
+        client = MesClient(self.config)
+        network = self.online.network if getattr(self, 'online', None) else None
+        while True:
+            if network and not network.ready():
+                message = '本件测试合格，等待联网取号。请保持本件连接，联网后自动继续。'
+                self.emit('allocation_wait', message)
+                while not network.ready():
+                    if self.cancelled() or network.shutdown.wait(.25):
+                        raise InterruptedError('已停止等待取号，保留本件合格数据和原 requestId')
+            try:
+                return client.allocate(payload, self.cancelled)
+            except IntegrationError as exc:
+                if not network or exc.diagnostic_code != 'MES_RETRIES_EXHAUSTED':
+                    raise
+                network.refresh()
+                if network.ready():
+                    raise
 
     def print_sn(self, sn):
         printer = PrinterClient(self.config)
@@ -333,12 +352,13 @@ class DemoServices(Services):
 
 class StationRunner:
     def __init__(self, config, *, root=None, emit=lambda *_: None, cancelled=lambda: False, services=None, delivery=None,
-                 log_target=None, firmware_sha256=None, hardware_ports=None):
+                 log_target=None, firmware_sha256=None, hardware_ports=None, online=None):
         self.config, self.emit, self.cancelled = config, emit, cancelled
         self.root = Path(root) if root else state_root()
         self.pointer = self.root / ('demo-active.json' if config.simulation else 'active.json')
         self.services = services or (DemoServices if config.simulation else Services)(
             config, cancelled, emit, delivery=delivery, firmware_sha256=firmware_sha256, hardware_ports=hardware_ports)
+        self.online = online
         self.record = None
         self.log = log_target or current_log()
 
@@ -360,7 +380,22 @@ class StationRunner:
                     self.log.event('flow.previous_record_missing', message, level='WARNING', path=str(path))
             return None
         record = json.loads(raw)
+        if record.get('status') == 'DISCARDED':
+            self.clear_discarded_files(record)
+            return None
         return record if record.get('status') not in ('COMPLETE', 'CLOSED') else None
+
+    def clear_discarded_files(self, record):
+        directory = Path(record['directory']).resolve()
+        expected = self.root / ('demo-data' if self.config.simulation else 'data') / str(uuid.UUID(record['session']))
+        if directory != expected.parent.resolve()/expected.name:
+            raise RecoveryRequired('工件目录不匹配，请人工核对报废数据')
+        for name in ('summary.json','report.png','kt/kt_curve.csv','tn/curve.csv'):
+            path = directory/name
+            if not path.resolve().is_relative_to(directory):
+                raise RecoveryRequired('报废文件路径超出本件目录，请人工核对')
+            path.unlink(missing_ok=True)
+
 
     def close_pending(self, reason):
         record = self.pending()
@@ -395,6 +430,8 @@ class StationRunner:
             raise
 
     def begin(self, detected_sn, detected_id=None):
+        if self.online:
+            self.online.check()
         self.config.validate(live=not self.config.simulation)
         target_id = self.config.require_target_id()
         if self.pending():
@@ -425,6 +462,10 @@ class StationRunner:
             if getattr(self,'_missing_record',None):
                 raise RecoveryRequired('上次工件的本地记录缺失，无法继续该件；如需恢复，请还原原工件目录。')
             raise RecoveryRequired('没有未完成工件')
+        if self.online and record['steps'].get('measure') == 'DONE':
+            evidence = measurement_evidence(record.get('summary'))
+            self.online.committed = evidence['summary_status'] == 'PASS' and all(
+                state == 'DONE' for state in evidence['step_states'].values())
         original_fields=record['config']
         target_id = self.config.require_target_id()
         if original_fields.get('target_id', target_id) != target_id:
@@ -480,6 +521,8 @@ class StationRunner:
         return self.run()
 
     def action(self, name, operation):
+        if self.online:
+            self.online.check()
         if self.record['steps'].get(name) == 'DONE':
             log_event('flow.step.skip', '步骤已经完成，沿用原结果', step=name)
             return
@@ -511,18 +554,27 @@ class StationRunner:
                 raise
         log_event('flow.step.operation_returned', '步骤调用已返回，准备持久保存完成状态',step=name,
                   elapsed_s=round(time.perf_counter()-started,4),result=result,module_sn=self.record.get('module_sn'))
-        self.record['steps'][name] = 'DONE'
-        self.save()
+        def save_completion():
+            self.record['steps'][name] = 'DONE'
+            self.save()
+        if self.online and name == 'measure':
+            self.online.confirm_pass(save_completion)
+        else:
+            save_completion()
         log_event('flow.step.done', label+'完成', step=name, elapsed_s=round(time.perf_counter()-started, 4), result=result)
+        if self.online:
+            self.online.check()
         self.emit('step', dict(name=name, status='DONE'))
         return result
 
     def run(self):
         record = self.record
+        if self.online:
+            self.services.online = self.online
         target = self.log.bind(session=record['session'],request_id=record['request_id'],
                                report_directory=record['directory']) if self.log else None
         from .measurements import hardware_scope
-        with log_scope(target),hardware_scope(self.emit):
+        with log_scope(target),hardware_scope(self.emit, self.online.check if self.online else None):
             started = time.perf_counter()
             log_event('flow.start', '开始执行产测流程', config=record['config'],
                       detected_id=record['detected_id'], detected_sn=record['detected_sn'], base_sn=record['base_sn'])
@@ -581,6 +633,15 @@ class StationRunner:
             self.action('calibrate', self.services.calibrate)
             def measure():
                 summary = self.services.measure(directory, record['base_sn'])
+                if self.online:
+                    if summary.get('error_notes'):
+                        try:
+                            self.online.check()
+                        except NetworkLost as exc:
+                            for note in summary['error_notes']:
+                                exc.add_note(note)
+                            raise
+                    self.online.check()
                 if record.get('firmware'):
                     summary['firmware'] = record['firmware']
                 summary.update(station_version=2, station_session=record['session'], station_ready=False)
@@ -613,6 +674,8 @@ class StationRunner:
                     record['mes_payload'] = mes_payload(self.config, record['request_id'],
                                                        production_date=record.get('production_date'))
                     self.save()
+                if record.get('module_sn'):
+                    return
                 record['module_sn'] = self.services.allocate(record['mes_payload'])
                 log_event('sn.allocated', module_sn=record['module_sn'], payload=record['mes_payload'])
                 self.save()  # SN 一旦返回，立即持久化；补打/恢复不重新取号。
@@ -654,9 +717,29 @@ class StationRunner:
                 except Exception as cleanup:
                     exc.add_note('工装停机未确认：磁粉加载电源关闭未确认，请切断工装电源。原因：'+str(cleanup))
                     log_event('load.shutdown.failed','异常收尾未能确认磁粉加载关闭',level='ERROR',error=cleanup)
+            discard = False
+            if self.online and not self.online.committed:
+                self.online.network.refresh()
+                try:
+                    self.online.check()
+                except NetworkLost as lost:
+                    for note in getattr(exc,'__notes__',()):
+                        lost.add_note(note)
+                    log_event('flow.network.discard','测试通过前失联，报废本件测量数据',step=record.get('current_step'),
+                              module_sn=record.get('module_sn'),request_id=record['request_id'],original_error=str(exc))
+                    exc, discard = lost, True
             step = record.get('current_step', '')
             status = 'UNKNOWN' if isinstance(exc, PrintUnknown) else 'PENDING' if isinstance(exc, PendingConfiguration) else 'FAILED'
-            record['steps'][step] = status
+            if not discard or record['steps'].get(step) != 'DONE':
+                record['steps'][step] = status
+            if discard:
+                status = 'DISCARDED'
+                record.pop('summary',None)
+                record.pop('local_report_generated',None)
+                if record.get('module_sn'):
+                    exc.add_note('已分配 SN '+record['module_sn']+'；已取号、未上报。请核对本件与标签。')
+                elif 'mes_payload' in record:
+                    exc.add_note('取号回执未确认，使用原 requestId 核对 MES：'+record['request_id'])
             diagnostic = error_details(exc)
             notes = list(getattr(exc, '__notes__', []))
             redact = self.log.owner.redact if self.log else lambda value:value
@@ -666,11 +749,16 @@ class StationRunner:
                       module_sn=record.get('module_sn'))
             try:
                 self.save()
+                if discard:
+                    self.clear_discarded_files(record)
             except Exception as save_exc:
                 # A disk/permission fault must not hide the original failure from the UI.
                 log_event('flow.failure_record.failed', '原始失败已写入诊断日志，但工件状态保存失败',
                           level='ERROR', error=save_exc, original_diagnostic=record['diagnostic'])
-                record['error_notes'].append(redact('本件状态保存失败：'+str(save_exc)))
+                note = redact(('报废记录或数据清理未完成，请核对本地目录：' if discard else '本件状态保存失败：')+str(save_exc))
+                record['error_notes'].append(note)
+                if discard:
+                    exc.add_note(note)
             self.emit('step', dict(name=step, status=status))
             self.emit('failed', dict(local_report_generated=record.get('local_report_generated',False),message=record['error'], notes=record['error_notes'], step=step, status=status,
                 step_label=dict(STEPS).get(step,'两项性能测试' if step=='measure' else step),

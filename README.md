@@ -25,7 +25,7 @@ APP 直接放在根目录 EXE 旁的 firmware 文件夹；更换该文件后自�
 
 ## 文档
 
-- [产测人员使用手册](docs/产测人员使用手册.md)：软件顶部 Help 或 F1 也可离线查看。
+- [产测人员使用手册](docs/产测人员使用手册.md)：软件内按 F1 可离线查看。
 - [源码维护说明](scripts/factory_test/README.md)
 - [报告上传接口](docs/factory_report_upload.md)
 

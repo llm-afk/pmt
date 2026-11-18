@@ -515,6 +515,52 @@ class PipelineTests(unittest.TestCase):
         service.render=Mock()
         return StationRunner(cfg,root=root,services=service,cancelled=cancelled),service
 
+    def test_loss_after_sn_allocation_prints_same_sn_and_preserves_pass(self):
+        from scripts.factory_test.network_status import ProductionNetwork
+        from threading import Event
+        with tempfile.TemporaryDirectory() as tmp:
+            runner,svc=self.runner(tmp)
+            probe=Mock(return_value=True)
+            network=ProductionNetwork(lambda:'https://mes.example.test',Event(),Mock(),probe=probe)
+            runner.online=network.begin()
+            def allocate(payload):
+                probe.return_value=False
+                network.refresh()
+                probe.return_value=True
+                return SN
+            svc.allocate=allocate
+            svc.print_sn=Mock()
+            svc.upload=Mock(return_value={'status':'PENDING'})
+            record=runner.begin('incoming')
+            self.assertEqual(record['status'],'COMPLETE')
+            saved=json.loads((Path(record['directory'])/'station.json').read_bytes())
+            self.assertEqual(saved['module_sn'],SN)
+            self.assertEqual(saved['summary']['status'],'PASS')
+            self.assertEqual(saved['request_id'],saved['mes_payload']['requestId'])
+            svc.print_sn.assert_called_once_with(SN)
+            svc.upload.assert_called_once()
+
+    def test_network_loss_before_measurement_pass_discards_curves_without_allocation(self):
+        from scripts.factory_test.network_status import ProductionNetwork
+        from threading import Event
+        with tempfile.TemporaryDirectory() as tmp:
+            runner, svc = self.runner(tmp)
+            probe = Mock(return_value=True)
+            network = ProductionNetwork(lambda:'https://mes.example.test',Event(),Mock(),probe=probe)
+            runner.online = network.begin()
+            measure = svc.measure
+            def interrupted_measure(*args):
+                result = measure(*args)
+                probe.return_value = False
+                network.refresh()
+                return result
+            svc.measure = interrupted_measure
+            svc.allocate = Mock()
+            record = runner.begin('incoming')
+            self.assertEqual(record['status'],'DISCARDED')
+            self.assertFalse((Path(record['directory'])/'summary.json').exists())
+            svc.allocate.assert_not_called()
+
     def test_full_demo_has_no_hardware_or_http_and_all_steps_persisted(self):
         with tempfile.TemporaryDirectory() as tmp, patch('scripts.factory_test.maintenance.Canable',side_effect=AssertionError('USB')), \
              patch('scripts.factory_test.integrations.json_http',side_effect=AssertionError('HTTP')):

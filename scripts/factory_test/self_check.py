@@ -226,12 +226,12 @@ def check_operator_actions(window, summary):
 
 
 def check_operator_manual(window):
-    # Exercise the packaged manual through the real menu, including a busy workpiece.
+    # Exercise the packaged manual through its keyboard handler, including a busy workpiece.
     assert window.root.bind('<F1>') and window.settings_window.bind('<F1>')
     before = (window.page, window.pending_page, window.start_requested,
               window.production_pause.is_set(), window.config_revision)
     window.busy = True
-    window.page_menu.invoke(3)
+    window.show_help()
     help_view = window.help_view
     assert help_view is not None and len(help_view.chapters)>=13
     assert help_view.current==0
@@ -251,7 +251,7 @@ def check_operator_manual(window):
     help_view.query.set('')
     assert len(help_view.visible)==len(help_view.chapters)
     help_view.hide()
-    window.page_menu.invoke(3)
+    window.show_help()
     assert window.help_view is help_view
     assert before==(window.page, window.pending_page, window.start_requested,
                     window.production_pause.is_set(), window.config_revision)
@@ -364,8 +364,8 @@ def run(destination):
             root.update_idletasks()
             assert VERSION_LABEL in root.title() and window.version_label.cget('text')==VERSION_LABEL
             assert window.diagnostics.runtime_info()['version']==VERSION
-            menu = [window.page_menu.entrycget(i, 'label') for i in range(4)]
-            assert menu == ['自动产测', '电机调试', '工位配置', 'Help']
+            menu = [window.page_menu.entrycget(i, 'label') for i in range(window.page_menu.index('end')+1)]
+            assert menu == ['自动产测', '电机调试', '工位配置']
             layout_heights = check_production_layout(window)
             check_operator_manual(window)
             check_startup_logging(window)

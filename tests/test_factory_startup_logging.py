@@ -20,6 +20,28 @@ def snapshot(state='Up'):
 
 
 class NetworkTests(unittest.TestCase):
+    def test_outage_is_latched_for_one_run_and_ignored_after_handoff(self):
+        from scripts.factory_test.network_status import NetworkLost, ProductionNetwork
+        probe = Mock(return_value=False)
+        stop = Mock(); stop.wait.return_value = False
+        network = ProductionNetwork(lambda:'https://mes.example.test',stop,Mock(),probe=probe)
+        with self.assertRaises(NetworkLost): network.begin()
+        probe.return_value=True
+        run = network.begin()
+        probe.return_value=False
+        network.refresh()
+        probe.return_value=True
+        network.refresh()
+        persist=Mock()
+        with self.assertRaises(NetworkLost): run.confirm_pass(persist)
+        persist.assert_not_called()
+        fresh=network.begin()
+        fresh.confirm_pass(persist)
+        probe.return_value=False
+        network.refresh()
+        fresh.check()
+        persist.assert_called_once()
+
     def test_local_snapshot_parses_unicode_and_keeps_dns_without_requesting_services(self):
         data=snapshot()
         data['interfaces'][0]['name']='无线网络'

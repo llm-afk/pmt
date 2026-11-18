@@ -1,10 +1,102 @@
-"""Read local Windows network configuration without sending traffic or changing settings."""
+"""Local adapter diagnostics and production MES reachability."""
 import json
 import os
 from pathlib import Path
 import subprocess
 import threading
 import time
+
+
+class NetworkLost(RuntimeError):
+    diagnostic_code = 'PRODUCTION_NETWORK_LOST'
+    diagnostic_hint = '本件尚未通过测试。恢复网络后重新测试。'
+
+
+def mes_reachable(url):
+    from http.client import HTTPException
+    from urllib.error import HTTPError
+    from urllib.parse import urlsplit
+    from urllib.request import Request, ProxyHandler, build_opener
+    from .integrations import _NoRedirect
+    # HEAD on the configured base uses the same system proxy/TLS path as MES.
+    # Even 401/404/405 proves a reachable server; do not call a business endpoint.
+    try:
+        if urlsplit(url).scheme not in ('http','https'):
+            return False
+        handlers = [ProxyHandler({})] if urlsplit(url).hostname in ('127.0.0.1','localhost','::1') else []
+        with build_opener(*handlers, _NoRedirect()).open(Request(url, method='HEAD'), timeout=2):
+            return True
+    except HTTPError as exc:
+        exc.close()
+        return exc.code not in (407, 502, 503, 504)
+    except (OSError, ValueError, HTTPException):
+        return False
+
+
+class ProductionNetwork:
+    def __init__(self, endpoint, shutdown, notify, probe=mes_reachable):
+        self.endpoint, self.shutdown, self.notify, self.probe = endpoint, shutdown, notify, probe
+        self.lock = threading.RLock()
+        self.poll_lock = threading.Lock()
+        self.url, self.online, self.checked, self.epoch = '', False, 0., 0
+        self.thread = None
+
+    def refresh(self):
+        with self.poll_lock:
+            url = self.endpoint()
+            online = bool(url and self.probe(url))
+            if not online and url and not self.shutdown.wait(.25):
+                online = self.probe(url)
+            with self.lock:
+                now = time.monotonic()
+                if url != self.endpoint():
+                    online = False
+                changed = (url, online) != (self.url, self.online) or not self.checked
+                if changed or now-self.checked > 10:
+                    self.epoch += 1
+                self.url, self.online, self.checked = url, online, now
+            if changed:
+                self.notify(online)
+
+    def ready(self):
+        with self.lock:
+            return self.online and self.url == self.endpoint() and time.monotonic()-self.checked <= 10
+
+    def start(self):
+        def watch():
+            while not self.shutdown.is_set():
+                self.refresh()
+                self.shutdown.wait(2)
+        self.thread = threading.Thread(target=watch, name='production-network', daemon=True)
+        self.thread.start()
+
+    def begin(self, *, resume=False):
+        self.refresh()
+        with self.lock:
+            if not resume and not self.ready():
+                raise NetworkLost('MES 网络未就绪，未开始测试。')
+            return OnlineWorkpiece(self, self.epoch)
+
+
+class OnlineWorkpiece:
+    def __init__(self, network, epoch):
+        self.network, self.epoch = network, epoch
+        self.committed = self.lost = False
+
+    def check(self):
+        with self.network.lock:
+            if self.committed:
+                return
+            if self.lost or self.network.epoch != self.epoch or not self.network.ready():
+                self.lost = True
+                raise NetworkLost('测试通过前 MES 网络中断，本次测试数据报废。')
+
+    def confirm_pass(self, persist):
+        self.network.refresh()
+        with self.network.lock:
+            self.check()
+            persist()
+            self.committed = True
 
 
 NETWORK_INTERVAL_S = 30

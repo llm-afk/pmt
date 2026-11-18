@@ -13,7 +13,7 @@ from motor_platform.runtime import MOTOR_FEEDBACK_TIMEOUT_S
 from motor_platform.components.dynamometer.protocol import SPEED_COUNTS_PER_RPM
 from .. import (measurement_devices, SAMPLE_MAX_GAP_S, power_off, record_shutdown_failure,
                 device_snapshot, log_measurement_snapshot, stop_with_ramp, capture_shutdown_error,
-                check_motor_feedback, hardware_state, finish_capture, record_progress, check_cancelled)
+                check_motor_feedback, hardware_state, finish_capture, record_progress, check_cancelled, check_production_network)
 from ..console import WindowConsole as TerminalConsole
 from scripts.factory_test.measurements.tn_curve.recording import CurveRecorder, event_row
 from scripts.factory_test.measurements.smoothing import append_smoothed_columns
@@ -162,6 +162,7 @@ def run(motor, dyno, power, pool, ui, writer, summary, *, torque=None):
         target_reached = False
         progress.started = math.inf  # 到达最大扭矩后才开始保持计时
         while True:
+            check_production_network()
             now = time.perf_counter()
             state,stats = check_motor_feedback(motor)
             ds = dyno.state(max_age=DYNO_FEEDBACK_TIMEOUT_S)

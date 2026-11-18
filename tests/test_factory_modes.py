@@ -243,6 +243,29 @@ class DebugSettingsTests(unittest.TestCase):
         host.apply_config=Mock(return_value=True)
         return host
 
+    def test_ready_settings_open_even_if_diagnostics_fail(self):
+        host=self.make_host()
+        host.page='production'
+        host.control_page.active=False
+        host.ready_to_start=host.scan_in_progress=True
+        host.refresh_environment.side_effect=ValueError('invalid cached snapshot')
+        host.show_settings()
+        host.settings_window.deiconify.assert_called_once()
+        host.settings_window.lift.assert_called_once()
+        host.settings_error.set.assert_called()
+        self.assertTrue(host.ready_to_start)
+
+    def test_opening_settings_during_driver_install_or_test_allows_view_but_blocks_save(self):
+        for flag in ('busy','driver_installing'):
+            with self.subTest(flag=flag):
+                host=self.make_host()
+                setattr(host,flag,True)
+                host.show_settings()
+                host.settings_window.deiconify.assert_called_once()
+                host.finish_settings()
+                host.apply_config.assert_not_called()
+                host.control_page.leave.assert_not_called()
+
     def test_settings_can_open_while_debug_motor_is_connected(self):
         host=self.make_host()
         host.show_settings()

@@ -91,6 +91,7 @@ class FactoryWindow:
         self.storage_root = storage_root
         self.preview_only = preview_only
         self.help_view = None
+        self.production_network = None
         self.network_monitor = None
         self.network_snapshot = None
         self.bootstrap_thread = None
@@ -353,22 +354,22 @@ class FactoryWindow:
     def show_settings(self):
         if self.closing:
             return
-        if getattr(self, 'driver_installing', False):
-            self.hint.set('正在安装设备驱动，完成后可修改工位设置。')
-            return
-        if self.busy:
-            self.hint.set('任务运行中，结束后可修改工位设置。')
-            return
-        if self.control_page.active and not self.settings_save_pending:
+        self.settings_window.transient(self.root)
+        self.settings_window.deiconify()
+        self.settings_window.lift()
+        self.settings_window.focus_set()
+        if self.busy or getattr(self, 'driver_installing', False):
+            self.settings_error.set('可查看工位配置。当前任务结束后可保存修改。')
+        elif self.control_page.active and not self.settings_save_pending:
             self.settings_error.set('调试连接中；修改 CANable 或硬件版本后保存会先停机重连，云端配置不打断调试。')
         self.show_service_keys.set(False)
         for widget in self.secret_widgets.values():
             widget.configure(show='*')
-        self.refresh_environment()
-        self.settings_window.deiconify()
-        self.settings_window.transient(self.root)
-        self.settings_window.lift()
-        self.settings_window.focus_set()
+        try:
+            self.refresh_environment()
+        except Exception as exc:
+            self.diagnostics.current.event('ui.settings.environment_failed', level='ERROR', error=exc)
+            self.settings_error.set('环境诊断信息未能刷新，详情已写入本次日志。')
         self.firmware_panel.refresh()
 
     def refresh_serial_field(self, name):
@@ -483,6 +484,9 @@ class FactoryWindow:
             return True
 
     def finish_settings(self):
+        if self.busy or getattr(self, 'driver_installing', False):
+            self.settings_error.set('当前任务仍在运行，请在结束后保存修改。')
+            return
         if self.settings_save_pending:
             return
         if (self.page == 'control' or self.control_page.active) and self.debug_settings_require_restart():
@@ -614,6 +618,10 @@ class FactoryWindow:
             self.request_stop()
             return
         if self.drivers_blocking() or self.page != 'production' or self.control_page.active or not self.ready_to_start:
+            return
+        if not self.config.simulation and not self.production_network.ready():
+            self.stop.config(state='disabled')
+            self.set_prompt('请连接网络并确认 MES 可达','恢复网络后可开始正式产测。')
             return
         WindowConsole.cancelled.clear()
         with self.lock:
@@ -893,10 +901,13 @@ class FactoryWindow:
     def bootstrap_dependencies(self):
         self.write_log('[环境] 开始加载串口、报告渲染和云端客户端组件。')
         if not self.config.simulation:
-            from .network_status import NetworkMonitor
+            from .network_status import NetworkMonitor, ProductionNetwork
             self.write_log('[网络] 正在读取 Wi-Fi / 有线网络、IP、网关和 DNS 配置。')
             self.network_monitor = NetworkMonitor(lambda value:self.events.put(('network_status',value)),
                 self.shutdown,self.diagnostics)
+            self.production_network = ProductionNetwork(lambda:self.config.mes_url,self.shutdown,
+                lambda online:self.events.put(('mes_reachability',online)))
+            self.production_network.start()
             self.network_monitor.start()
         def worker():
             missing = []
@@ -1204,6 +1215,8 @@ class FactoryWindow:
                 states = {name:info['state'] for name,info in health_snapshot.items()}
                 self.diagnostics.record_health(health_snapshot)
                 needed = [] if config.simulation else [key for key in ('can','dyno','power','printer') if states.get(key)!='READY']
+                if not config.simulation and not (getattr(self,'production_network',None) and self.production_network.ready()):
+                    needed.append('network')
                 support_ready = not needed
                 sn_configured=self.sn_configuration_ready(config)
                 if firmware_issue and not config.simulation: needed.append('firmware')
@@ -1242,6 +1255,18 @@ class FactoryWindow:
                             or self.page != 'production' or self.config_revision != revision or latest != config):
                         self.latch.stable = 0
                         continue
+                online = None
+                if not config.simulation:
+                    from .network_status import NetworkLost
+                    try:
+                        online = self.production_network.begin(resume=resume)
+                    except NetworkLost as exc:
+                        self.events.put(('logged_line',str(exc)))
+                        continue
+                with self.lock:
+                    if (self.station_cancelled() or self.configuring or revision != self.config_revision
+                            or mode_generation != self.mode_generation):
+                        continue
                     self.busy = True
                     last_motor_response = None
                 hardware_ports = {name:port for name in ('power','dyno')
@@ -1263,7 +1288,7 @@ class FactoryWindow:
                     firmware_sha256 = start_app['sha256']
                     self.diagnostics.current.event('firmware.start_snapshot', **start_app)
                 runner = StationRunner(config,root=self.storage_root,emit=emit,cancelled=self.station_cancelled,
-                                       delivery=self.delivery,log_target=self.diagnostics.current,
+                                       delivery=self.delivery,log_target=self.diagnostics.current,online=online,
                                        firmware_sha256=firmware_sha256, hardware_ports=hardware_ports)
                 if not resume and runner.already_completed(detected):
                     self.events.put(('failed',dict(message='当前 SN 已完成生产，不能重复取号',notes=[])))
@@ -1285,7 +1310,7 @@ class FactoryWindow:
                     unsafe_notes = unconfirmed_cleanup_notes(record.get('error_notes', ()))
                     if unsafe_notes:
                         self.handoff_error='；'.join(unsafe_notes)
-                if record['status'] != 'COMPLETE':
+                if record['status'] not in ('COMPLETE','DISCARDED'):
                     runner.close_pending('工位异常自动归档，保留原 SN、requestId、打印状态和错误日志；禁止盲重试')
                 self.started_sessions += 1
             except BaseException as exc:
@@ -1388,6 +1413,8 @@ class FactoryWindow:
         if missing:
             if any(k in blockers for k in ('firmware','profile','target_id','sn_key','mes_url')):
                 title='请联系工程人员完善工位配置'
+            elif 'network' in blockers:
+                title='请连接网络并确认 MES 可达'
             elif 'dyno' in blockers:
                 title='请检查测功机连接'
             elif 'power' in blockers:
@@ -1441,7 +1468,7 @@ class FactoryWindow:
     def process_events(self):
         if self.closing:
             return
-        statuses=dict(RUNNING='进行中',DONE='完成',FAILED='失败',PENDING='待配置',UNKNOWN='异常已记录',
+        statuses=dict(RUNNING='进行中',DONE='完成',FAILED='失败',DISCARDED='已报废',PENDING='待配置',UNKNOWN='异常已记录',
                       LEGACY='沿用旧流程',COLLECTED='已采集，待判定',INCOMPLETE='未完成',WAITING='等待')
         started=time.monotonic()
         handled=0
@@ -1456,6 +1483,11 @@ class FactoryWindow:
                 continue
             if kind=='driver_setup':
                 self.driver_event(value)
+            elif kind=='mes_reachability':
+                self.write_log('[产测网络] '+('MES 网络可达' if value else 'MES 网络不可达，请检查工位网络或服务地址。'))
+                if not value and not self.busy and not self.config.simulation:
+                    self.ready_to_start=self.start_requested=self.resume_requested=False
+                    self.stop.config(state='disabled')
             elif kind=='network_status':
                 from .network_status import network_messages
                 self.network_snapshot=value
@@ -1604,7 +1636,6 @@ class FactoryWindow:
                 for widget,mode in self.fields: widget.config(state='disabled' if value else mode)
                 for widget in (self.auto_control,self.resume_button,self.resolve_button):
                     widget.config(state='disabled' if value else 'normal')
-                self.page_menu.entryconfigure(2,state='disabled' if value else 'normal')
                 self.stop.config(text='停止测试' if value else '开始测试',state='normal' if value and not self.stopping else 'disabled')
                 if value:
                     self.terminal_prompt=None
@@ -1637,7 +1668,7 @@ class FactoryWindow:
                     label=dict(STEPS)[name]
                     index=[n for n,_ in STEPS].index(name)+1
                     step_label = f'{index:02d} {label}'
-                    tag = {'COLLECTED':'PENDING', 'INCOMPLETE':'FAILED'}.get(state,state)
+                    tag = {'COLLECTED':'PENDING', 'INCOMPLETE':'FAILED','DISCARDED':'FAILED'}.get(state,state)
                     self.steps.item(name,values=(f'{index:02d}   {label}',statuses[state]),tags=(tag,))
                     if state=='RUNNING' and not self.stopping and not self.terminal_prompt:
                         title='请保持连接，等待自动测试'
@@ -1655,6 +1686,9 @@ class FactoryWindow:
                 if not self.stopping and not self.terminal_prompt:
                     self.set_prompt('请保持供电和 CAN 连接',value,'#2563EB')
                 self.write_log(value,persist=False)
+            elif kind=='allocation_wait':
+                self.set_prompt('已合格，等待联网取号',value,'#956100')
+                self.write_log(value)
             elif kind=='sn': self.current_sn.set(value)
             elif kind=='sn_phase': self.sn_phase.set(value)
             elif kind=='metrics':
@@ -1719,6 +1753,8 @@ class FactoryWindow:
         if step=='print' and (value.get('status')=='UNKNOWN' or code in
                               ('PRINT_OUTCOME_UNKNOWN','PRINT_ACK_INVALID','PRINT_SERVICE_OUTCOME_UNKNOWN','PRINT_ACK_CONFLICT')):
             return '打印结果未确认，请隔离本件','勿补打或贴标。请工程人员核对实体标签和打印记录。'
+        if code == 'PRODUCTION_NETWORK_LOST':
+            return '网络中断，请隔离本件',value.get('message','本次数据报废；恢复网络后重新测试。')
         if code == 'CANCELLED':
             return '本次测试已停止','停止结果和加载关闭回执已保存；确认设备停止后再取件。'
         if code == 'TEST_QUALITY_FAILED':
@@ -1819,7 +1855,7 @@ class FactoryWindow:
         if getattr(self,'help_view',None) is not None:
             self.help_view.hide()
         self.stop.config(state='disabled')
-        for index in range(4): self.page_menu.entryconfigure(index,state='disabled')
+        for index in range(3): self.page_menu.entryconfigure(index,state='disabled')
         self.advance_shutdown()
 
     def owned_threads(self):
@@ -1832,6 +1868,7 @@ class FactoryWindow:
         candidates.append(getattr(self,'bootstrap_thread',None))
         candidates.append(getattr(getattr(self,'driver_manager',None),'thread',None))
         candidates.append(getattr(getattr(self,'network_monitor',None),'thread',None))
+        candidates.append(getattr(getattr(self,'production_network',None),'thread',None))
         candidates.append(getattr(getattr(self,'firmware_panel',None),'thread',None))
         health = getattr(self,'device_health',None)
         if health is not None:

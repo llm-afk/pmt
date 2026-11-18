@@ -10,12 +10,17 @@ SAMPLE_MAX_GAP_S = 0.1  # 采集连续性和平滑分段阈值，独立于电机
 _hardware_events = ContextVar('production_hardware_events',default=None)
 
 
+_network_check = ContextVar('production_network_check', default=None)
+
+
 @contextmanager
-def hardware_scope(emit):
+def hardware_scope(emit, network_check=None):
     token = _hardware_events.set(emit)
+    network_token = _network_check.set(network_check)
     try:
         yield
     finally:
+        _network_check.reset(network_token)
         _hardware_events.reset(token)
 
 
@@ -35,7 +40,14 @@ def hardware_state(name, detail, *, state='IN_USE', **data):
     _hardware_emit(_hardware_events.get(),current_log(),name,detail,state=state,**data)
 
 
+def check_production_network():
+    check = _network_check.get()
+    if check is not None:
+        check()
+
+
 def check_cancelled():
+    check_production_network()
     from .console import WindowConsole
     if WindowConsole.cancelled.is_set():
         raise InterruptedError('操作员已停止测试')

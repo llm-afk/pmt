@@ -11,7 +11,7 @@ from motor_platform import MitCommand
 from motor_platform.components.dynamometer.protocol import SPEED_COUNTS_PER_RPM
 from .. import (measurement_devices, SAMPLE_MAX_GAP_S, power_off,
                 device_snapshot, log_measurement_snapshot, stop_with_ramp, capture_shutdown_error,
-                check_motor_feedback, hardware_state, finish_capture, record_progress, check_cancelled)
+                check_motor_feedback, hardware_state, finish_capture, record_progress, check_cancelled, check_production_network)
 from ..console import WindowConsole as TerminalConsole
 from scripts.factory_test.measurements.smoothing import append_smoothed_columns
 from scripts.factory_test.measurements.csv_streams import pack_streams
@@ -111,6 +111,7 @@ def run(motor, dyno, ui, args, result):
         result['recorder'] = recorder
         next_display = 0.0
         while True:
+            check_production_network()
             now = time.perf_counter()
             state, stats = check_motor(motor)
             ds = dyno.state(max_age=DYNO_FEEDBACK_TIMEOUT_S)
