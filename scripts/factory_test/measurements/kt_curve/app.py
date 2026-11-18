@@ -10,6 +10,7 @@ from scripts.factory_test.station_config import DEFAULT_KT_ERROR_LIMIT_PCT
 from motor_platform import Bench, Canable, Dynamometer, MitCommand, PowerSupply
 from motor_platform.runtime import MOTOR_FEEDBACK_TIMEOUT_S, start_monitoring
 from motor_platform.components.dynamometer import detect_dynamometers
+from motor_platform.components.dynamometer.protocol import SPEED_COUNTS_PER_RPM
 from motor_platform.components.power_supply.discovery import resolve_power_port
 from .. import (SAMPLE_MAX_GAP_S, power_off, record_shutdown_failure, power_observer,
                 device_snapshot, log_measurement_snapshot, stop_with_ramp, capture_shutdown_error,
@@ -34,7 +35,7 @@ TARGET_UPDATE_S = 0.001         # 应用更新目标的间隔；迟到不补发�
 STOP_RAMP_S = 1.0               # 正常结束、用户停止：保持阻尼，线性降扭矩到零
 DYNO_FEEDBACK_TIMEOUT_S = 1.0
 DYNO_TORQUE_SCALE = 100.0
-DYNO_SPEED_SCALE = 100.0
+DYNO_SPEED_SCALE = SPEED_COUNTS_PER_RPM
 SMOOTH_WINDOW_S = 0.30          # 停机后平滑两路扭矩；原始样本不修改
 
 

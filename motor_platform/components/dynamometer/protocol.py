@@ -3,6 +3,10 @@ from dataclasses import dataclass
 import math
 
 
+# Production DYN-200 speed field, in counts per revolution per minute.
+SPEED_COUNTS_PER_RPM = 10.0
+
+
 def positive(value):
     if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
         raise ValueError('scale/timeout must be finite and positive')
@@ -37,7 +41,7 @@ class DynamometerState:
         return self.torque * self.speed
 
 
-def parse_frame(data, *, torque_scale=100.0, speed_scale=100.0, received_at=0.0):
+def parse_frame(data, *, torque_scale=100.0, speed_scale=SPEED_COUNTS_PER_RPM, received_at=0.0):
     positive(torque_scale)
     positive(speed_scale)
     if not valid_frame(data):

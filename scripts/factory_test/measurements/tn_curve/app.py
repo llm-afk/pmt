@@ -10,6 +10,7 @@ import time
 from motor_platform import Bench, MitCommand, Dynamometer, PowerSupply, Canable
 from motor_platform.runtime import MOTOR_FEEDBACK_TIMEOUT_S, start_monitoring
 from motor_platform.components.dynamometer import detect_dynamometers
+from motor_platform.components.dynamometer.protocol import SPEED_COUNTS_PER_RPM
 from motor_platform.components.power_supply.discovery import resolve_power_port
 from .. import (SAMPLE_MAX_GAP_S, power_off, record_shutdown_failure, power_observer,
                 device_snapshot, log_measurement_snapshot, stop_with_ramp, capture_shutdown_error,
@@ -36,7 +37,7 @@ STALL_SPEED_RAD_S = 0.5
 STALL_HOLD_S = 0.100
 DYNO_FEEDBACK_TIMEOUT_S = 1.0
 DYNO_TORQUE_SCALE = 100.0         # 沿用已验证接收组件；实测标定另行核对
-DYNO_SPEED_SCALE = 100.0
+DYNO_SPEED_SCALE = SPEED_COUNTS_PER_RPM
 MOTOR_SPEED_SMOOTH_S = 0.30       # 停机后速度平滑的完整时间窗口；越大越平滑、拐点越钝
 MOTOR_TORQUE_SMOOTH_S = 0.30      # 扭矩平滑窗口；原始反馈保留，堵转判断仍使用原始速度
 DYNO_SPEED_SMOOTH_S = 0.30        # 测功机速度平滑窗口；与电机采用相同的抗毛刺算法

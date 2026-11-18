@@ -48,12 +48,19 @@ class DynamometerTests(unittest.TestCase):
                 state = parse_frame(frame(raw_torque, 32767), received_at=1)
                 self.assertEqual(state.raw_torque, raw_torque)
                 self.assertEqual(state.torque, motor_torque)
-                self.assertEqual(state.rpm, 327.67)
-                self.assertAlmostEqual(state.speed, 327.67*math.pi/30)
+                self.assertEqual(state.rpm, 3276.7)
+                self.assertAlmostEqual(state.speed, 3276.7*math.pi/30)
                 self.assertAlmostEqual(state.power, motor_torque*state.speed)
                 self.assertEqual(state.received_at, 1)
         with self.assertRaises(ValueError):
             parse_frame(b'123456')
+
+    def test_station_speed_units(self):
+        # A field sample at 11:06:10 had 2084 counts on the serial channel.
+        state = parse_frame(frame(-25, 2084))
+        self.assertEqual(state.rpm, 208.4)
+        self.assertAlmostEqual(state.speed, 21.8235969669371)
+        self.assertAlmostEqual(state.power, 0.25 * state.speed)
 
     def test_all_split_boundaries_and_coalesced_frames(self):
         frames = [frame(i, i*2) for i in range(10)]

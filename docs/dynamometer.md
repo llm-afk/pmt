@@ -44,8 +44,8 @@ CRC 不是绝对的身份标识，偶然误匹配仍有可能；`discarded_bytes
 工位以电机方向为正。v1.0.29 起，`raw_torque` 保留测功机回包的带符号计数，
 工位扭矩 `torque = -raw_torque / torque_scale`，默认每 100 个计数对应 1 Nm。
 例如，原始计数 −2128 对应工位 +21.28 Nm。设备卡、测试记录和报告使用工位方向。
-`rpm = raw_speed / speed_scale`，默认 `speed_scale=100`，`speed = rpm * π / 30`（rad/s）。
-旧代码标记缩放待校准，仍需实机确认；脚本可传入不同缩放。
+`rpm = raw_speed / speed_scale`，当前工位默认 `speed_scale=10`（每计数 0.1 rpm），`speed = rpm * π / 30`（rad/s）。
+v1.0.38 起使用此倍率，与现场同工况电机转速交叉核对。v1.0.37 及以前按 100 个计数/rpm 换算，旧测功机速度与派生功率数值是当前换算的十分之一。独立仪表标定待现场验证。
 `power = torque * speed` 保留符号。线路没有转速方向位，不能据此判定完整机械功率流向；
 需要幅值时应用取 `abs(state.power)`。
 

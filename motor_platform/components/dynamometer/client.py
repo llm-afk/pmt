@@ -5,7 +5,7 @@ import threading
 import time
 
 from ...transports.serial_stream import SerialStream
-from .protocol import FrameParser, parse_frame, positive
+from .protocol import SPEED_COUNTS_PER_RPM, FrameParser, parse_frame, positive
 
 
 _port_owners = {}
@@ -33,7 +33,7 @@ class Dynamometer:
             return list(_port_owners.values())
 
     def __init__(self, *, port, baudrate=115200, torque_scale=100.0,
-                 speed_scale=100.0, transport=None):
+                 speed_scale=SPEED_COUNTS_PER_RPM, transport=None):
         self.torque_scale, self.speed_scale = positive(torque_scale), positive(speed_scale)
         self.port = port
         self._port_key = port.strip().casefold()
