@@ -159,6 +159,7 @@ class StationConfig:
     report_api_key_header: str = 'X-Api-Key'
     printer_copies: int = 1
     max_test_torque_nm: float = DEFAULT_TEST_TORQUE_NM
+    adapter_auto_selected: bool = False
 
     @property
     def target_id(self):
@@ -256,6 +257,9 @@ def load_config(path=None):
     # queue saved by this release still means "use the service default".
     if raw.get('config_format', 1) == 1 and not values.get('printer_name', '').strip():
         values['printer_name'] = DEFAULT_PRINTER_NAME
+    # Older configs stored the sole adapter without recording how it was chosen.
+    if 'adapter_auto_selected' not in raw:
+        values['adapter_auto_selected'] = bool(values.get('adapter_sn'))
     if 'protected_credentials' in raw:
         values['credentials_file'] = str(path.resolve())
     if 'hardware_version' in values:

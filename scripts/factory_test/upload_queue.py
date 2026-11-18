@@ -18,6 +18,7 @@ from .diagnostics import current_log, log_event, log_scope
 RETRY_DELAYS = (5, 15, 30, 60, 120, 300)
 BLOCKED_RECHECK_S = 600
 SCAN_SECONDS = 30
+SESSION_PATTERN = re.compile(r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}')
 NAME_PATTERN = re.compile(r'\d{8}_\d{6}_[A-Za-z0-9]{26}(?:_\d+)?')
 
 
@@ -28,7 +29,11 @@ def read_json(path):
     return value
 
 
-def production_pass(summary):
+def production_pass(summary, directory=None):
+    # A UUID directory is a workstation session. Its first PASS summary can
+    # precede allocation, label printing and completion of the local report.
+    if directory is not None and SESSION_PATTERN.fullmatch(Path(directory).name) and summary.get('station_version') != 2:
+        return False
     return (summary.get('delivery_policy') != 'LOCAL_ONLY' and
             summary.get('demo') is False and not summary.get('integration_test') and
             (summary.get('station_version') != 2 or summary.get('station_ready') is True) and
@@ -107,7 +112,7 @@ class UploadQueue:
         directory = Path(directory).resolve()
         with report_lock(directory, '.upload-queue.lock'):
             summary = read_json(metadata(directory, 'summary.json'))
-            if not production_pass(summary):
+            if not production_pass(summary, directory):
                 raise UploadError('只有真实、完整且测试通过的报告才能进入生产上传队列。')
             with report_lock(directory):
                 plan = UploadPlan.from_directory(directory, summary,object_prefix=self.oss_target['prefix'])
@@ -143,7 +148,7 @@ class UploadQueue:
         summary = read_json(source)
         if summary.get('delivery_policy') == 'LOCAL_ONLY':
             return
-        if not outcome_only and not production_pass(summary):
+        if not outcome_only and not production_pass(summary, directory):
             return
         if outcome_only and (summary.get('demo') is not False or summary.get('integration_test')):
             return
@@ -163,13 +168,22 @@ class UploadQueue:
 
     def discover(self):
         errors = []
+        with self.lock:
+            cached = tuple(self.entries)
+        for directory in cached:
+            try:
+                directory.stat()
+            except FileNotFoundError:
+                with self.lock:
+                    self.entries.pop(directory, None)
+            except OSError:
+                pass  # An inaccessible directory can still contain a pending task.
         for root in self.roots:
             if not root.exists():
                 continue
             try:
                 directories = [p for p in root.iterdir() if p.is_dir() and (
-                    NAME_PATTERN.fullmatch(p.name) or re.fullmatch(
-                        r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}', p.name))]
+                    NAME_PATTERN.fullmatch(p.name) or SESSION_PATTERN.fullmatch(p.name))]
             except OSError:
                 errors.append(f'无法读取报告目录：{root}')
                 continue
@@ -193,11 +207,18 @@ class UploadQueue:
                         if item['status'] == 'SUCCEEDED':
                             self._sync_receipt(directory)
                         continue
+                    if SESSION_PATTERN.fullmatch(directory.name):
+                        summary_path = metadata(directory, 'summary.json')
+                        if not summary_path.exists() or not production_pass(read_json(summary_path), directory):
+                            with self.lock:
+                                if self.entries.get(directory, {}).get('discovery_error'):
+                                    self.entries.pop(directory)
+                            continue
                     self._recover_render(directory)
                     if not (metadata(directory, 'summary.json')).exists():
                         continue  # A setup-only directory is not a completed test.
                     summary = read_json(metadata(directory, 'summary.json'))
-                    if production_pass(summary):
+                    if production_pass(summary, directory):
                         self.enqueue(directory)
                 except UploadBusy:
                     continue
@@ -229,7 +250,7 @@ class UploadQueue:
             if item.get('endpoint') != CLOUD_MES_URL or item.get('status') == 'SUCCEEDED':
                 return False
             summary = read_json(metadata(directory, 'summary.json'))
-            if not production_pass(summary):
+            if not production_pass(summary, directory):
                 return False
             state_path = metadata(directory, 'upload-state.json')
             state = read_json(state_path)
@@ -354,7 +375,7 @@ class UploadQueue:
         previous_error = item.get('last_error')
         try:
             summary = read_json(metadata(directory, 'summary.json'))
-            if not production_pass(summary):
+            if not production_pass(summary, directory):
                 raise UploadError('报告不再满足真实测试 PASS 条件，已停止自动上报。')
             receipt = self.uploader(directory)
             item.update(status='SUCCEEDED', receipt=receipt, last_error=None, next_attempt=0)

@@ -371,6 +371,23 @@ class FactoryWindow:
         self.settings_window.focus_set()
         self.firmware_panel.refresh()
 
+    def refresh_serial_field(self, name):
+        from .operator_view import serial_choices
+        matches, active = self.serial_results.get(name, ((), None))
+        shown, choices = serial_choices(self.vars[name].get(), matches, active)
+        widget = self.field_widgets[name]
+        widget.configure(values=choices)
+        self.serial_display[name].set(shown)
+
+    def choose_serial_port(self, name):
+        choice = self.serial_display[name].get()
+        if choice == '自动探测':
+            self.vars[name].set('auto')
+        elif choice in self.serial_results.get(name, ((), None))[0]:
+            self.vars[name].set(choice)
+        self.refresh_serial_field(name)
+        self.selection_changed(name)
+
     def show_adapter_status(self):
         if self.adapter_devices is not None:
             info = (dict(state='ERROR', detail='USB 枚举失败：'+str(self.adapter_error)) if self.adapter_error
@@ -419,8 +436,12 @@ class FactoryWindow:
         self.save_adapter_selection('', reason='adapter_removed')
 
     def select_single_adapter(self):
-        if (self.adapter_error is None and self.adapter_devices is not None and len(self.adapter_devices)==1
-                and not self.busy and not self.closing and not self.control_page.active and self.pending_page is None):
+        if (self.adapter_error is not None or self.adapter_devices is None or self.busy or self.closing
+                or self.control_page.active or self.pending_page is not None):
+            return
+        if len(self.adapter_devices)>1 and self.config.adapter_auto_selected:
+            self.save_adapter_selection('', reason='multiple_adapters')
+        elif len(self.adapter_devices)==1:
             serial = self.adapter_devices[0]['serial_number']
             if self.config.adapter_sn != serial:
                 self.save_adapter_selection(serial, reason='only_adapter')
@@ -431,14 +452,14 @@ class FactoryWindow:
                 return
             self.configuring = True
             previous = self.config.adapter_sn
-            config = replace(self.config, adapter_sn=serial)
+            config = replace(self.config, adapter_sn=serial, adapter_auto_selected=(reason=='only_adapter'))
         try:
             # Commit only the current config, never other half-edited UI fields.
             save_config(config, self.config_path)
             with self.lock:
                 self.config = config
                 self.config_revision += 1
-                self.invalidate_readiness()
+                self.invalidate_readiness({'can','motor'})
             self.vars['adapter_sn'].set(serial)
             self.diagnostics.current.event('configuration.adapter_selected' if serial else 'configuration.adapter_removed',
                                            previous_serial=previous, selected_serial=serial, reason=reason, busy=self.busy)
@@ -501,6 +522,8 @@ class FactoryWindow:
             variable.set(self.config.hardware_version['ABCD'.index(part)])
         for name, variable in self.secret_vars.items():
             variable.set(self.saved_credentials.get(name,''))
+        for name in self.serial_display:
+            self.refresh_serial_field(name)
         self.category.configure(values=material_options(self.config.project))
         self.subcategory.configure(values=material_options(self.config.project,self.config.category))
         self.settings_error.set('')
@@ -691,6 +714,8 @@ class FactoryWindow:
                 values['kt_error_limit_pct'] = float(values['kt_error_limit_pct'])
             if 'printer_copies' in values:
                 values['printer_copies'] = int(values['printer_copies'])
+            if commit_services and values['adapter_sn'] != self.config.adapter_sn:
+                values['adapter_auto_selected'] = False
             config = replace(self.config, **values, automatic=self.auto.get(),
                              simulation=bool(self.preview_only))
             desired = {key:variable.get().strip() for key,variable in self.secret_vars.items()} if commit_services else self.saved_credentials
@@ -1474,6 +1499,12 @@ class FactoryWindow:
                 self.update_adapters(value)
             elif kind=='device_health':
                 name, info = value['name'], value['info']
+                if name in ('dyno','power'):
+                    key = name + '_port'
+                    result = (tuple(info.get('matched_ports', ())), info.get('active_port'))
+                    if self.serial_results.get(key) != result:
+                        self.serial_results[key] = result
+                        self.refresh_serial_field(key)
                 if name=='printer' and 'printer_names' in info:
                     self.field_widgets['printer_name'].configure(values=info['printer_names'])
                 if name != 'can' or self.adapter_monitor is None:

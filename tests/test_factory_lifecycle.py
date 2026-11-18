@@ -359,7 +359,7 @@ class SettingsTransactionTests(unittest.TestCase):
         host.log_configuration=Mock()
         host.health_states={name:dict(state='READY',detail=name) for name in ('can','dyno','power','printer')}
         host.last_health=123.;host.latch.stable=3
-        host.settings_window=Mock()
+        host.settings_window=Mock();host.serial_display={}
         return host
 
     def test_product_edits_stay_draft_and_commit_preserves_hardware_readiness(self):

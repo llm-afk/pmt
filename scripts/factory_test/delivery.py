@@ -62,7 +62,7 @@ class ReportDelivery:
             raise UploadError('报告不属于当前工位的数据目录。')
         with report_lock(directory, '.delivery-intent.lock'):
             summary = read_json(metadata(directory, 'summary.json'))
-            if not production_pass(summary):
+            if not production_pass(summary, directory):
                 raise UploadError('只有真实、完成写号打印并测试通过的报告才能上报。')
             plan = UploadPlan.from_directory(directory, summary,object_prefix=self.config.oss_prefix)
             path = metadata(directory, 'upload-pending.json')
@@ -97,7 +97,7 @@ class ReportDelivery:
                 continue
             try:
                 summary = read_json(path)
-                if not production_pass(summary):
+                if not production_pass(summary, directory):
                     continue
                 state_path = metadata(directory, 'upload-state.json')
                 if state_path.exists() and read_json(state_path).get('status') == 'SUCCEEDED':

@@ -20,13 +20,18 @@ def limit_entry_length(widget, maximum, *, digits=False):
                         (not digits or not proposed or all(ch in '0123456789' for ch in proposed))), '%P'))
 
 
-def port_options(saved='auto'):
-    try:
-        from serial.tools.list_ports import comports
-        found=sorted({p.device for p in comports()})
-    except ImportError:
-        found=[]
-    return list(dict.fromkeys(['auto',*found,*([saved] if saved and saved!='auto' else [])]))
+def serial_choices(preference, matches, active):
+    """Return the visible text and a dropdown containing only identified ports."""
+    automatic = '自动探测'
+    if preference in matches:
+        shown = preference
+    elif active:
+        shown = active + '（自动）'
+    elif len(matches) > 1:
+        shown = '请选择串口'
+    else:
+        shown = '等待识别'
+    return shown, (automatic, *matches)
 
 
 def build_settings(self):
@@ -73,10 +78,19 @@ def build_settings(self):
         parent.columnconfigure(1, weight=1)
         return widget
     self.devices = field(basic, 0, 'adapter_sn', 'CANable SN', [])
-    self.power_port_combo=field(basic,1,'power_port','加载电源串口',port_options(self.config.power_port))
-    self.dyno_port_combo=field(basic,2,'dyno_port','测功机串口',port_options(self.config.dyno_port))
-    self.power_port_combo.configure(postcommand=lambda:self.power_port_combo.configure(values=port_options(self.vars['power_port'].get())))
-    self.dyno_port_combo.configure(postcommand=lambda:self.dyno_port_combo.configure(values=port_options(self.vars['dyno_port'].get())))
+    self.serial_results = {}
+    self.serial_display = {}
+    for row, name, label in ((1,'power_port','加载电源串口'),(2,'dyno_port','测功机串口')):
+        combo = field(basic,row,name,label,[])
+        display = tk.StringVar(value='等待识别')
+        self.serial_display[name] = display
+        combo.configure(textvariable=display)
+        combo.bind('<<ComboboxSelected>>', lambda _, key=name: self.choose_serial_port(key))
+        combo.unbind('<FocusOut>')
+        combo.unbind('<Return>')
+        self.refresh_serial_field(name)
+    self.power_port_combo = self.field_widgets['power_port']
+    self.dyno_port_combo = self.field_widgets['dyno_port']
     field(basic,3,'kt_error_limit_pct','扭矩误差上限 / %满量程')
     field(basic,4,'max_test_torque_nm','KT / T-N 最大扭矩 / Nm')
     self.firmware_panel = FirmwarePanel(self, basic, 5)

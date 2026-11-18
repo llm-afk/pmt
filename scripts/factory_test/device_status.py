@@ -159,6 +159,10 @@ class DeviceHealth:
         self.printer = PrinterMonitor()
         self._power = self._power_route = self._power_reading = None
         self.release_error = ''
+        self._power_matches = ()
+        self._power_scan_at = 0.0
+        self._dyno_scan_at = 0.0
+        self._dyno_route = self._dyno_matches = ()
 
     @property
     def owns_serial(self):
@@ -287,28 +291,38 @@ class DeviceHealth:
                 error=str(inventory_error) if inventory_error else None),target=target)
 
         started = time.monotonic()
-        requested = config.dyno_port if config.dyno_port != 'auto' else self.dyno_port
-        candidates = [requested] if requested in ports else ports if config.dyno_port == 'auto' else []
-        if config.dyno_port == 'auto':
-            power_port = self.power_port if self._power is not None else config.power_port
-            if power_port and power_port != 'auto':
-                candidates = [p for p in candidates if p.casefold() != power_port.casefold()]
+        # Listen passively before identifying the supply. Include newly attached ports
+        # even while the previously selected dynamometer continues to return samples.
+        reserved_power = self.power_port if self._power is not None else config.power_port
+        candidates = [p for p in ports if p != reserved_power or p == config.dyno_port]
+        dyno_route = (tuple(sorted(candidates)), config.dyno_port)
+        full_scan = (dyno_route != self._dyno_route or not self._dyno_matches
+                     or time.monotonic() >= self._dyno_scan_at)
+        if not full_scan:
+            candidates = list(self._dyno_matches)
         observed = []
         evidence = dict(configured_port=config.dyno_port, candidates=candidates, listen_s=.25, observations=observed)
         code, error = 'DYNO_NO_FEEDBACK', inventory_error
         self.dyno_port = None
+        dyno_matches = []
         try:
             readings = {}
             matches = detect_dynamometers(ports=candidates, duration=.25, observations=observed, readings=readings)
             evidence['matches'] = matches
-            if len(matches) == 1:
-                reading = readings.get(matches[0])
+            dyno_matches = list(matches)
+            self._dyno_matches = tuple(matches)
+            if full_scan:
+                self._dyno_route = dyno_route
+                self._dyno_scan_at = time.monotonic() + 15
+            selected = config.dyno_port if config.dyno_port in matches else matches[0] if len(matches)==1 else None
+            if selected:
+                reading = readings.get(selected)
                 if reading is None or time.perf_counter() - reading.received_at > .4:
                     # A full scan of several ports may outlive the first port's sample.
-                    with Dynamometer(port=matches[0]) as dyno:
+                    with Dynamometer(port=selected) as dyno:
                         reading = dyno.receive_state(timeout=.4)
                 evidence['reading'] = reading
-                self.dyno_port = matches[0]
+                self.dyno_port = selected
                 info, code = status('READY', f'{self.dyno_port} · {reading.torque:.2f} Nm / {reading.speed:.1f} rad/s'), 'DYNO_READY'
             elif matches:
                 info, code = status('OFFLINE','发现多台测功机，请指定串口'), 'DYNO_MULTIPLE'
@@ -325,11 +339,14 @@ class DeviceHealth:
         except Exception as exc:
             info, code, error = status('ERROR',str(exc)), 'DYNO_READ_FAILED', exc
         record_probe('dyno',info,code,started,evidence,route=(tuple(candidates),self.dyno_port),error=error)
+        info.update(matched_ports=dyno_matches, active_port=self.dyno_port)
         report('dyno', info)
 
         started = time.monotonic()
-        requested = config.power_port if config.power_port != 'auto' else self.power_port
-        candidates = [p for p in ports if p != self.dyno_port and (not requested or p == requested)]
+        candidates = [p for p in ports if p not in dyno_matches and p != config.dyno_port]
+        if not self.dyno_port:
+            candidates = [p for p in candidates if p == config.power_port]
+        power_matches = ()
         observed = []
         evidence = dict(configured_port=config.power_port, excluded_dyno_port=self.dyno_port,
                         candidates=candidates, observations=observed, query_timeout_s=.2)
@@ -342,14 +359,20 @@ class DeviceHealth:
             try:
                 evidence['query_attempted'] = bool(candidates)
                 route = (config.power_port, tuple(sorted(candidates)), self.dyno_port)
-                if self._power is not None and route != self._power_route:
+                rescan = len(candidates) > len(self._power_matches) and time.monotonic() >= self._power_scan_at
+                if self._power is not None and (route != self._power_route or rescan):
                     self.release('serial_route_changed')
                 reused = self._power is not None
-                matches = ({self.power_port:self._power.identity} if reused else
-                           detect_power_supplies(ports=candidates, timeout=.2, observations=observed, cancelled=cancelled))
-                evidence.update(matches=matches, connection_reused=reused)
-                if len(matches) == 1:
-                    port = next(iter(matches))
+                if reused:
+                    power_matches = self._power_matches
+                else:
+                    matches = detect_power_supplies(ports=candidates, timeout=.2, observations=observed, cancelled=cancelled)
+                    power_matches = tuple(matches)
+                    self._power_matches = power_matches
+                    self._power_scan_at = time.monotonic() + 15
+                evidence.update(matches=power_matches, connection_reused=reused)
+                port = config.power_port if config.power_port in power_matches else power_matches[0] if len(power_matches)==1 else None
+                if port:
                     if not reused:
                         self._power = PowerSupply(port=port, observer=log_event)
                         self._power.open()
@@ -357,7 +380,7 @@ class DeviceHealth:
                     reading = self._read_power()
                     evidence.update(reading=reading, session=self._power.diagnostic_snapshot())
                     info, code = status('READY', f'{port} · {reading.voltage:.1f} V · 输出'+('开启' if reading.output else '关闭')), 'POWER_READY'
-                elif matches:
+                elif power_matches:
                     info, code = status('OFFLINE','发现多台电源，请指定串口'), 'POWER_MULTIPLE'
                 else:
                     info, code = status('OFFLINE','未识别到 UDP6721 电源'), 'POWER_NO_REPLY' if candidates else 'POWER_PORT_ABSENT'
@@ -373,6 +396,7 @@ class DeviceHealth:
                     exc.add_note('电源串口释放未确认：'+str(cleanup))
                 info, code, error = status('ERROR',str(exc)), getattr(exc,'diagnostic_code','POWER_PROBE_FAILED'), exc
         record_probe('power',info,code,started,evidence,route=(tuple(evidence['candidates']),self.power_port),error=error)
+        info.update(matched_ports=list(power_matches), active_port=self.power_port if info['state']=='READY' else None)
         report('power', info)
         report('printer', printer if printer is not None else check_printer(config)[0])
         return result

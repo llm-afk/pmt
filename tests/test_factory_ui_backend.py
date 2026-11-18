@@ -352,10 +352,12 @@ class ManualTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,'先停止'): session.command(command)
         self.assertTrue(session.commands.empty())
 
-    def test_port_dropdown_lists_auto_present_and_saved_port(self):
-        from scripts.factory_test.operator_view import port_options
-        with patch('serial.tools.list_ports.comports',return_value=[NS(device='COM3'),NS(device='COM5')]):
-            self.assertEqual(port_options('COM9'),['auto','COM3','COM5','COM9'])
+    def test_port_dropdown_shows_detected_route_without_changing_preference(self):
+        from scripts.factory_test.operator_view import serial_choices
+        self.assertEqual(serial_choices('auto',['COM3'],'COM3'),('COM3（自动）',('自动探测','COM3')))
+        self.assertEqual(serial_choices('auto',['COM3','COM5'],None)[0],'请选择串口')
+        self.assertEqual(serial_choices('COM5',['COM3','COM5'],'COM5')[0],'COM5')
+        self.assertEqual(serial_choices('COM9',[],None),('等待识别',('自动探测',)))
 
     def test_auto_connection_backfills_actual_node_and_hardware_profile(self):
         config=StationConfig(adapter_sn='adapter')
@@ -513,6 +515,29 @@ class IdleHardwareOwnershipTests(unittest.TestCase):
         self.assertFalse(self.health.owns_serial);self.power.close.assert_called_once()
         for method in ('enable','disable','set_output','set_voltage','set_current'):
             getattr(self.power,method).assert_not_called()
+
+    def test_hotplug_second_supply_requires_selection_and_uses_matching_ports(self):
+        self.assertEqual(self.health.check(self.config)['power']['active_port'],'COM2')
+        self.ports.append(NS(device='COM3'))
+        self.detect.return_value={'COM2':'UDP6721','COM3':'UDP6721'}
+        info=self.health.check(self.config)['power']
+        self.assertEqual(self.detect.call_args.kwargs['ports'],['COM2','COM3'])
+        self.assertEqual((info['matched_ports'],info['active_port']),(['COM2','COM3'],None))
+        self.assertFalse(self.health.owns_serial)
+        from dataclasses import replace
+        self.assertEqual(self.health.check(replace(self.config,power_port='COM3'))['power']['active_port'],'COM3')
+
+    def test_all_identified_dynamometers_are_excluded_from_supply_discovery(self):
+        from dataclasses import replace
+        self.ports.append(NS(device='COM3'))
+        with patch('motor_platform.components.dynamometer.detect_dynamometers',return_value=['COM1','COM3']):
+            result=self.health.check(self.config)
+            self.assertEqual(result['dyno']['matched_ports'],['COM1','COM3'])
+            self.assertIsNone(result['dyno']['active_port'])
+            self.detect.assert_not_called()
+            result=self.health.check(replace(self.config,dyno_port='COM3'))
+            self.assertEqual(result['dyno']['active_port'],'COM3')
+            self.assertEqual(self.detect.call_args.kwargs['ports'],['COM2'])
 
     def test_changed_output_is_confirmed_and_preserves_evidence_without_resend(self):
         self.health.check(self.config)

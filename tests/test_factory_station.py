@@ -1215,6 +1215,21 @@ class RecoveryIdentityTests(unittest.TestCase):
         runner = StationRunner(config, root=root, services=services)
         return runner, services, path, record
 
+    def test_deleted_previous_record_allows_a_new_piece_but_cannot_resume_old_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner, services, path, record = self.interrupted(tmp)
+            path.unlink()
+            self.assertIsNone(runner.pending())
+            with self.assertRaisesRegex(RecoveryRequired,'本地记录缺失'):
+                runner.resume()
+            runner.run=Mock()
+            with patch.object(StationConfig,'validate'):
+                runner.begin('incoming-B')
+            self.assertNotEqual(runner.record['session'],record['session'])
+            self.assertFalse(path.exists())
+            services.allocate.assert_not_called()
+            services.print_sn.assert_not_called()
+
     def test_shared_temporary_sn_cannot_reuse_pass_or_allocated_sn_for_a_replacement(self):
         for allocation in ('RUNNING', 'FAILED', 'DONE'):
             with self.subTest(allocation=allocation), tempfile.TemporaryDirectory() as tmp:

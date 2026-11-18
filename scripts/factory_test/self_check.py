@@ -344,7 +344,6 @@ def run(destination):
                 'scripts.factory_test.printer_service.spawn_process', 'scripts.factory_test.network_status.spawn_snapshot', 'scripts.factory_test.driver_setup.spawn_driver_process')]
             check_debug_monitor()
             stack.enter_context(patch.object(FactoryWindow, 'bootstrap_dependencies'))
-            stack.enter_context(patch('scripts.factory_test.operator_view.port_options', return_value=['auto', 'COM3']))
             # Force the bundled renderer; a developer's Poppler installation cannot mask a missing dependency.
             stack.enter_context(patch('scripts.factory_test.report._find_pdftoppm', return_value=None))
             config = StationConfig(simulation=True, automatic=False)
@@ -485,7 +484,20 @@ def run(destination):
             popup_values = window.devices.tk.globalgetvar('ttk::combobox::Values('+str(window.devices)+')')
             assert tuple(window.devices.tk.splitlist(popup_values)) == ('self-check-can-a',)
             window.update_adapters(dict(devices=adapters,error=None))
-            assert window.vars['adapter_sn'].get() == 'self-check-can-a'
+            assert window.vars['adapter_sn'].get() == '' and window.config.adapter_sn == ''
+            window.serial_results['power_port']=(('COM19',),'COM19')
+            window.refresh_serial_field('power_port')
+            assert window.serial_display['power_port'].get() == 'COM19（自动）'
+            assert window.apply_config(commit_services=True) and load_config(config_path).power_port == 'auto'
+            window.serial_results['power_port']=(('COM19','COM21'),None)
+            window.refresh_serial_field('power_port')
+            assert window.serial_display['power_port'].get() == '请选择串口'
+            window.serial_display['power_port'].set('COM21')
+            window.choose_serial_port('power_port')
+            assert window.apply_config(commit_services=True) and load_config(config_path).power_port == 'COM21'
+            window.serial_display['power_port'].set('自动探测')
+            window.choose_serial_port('power_port')
+            assert window.apply_config(commit_services=True) and load_config(config_path).power_port == 'auto'
             window.update_adapters(dict(devices=[],error=None))
             assert not window.devices.cget('values') and window.vars['adapter_sn'].get() == ''
             window.busy=True

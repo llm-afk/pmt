@@ -44,6 +44,23 @@ class QueueTests(unittest.TestCase):
     def read(self, directory, filename='upload-queue.json'):
         return json.loads((directory/filename).read_text(encoding='utf-8'))
 
+    def test_deleted_report_and_unfinalized_station_measurement_are_not_queued(self):
+        import shutil
+        station = self.root/'2e7a377d-b504-418a-b129-4daef343f985'
+        station.mkdir()
+        upload.save_json(station/'summary.json',dict(status='PASS',demo=False,motor_sn=SN))
+        self.queue._remember(station,dict(status='BLOCKED',discovery_error=True))
+        done = self.make_report()
+        self.queue.step()
+        self.assertNotIn(station,self.queue.entries)
+        self.assertFalse((station/'upload-state.json').exists())
+        self.assertEqual(self.queue.entries[done]['status'],'SUCCEEDED')
+        shutil.rmtree(done)
+        self.queue.discover()
+        self.assertNotIn(done,self.queue.entries)
+        self.assertEqual(self.notices[-1]['blocked'],0)
+        self.assertEqual(self.mes.register.call_count,1)
+
     def test_retry_failure_is_visible_to_panel_until_upload_succeeds(self):
         self.make_report()
         self.store.put.side_effect = upload.UploadError('network unavailable', retryable=True)

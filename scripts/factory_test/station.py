@@ -346,7 +346,20 @@ class StationRunner:
         if not self.pointer.exists():
             return None
         path = Path(json.loads(self.pointer.read_text(encoding='utf-8'))['record'])
-        record = json.loads(path.read_text(encoding='utf-8'))
+        try:
+            raw = path.read_text(encoding='utf-8')
+        except FileNotFoundError:
+            data_root = self.root / ('demo-data' if self.config.simulation else 'data')
+            if path.name != 'station.json' or path.parent.parent.resolve() != data_root.resolve():
+                raise
+            if getattr(self, '_missing_record', None) != path:
+                self._missing_record = path
+                message = f'上次工件 {path.parent.name} 的本地记录已缺失；无法续测该件，新工件可正常开始。'
+                self.emit('logged_line', message)
+                if self.log:
+                    self.log.event('flow.previous_record_missing', message, level='WARNING', path=str(path))
+            return None
+        record = json.loads(raw)
         return record if record.get('status') not in ('COMPLETE', 'CLOSED') else None
 
     def close_pending(self, reason):
@@ -409,6 +422,8 @@ class StationRunner:
     def resume(self):
         record = self.pending()
         if not record:
+            if getattr(self,'_missing_record',None):
+                raise RecoveryRequired('上次工件的本地记录缺失，无法继续该件；如需恢复，请还原原工件目录。')
             raise RecoveryRequired('没有未完成工件')
         original_fields=record['config']
         target_id = self.config.require_target_id()
@@ -418,8 +433,9 @@ class StationRunner:
         restored.update({key:value for key,value in original_fields.items() if key in restored})
         current=asdict(self.config)
         # A local encrypted-key location is not part of a workpiece's protocol identity.
-        restored.pop('credentials_file',None)
-        current.pop('credentials_file',None)
+        for key in ('credentials_file','adapter_auto_selected'):
+            restored.pop(key,None)
+            current.pop(key,None)
         if restored != current:
             raise RecoveryRequired('当前配置与未完成工件不一致，请恢复原工位配置后再继续')
         if (not self.config.simulation and record['steps'].get('base_sn') == 'DONE'
@@ -567,6 +583,7 @@ class StationRunner:
                 summary = self.services.measure(directory, record['base_sn'])
                 if record.get('firmware'):
                     summary['firmware'] = record['firmware']
+                summary.update(station_version=2, station_session=record['session'], station_ready=False)
                 record['summary'] = summary
                 emit_measurement_steps(self.emit, summary)
                 log_event('test.analysis', status=summary['status'], sections=measurement_overview(summary),
