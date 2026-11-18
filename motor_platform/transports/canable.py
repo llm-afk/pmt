@@ -296,7 +296,7 @@ class Canable:
         self.last_counter_report = None
         self.protocol_reports = 0
         self.last_protocol_report = None
-        self._recent_protocol_reports = deque(maxlen=64)
+        self._bus_off_event = None
         self.protocol_history = deque(maxlen=16)
         self._feedback_supervised = False
         self._usb = None
@@ -414,6 +414,10 @@ class Canable:
                             if time.perf_counter() >= deadline:
                                 return None
                             continue
+                        if not frame.is_error and not frame.is_remote:
+                            # A received data frame shows that this bus carried traffic again.
+                            # Per-node feedback deadlines are maintained separately by the runtime.
+                            self._bus_off_event = None
                         return frame
                     continue
             remaining = deadline - time.perf_counter()
@@ -433,20 +437,26 @@ class Canable:
     def set_feedback_supervision(self, enabled):
         """Memory-only policy switch, owned by the periodic runtime.
 
-        Maintenance and periodic traffic share the same CAN report budget.
+        Annotate diagnostic events with the receive owner.
         """
         if type(enabled) is not bool:
             raise ValueError('feedback supervision must be bool')
         self._feedback_supervised = enabled
 
     def _record_transient(self, frame, now):
-        # A CAN notification is not a lost motor reply. Maintenance and periodic
-        # control use the same rolling budget: tolerate 20 reports in one second.
-        # A real missing motor reply is independently supervised for one second.
+        # Well-formed adapter notifications are diagnostic. Only the expected
+        # motor feedback or transaction reply can satisfy the caller's deadline.
         if not (frame.is_error and not frame.is_fd and not frame.brs
                 and not frame.is_extended and not frame.is_remote
                 and len(frame.data) == 8):
             return False
+        bus_off = bool(frame.can_id & 0x40)
+        if bus_off and self._bus_off_event is not None:
+            event = self._bus_off_event
+            event.update(notifications=event['notifications'] + 1, last_received_at=now,
+                         last_can_id=frame.can_id, last_data=frame.data.hex())
+            self.last_protocol_report = event
+            return True
         kinds = [name for mask,name in PROTOCOL_ERROR_FLAGS if frame.can_id & 0x8 and frame.data[2] & mask]
         for mask,name in ((0x4,'controller'),(0x20,'ack'),(0x40,'bus_off'),(0x200,'crc')):
             if frame.can_id & mask:
@@ -457,11 +467,11 @@ class Canable:
             kind=kind, location=frame.data[3], controller_status=frame.data[1],
             tx_errors=frame.data[6], rx_errors=frame.data[7], feedback_supervised=self._feedback_supervised)
         self.protocol_history.append(self.last_protocol_report)
-        while self._recent_protocol_reports and now-self._recent_protocol_reports[0] >= 1:
-            self._recent_protocol_reports.popleft()
-        self._recent_protocol_reports.append(now)
-        self.last_protocol_report.update(reports_in_second=len(self._recent_protocol_reports),tolerance=20)
-        return len(self._recent_protocol_reports) <= 20
+        if bus_off:
+            self._bus_off_event = self.last_protocol_report
+            self._bus_off_event.update(notifications=1, last_received_at=now,
+                                       last_can_id=frame.can_id, last_data=frame.data.hex())
+        return True
 
     def close(self):
         usb, self._usb = self._usb, None
@@ -471,6 +481,7 @@ class Canable:
         finally:
             self._configured = self._started = False
             self._feedback_supervised = False
+            self._bus_off_event = None
             self._rx.clear()
             if usb:
                 usb.close()

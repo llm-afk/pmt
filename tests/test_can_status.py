@@ -6,7 +6,6 @@ from unittest.mock import Mock
 
 from motor_platform import Canable, CanFrame, MotorBus
 from motor_platform.transports.canable import is_counter_report
-from motor_platform.components.motor.client import CanBusError
 
 
 class CounterReportTests(unittest.TestCase):
@@ -17,17 +16,16 @@ class CounterReportTests(unittest.TestCase):
                 self.assertTrue(is_counter_report(frame,supervised=supervised))
         self.assertFalse(is_counter_report(CanFrame(0x20,bytes(8),is_error=True)))
 
-    def test_rolling_second_tolerates_twenty_reports_and_fails_on_twenty_first(self):
-        for supervised in (False,True):
-            for cid in (0x8,0x20,0x200,0x4,0x40):
-                can=Canable('memory');can.set_feedback_supervision(supervised)
-                frame=CanFrame(cid,bytes.fromhex('000010000000FFFF'),is_error=True,is_fd=False,brs=False)
-                for i in range(20):
-                    self.assertTrue(can._record_transient(frame,100+i*.01))
-                self.assertFalse(can._record_transient(frame,100.2))
-                self.assertEqual(can.protocol_reports,21)
-                self.assertEqual(can.last_protocol_report['data'],frame.data.hex())
-                self.assertTrue(can._record_transient(frame,101.2))
+    def test_adapter_notifications_do_not_end_transactions_by_count(self):
+        for supervised in (False, True):
+            for cid in (0x8, 0x20, 0x200, 0x4, 0x40):
+                can = Canable('memory')
+                can.set_feedback_supervision(supervised)
+                frame = CanFrame(cid, bytes(8), is_error=True, is_fd=False, brs=False)
+                for i in range(50):
+                    self.assertTrue(can._record_transient(frame, 100+i*.03))
+                self.assertEqual(can.protocol_reports, 1 if cid == 0x40 else 50)
+                self.assertEqual(can.last_protocol_report['data'], frame.data.hex())
 
     def test_invalid_error_frame_is_not_tolerated_as_bus_telemetry(self):
         can=Canable('memory')
@@ -56,14 +54,20 @@ class CounterReportUsbTests(unittest.TestCase):
             self.assertEqual(can.protocol_reports,20)
             self.assertEqual(can.counter_reports,1)
 
-    def test_twenty_first_error_interrupts_transaction_before_ack(self):
-        error=self.packet(0x20000020,bytes(8))
-        ack=self.packet(0x581,bytes.fromhex('6002200000000000'))
-        can=self.receiver(error*21+ack)
-        with self.assertRaises(CanBusError):
-            MotorBus(can)._wait_sdo(1,0x2002,time.perf_counter()+1)
-        self.assertEqual(can.protocol_reports,21)
-        self.assertEqual(bytes(can._rx),ack)
+    def test_bus_off_repeats_preserve_real_sdo_reply_and_count_new_episode_after_recovery(self):
+        first = self.packet(0x20000060, bytes.fromhex('000000000002f800'))
+        repeat = self.packet(0x20000040, bytes.fromhex('0000000000020000'))
+        ack = self.packet(0x581, bytes.fromhex('6002200000000000'))
+        can = self.receiver(first + repeat*40 + ack + repeat + ack)
+        bus = MotorBus(can)
+        bus._wait_sdo(1, 0x2002, time.perf_counter()+1)
+        self.assertEqual(can.protocol_reports, 1)
+        self.assertEqual(can.last_protocol_report['kind'], 'ack+bus_off')
+        self.assertEqual(can.last_protocol_report['tx_errors'], 248)
+        self.assertEqual(can.last_protocol_report['notifications'], 41)
+        bus._wait_sdo(1, 0x2002, time.perf_counter()+1)
+        self.assertEqual(can.protocol_reports, 2)
+        self.assertEqual(can.last_protocol_report['notifications'], 1)
 
     def test_single_error_without_response_still_times_out(self):
         can=self.receiver(self.packet(0x20000020,bytes(8)))

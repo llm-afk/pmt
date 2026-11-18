@@ -1108,6 +1108,29 @@ class SupervisedCounterRangeReplayTests(unittest.TestCase):
                 self.assertEqual(peer.disable_requests,1)
                 self.assertFalse(runtime.motor(1)._motor.enabled)
 
+    def test_repeated_field_busoff_waits_for_target_feedback_or_one_second_timeout(self):
+        first = CanFrame(0x60, bytes.fromhex('000000000002f800'), is_fd=False, brs=False, is_error=True)
+        repeat = CanFrame(0x40, bytes.fromhex('0000000000020000'), is_fd=False, brs=False, is_error=True)
+        burst = [(.1, first, 0xffffffff)]
+        burst.extend((.101+i*.001, repeat, 0xffffffff) for i in range(40))
+        for recovered in (True, False):
+            with self.subTest(recovered=recovered):
+                events = list(burst)
+                if recovered:
+                    events.append((.98, self.feedback(1), 0xffffffff))
+                runtime, peer, at, _ = self.replay(events, until=1.15, supervised=True,
+                    stop_ack=True, command=MitCommand(torque=2))
+                self.assertEqual(peer.protocol_reports, 1)
+                self.assertEqual(peer.last_protocol_report['notifications'], 41)
+                if recovered:
+                    self.assertIsNone(runtime._error)
+                    self.assertEqual(runtime.motor(1)._stats.rx_count, 1)
+                else:
+                    self.assertEqual(runtime._error.diagnostic_code, 'MOTOR_FEEDBACK_STALE')
+                    self.assertGreaterEqual(at, 11.)
+                    self.assertLess(at, 11.002)
+                self.assertTrue(runtime.motor(1).stop_status()['worker_cleanup']['confirmed'])
+
     def test_terminal_busoff_without_disable_ack_remains_unconfirmed(self):
         frame=CanFrame(0x40,bytes.fromhex('0000000000000009'),is_fd=False,brs=False,is_error=True)
         runtime,peer,_,_=self.replay([(.2,frame,0xffffffff)],supervised=True,stop_ack=False)

@@ -38,14 +38,9 @@ python -m unittest discover -s tests -v
 需要按 CRC 协议事件记录。该位的含义来自实际固件定义和 `buf_store_error()` 的生成路径。
 [Elmue 错误定义](https://github.com/Elmue/CANable-2.5-firmware-Slcan-and-Candlelight/blob/main/Firmware/Candlelight/candlelight_def.h)、[错误帧生成](https://github.com/Elmue/CANable-2.5-firmware-Slcan-and-Candlelight/blob/main/Firmware/Candlelight/buffer.c)
 
-只有 ID 为 0、前六字节为 0、TX/RX 计数均低于 96 的经典标准错误帧作为纯计数通知，
-保存在 `can_counter_reports` 和 `can_last_counter_report`。
-低计数的格式、填充和 CRC 事件保存在 `can_protocol_reports`、`can_last_protocol_report`
-与最近 16 条 `can_protocol_history`，类型分别为 `form`、`stuff`、`crc`。
+ID 为 0、前六字节为 0 的标准经典 CAN 错误帧单独记录 TX/RX 计数。协议通知计入 `can_protocol_reports`，最近 16 个事件保存在 `can_protocol_history`。Bus-Off 首报保留类型、载荷和错误计数；同一次的重复通知累加到 `notifications`，保留最后一条载荷和时间。适配器重新收到总线数据帧后，再次出现 Bus-Off 才算新事件。
 
-周期运行时仅在 TX、RX 两个计数均低于 Elmue 预警值 96，且报告仅含格式、位填充或 CRC 三者之一时，记录该事件并继续等待。任何明确的控制器预警、错误被动、总线关闭、应用错误或混合错误均进入故障处理。连续 1 秒没有本节点有效 TPDO5 时触发反馈中断保护。
-独立维护和 OTA 会话仅容许计数不超过 8 的上述协议事件，一秒内第三次即中止。周期运行时关闭电机仍须收到该节点对应的失能应答。
-错误报告不会刷新电机反馈时间，也不能充当 SDO 或停机应答。
+周期控制根据每个目标电机的有效 TPDO5 独立计时，连续 1 秒缺失才判断反馈中断。CAN 错误通知和 USB 发送回显均不刷新该计时。SDO、OTA 和停机事务仍按各自的协议应答和截止时间判断。
 
 ## 分层与接口
 

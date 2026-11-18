@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "production-motor-test"
-version = "1.0.38"
+version = "1.0.39"
 description = "Production motor testing workstation"
 requires-python = ">=3.11"
 dependencies = [
