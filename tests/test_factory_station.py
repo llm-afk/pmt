@@ -901,6 +901,15 @@ class ResetRecoveryTests(unittest.TestCase):
                          [0x2002,*range(0x2004,0x200b)])
         self.assertTrue(all(frame.data[0]==0x40 for session in state.sessions[1:] for frame in session.sent))
 
+    def test_identical_sn_confirms_identity_and_disable_without_rewriting_sn(self):
+        maintenance,state=self.drive(node=3)
+        maintenance.write_sn(SN,SN)
+        self.assertEqual([index for _,index,_ in state.writes],[0x2002])
+        self.assertEqual(len(state.sessions),1)
+        with self.assertRaisesRegex(RuntimeError,'身份发生变化'):
+            maintenance.write_sn(SN,'unexpected')
+        self.assertEqual([index for _,index,_ in state.writes],[0x2002])
+
     def test_nonfinal_sn_error_or_final_rejection_stops_without_replaying_any_segment(self):
         maintenance,state=self.drive(node=3);state.fail_index=0x2006
         with self.assertRaises(CanBusError):maintenance.write_sn(maintenance.config.base_sn,SN)

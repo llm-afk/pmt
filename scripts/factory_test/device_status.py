@@ -226,7 +226,7 @@ class DeviceHealth:
         self._power_reading = values
         return reading
 
-    def check(self, config, *, emit=None, cancelled=None, generation=None, inventory_emit=None):
+    def check(self, config, *, emit=None, cancelled=None, generation=None, inventory_emit=None, adapter_inventory=None):
         def check_stop():
             if cancelled is not None and cancelled():
                 self.release('probe_cancelled')
@@ -256,15 +256,21 @@ class DeviceHealth:
 
         started = time.monotonic()
         devices, error = [], None
-        try:
-            devices = Canable.detect()
-            info = adapter_status(devices, config.adapter_sn)
-        except Exception as exc:
-            info, error = status('ERROR', str(exc)), exc
+        if adapter_inventory is None:
+            try:
+                devices = Canable.detect()
+            except Exception as exc:
+                error = exc
+        else:
+            devices, error = adapter_inventory['devices'], adapter_inventory.get('error')
+        info = status('ERROR', str(error)) if error is not None else adapter_status(devices, config.adapter_sn)
         serials = tuple(item['serial_number'] for item in devices)
         record_probe('can', info, 'CAN_'+info['state'], started, dict(devices=devices,selected=config.adapter_sn),
                      route=(config.adapter_sn,serials),error=error)
         report('can', info)
+        # The local print service has no serial dependencies. Its worker can run
+        # while we passively identify the dynamometer and then query the supply.
+        printer = self.printer.poll(config,generation) if generation is not None else None
         try:
             available = list(comports())
             ports = [p.device for p in available]
@@ -283,16 +289,24 @@ class DeviceHealth:
         started = time.monotonic()
         requested = config.dyno_port if config.dyno_port != 'auto' else self.dyno_port
         candidates = [requested] if requested in ports else ports if config.dyno_port == 'auto' else []
+        if config.dyno_port == 'auto':
+            power_port = self.power_port if self._power is not None else config.power_port
+            if power_port and power_port != 'auto':
+                candidates = [p for p in candidates if p.casefold() != power_port.casefold()]
         observed = []
         evidence = dict(configured_port=config.dyno_port, candidates=candidates, listen_s=.25, observations=observed)
         code, error = 'DYNO_NO_FEEDBACK', inventory_error
         self.dyno_port = None
         try:
-            matches = detect_dynamometers(ports=candidates, duration=.25, observations=observed)
+            readings = {}
+            matches = detect_dynamometers(ports=candidates, duration=.25, observations=observed, readings=readings)
             evidence['matches'] = matches
             if len(matches) == 1:
-                with Dynamometer(port=matches[0]) as dyno:
-                    reading = dyno.receive_state(timeout=.4)
+                reading = readings.get(matches[0])
+                if reading is None or time.perf_counter() - reading.received_at > .4:
+                    # A full scan of several ports may outlive the first port's sample.
+                    with Dynamometer(port=matches[0]) as dyno:
+                        reading = dyno.receive_state(timeout=.4)
                 evidence['reading'] = reading
                 self.dyno_port = matches[0]
                 info, code = status('READY', f'{self.dyno_port} · {reading.torque:.2f} Nm / {reading.speed:.1f} rad/s'), 'DYNO_READY'
@@ -360,5 +374,5 @@ class DeviceHealth:
                 info, code, error = status('ERROR',str(exc)), getattr(exc,'diagnostic_code','POWER_PROBE_FAILED'), exc
         record_probe('power',info,code,started,evidence,route=(tuple(evidence['candidates']),self.power_port),error=error)
         report('power', info)
-        report('printer', self.printer.poll(config,generation) if generation is not None else check_printer(config)[0])
+        report('printer', printer if printer is not None else check_printer(config)[0])
         return result

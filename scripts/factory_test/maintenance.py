@@ -341,7 +341,6 @@ class Maintenance:
             raise ValueError('SN 硬件版本 ABCD 与工位产品配置不符')
         raw = sn.encode('ascii')+b'\0\0'
         node = self.config.target_id
-        log_event('motor.sn.write',node_id=node,previous_sn=expected_current,sn=sn)
         with self.connect() as bench:
             current_raw = bench.motor(node).read_serial_bytes()
             current = current_raw.rstrip(b'\0').decode('ascii', errors='replace') or '未写入 SN'
@@ -352,6 +351,11 @@ class Maintenance:
             log_event('motor.disable.request',node_id=node,reason='before_sn_write')
             bench.motor(node).disable()
             log_event('motor.disable.ack',node_id=node,reason='before_sn_write')
+            if current_raw == raw:
+                self.progress('已读回完整目标 SN，跳过写入及重启')
+                log_event('motor.sn.unchanged','完整 SN 已核对，跳过写入及重启',node_id=node,sn=sn)
+                return
+            log_event('motor.sn.write',node_id=node,previous_sn=expected_current,sn=sn)
             for offset, index in enumerate(range(0x2004, 0x200B)):
                 self.check_stop()
                 value = int.from_bytes(raw[offset*4:offset*4+4], 'little')

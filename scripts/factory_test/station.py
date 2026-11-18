@@ -467,7 +467,8 @@ class StationRunner:
             self.record.setdefault('print_job_id',uuid.uuid4().hex)
         self.save()  # 先保存意图，再调用可能具有副作用的接口。
         started = time.perf_counter()
-        log_event('flow.step.start', step=name)
+        label = dict(STEPS).get(name, '两项性能测试')
+        log_event('flow.step.start', label+'开始', step=name)
         self.emit('step', dict(name=name, status='RUNNING'))
         if self.cancelled():
             raise InterruptedError('已停止自动流程')
@@ -488,7 +489,7 @@ class StationRunner:
                   elapsed_s=round(time.perf_counter()-started,4),result=result,module_sn=self.record.get('module_sn'))
         self.record['steps'][name] = 'DONE'
         self.save()
-        log_event('flow.step.done', step=name, elapsed_s=round(time.perf_counter()-started, 4), result=result)
+        log_event('flow.step.done', label+'完成', step=name, elapsed_s=round(time.perf_counter()-started, 4), result=result)
         self.emit('step', dict(name=name, status='DONE'))
         return result
 

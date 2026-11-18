@@ -4,7 +4,7 @@ from .client import Dynamometer
 from .protocol import positive
 
 
-def detect_dynamometers(*, ports=None, baudrate=115200, duration=0.3, observations=None):
+def detect_dynamometers(*, ports=None, baudrate=115200, duration=0.3, observations=None, readings=None):
     positive(duration)
     if ports is None:
         from serial.tools.list_ports import comports
@@ -23,9 +23,13 @@ def detect_dynamometers(*, ports=None, baudrate=115200, duration=0.3, observatio
                         break
                     time.sleep(0.01)
                 evidence.update(stats)
+                if readings is not None and stats['rx_count'] >= 3 and not stats.get('fault'):
+                    reading = device.state(max_age=duration)
             if stats['rx_count'] >= 3 and not stats.get('fault'):
                 matches.append(port)
                 evidence['matched'] = True
+                if readings is not None:
+                    readings[port] = reading
         except (OSError, RuntimeError) as exc:
             evidence.update(error_type=type(exc).__name__, error=str(exc))
         if observations is not None:

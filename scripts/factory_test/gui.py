@@ -378,6 +378,7 @@ class FactoryWindow:
             self.device_state('can', info['state'], info['detail'])
 
     def update_adapters(self, value):
+        self.adapter_inventory = value
         self.adapter_devices = value['devices']
         self.adapter_error = value.get('error')
         serials = sorted({item['serial_number'] for item in self.adapter_devices})
@@ -812,8 +813,8 @@ class FactoryWindow:
         self.log_configuration()
         self.write_log('[探测] '+('设备监视已启用，等待环境就绪后探测硬件。' if self.config.automatic else
             '设备监视已暂停，可在工位配置 → 维护与诊断中启用。'))
-        self.write_log('[探测] CANable：枚举适配器；电机：读取实际 ID / SN；测功机：监听有效反馈。')
-        self.write_log('[探测] 电源：先确认测功机串口，再检查电源；打印机：核对服务和指定队列。')
+        if self.config.automatic and not self.config.simulation:
+            self.write_log('[探测顺序] 枚举 CANable → 监听测功机 → 查询磁粉加载电源 → 核对电机 ID / SN。打印队列并行查询。')
         if self.config.simulation:
             self.write_log('[离线自检] 硬件与网络使用隔离模拟，不访问现场设备。')
 
@@ -1052,7 +1053,7 @@ class FactoryWindow:
                         health = self.device_health.check(config,
                             emit=lambda name,info:self.events.put(('device_health',dict(name=name,info=info,
                                 config_revision=revision,mode_generation=mode_generation))),cancelled=self.station_cancelled,
-                                generation=(mode_generation,),
+                                generation=(mode_generation,), adapter_inventory=getattr(self,'adapter_inventory',None),
                                 inventory_emit=lambda info:self.events.put(('serial_inventory',dict(info,
                                     config_revision=revision,mode_generation=mode_generation))))
                     with self.lock:
@@ -1595,9 +1596,11 @@ class FactoryWindow:
                     self.set_prompt('本项正在收尾，请等待',value['detail'],'#2563EB')
             elif kind=='step':
                 name,state=value['name'],value['status']
+                step_label = '两项性能测试'
                 if self.steps.exists(name):
                     label=dict(STEPS)[name]
                     index=[n for n,_ in STEPS].index(name)+1
+                    step_label = f'{index:02d} {label}'
                     tag = {'COLLECTED':'PENDING', 'INCOMPLETE':'FAILED'}.get(state,state)
                     self.steps.item(name,values=(f'{index:02d}   {label}',statuses[state]),tags=(tag,))
                     if state=='RUNNING' and not self.stopping and not self.terminal_prompt:
@@ -1611,7 +1614,7 @@ class FactoryWindow:
                             title,hint='请稍候，正在保存本件结果',label+'完成后会提示取件。'
                         self.set_prompt(title,hint,'#2563EB')
                     self.refresh_progress()
-                self.write_log(dict(STEPS).get(name,'两项性能测试')+'：'+statuses[state],persist=False)
+                self.write_log(step_label+'：'+statuses[state],persist=False)
             elif kind in ('firmware_progress','maintenance_progress'):
                 if not self.stopping and not self.terminal_prompt:
                     self.set_prompt('请保持供电和 CAN 连接',value,'#2563EB')

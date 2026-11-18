@@ -132,13 +132,16 @@ class HealthTests(unittest.TestCase):
         def device(*,port,baudrate):
             if port=='COM1': raise PermissionError('port busy')
             instrument=Mock()
+            instrument.state.return_value=port+' sample'
             instrument.stats.return_value=dict(rx_bytes=31,rx_count=3 if port=='COM3' else 0,discarded_bytes=7)
             instrument.__enter__=Mock(return_value=instrument)
             instrument.__exit__=Mock(return_value=False)
             return instrument
         observations=[]
+        readings={}
         with patch('motor_platform.components.dynamometer.discovery.Dynamometer',side_effect=device):
-            matches=detect_dynamometers(ports=['COM1','COM2','COM3'],duration=.001,observations=observations)
+            matches=detect_dynamometers(ports=['COM1','COM2','COM3'],duration=.001,observations=observations,readings=readings)
+        self.assertEqual(readings,{'COM3':'COM3 sample'})
         self.assertEqual(matches,['COM3'])
         self.assertEqual(observations[0]['error_type'],'PermissionError')
         self.assertEqual(observations[1]['discarded_bytes'],7)
@@ -202,6 +205,28 @@ class HealthTests(unittest.TestCase):
              patch('scripts.factory_test.device_status.json_http',side_effect=printer):
             DeviceHealth().check(StationConfig(),emit=lambda name,info:emitted.append((name,info)))
         self.assertEqual([name for name,info in emitted],['can','dyno','power','printer'])
+
+    def test_idle_probe_reuses_usb_inventory_and_fresh_dyno_reading(self):
+        health=DeviceHealth()
+        health.printer.poll=Mock(return_value=dict(state='READY',detail='ready'))
+        order=[]
+        def detect(*,ports,readings,**kwargs):
+            order.append('dyno')
+            health.printer.poll.assert_called_once()
+            self.assertEqual(ports,['COM1'])
+            readings['COM1']=NS(torque=.12,speed=2.,received_at=time.perf_counter())
+            return ['COM1']
+        with patch('motor_platform.Canable.detect',side_effect=AssertionError('duplicate USB enumeration')), \
+             patch('serial.tools.list_ports.comports',return_value=[NS(device='COM1'),NS(device='COM2')]), \
+             patch('motor_platform.components.dynamometer.detect_dynamometers',side_effect=detect), \
+             patch('motor_platform.components.power_supply.discovery.detect_power_supplies',return_value={}), \
+             patch('motor_platform.Dynamometer',side_effect=AssertionError('duplicate serial open')):
+            result=health.check(StationConfig(adapter_sn='a',power_port='COM2'),generation=(1,),
+                adapter_inventory=dict(devices=[dict(serial_number='a')],error=None),
+                emit=lambda name,info:order.append('ready:'+name))
+        self.assertEqual(order,['ready:can','dyno','ready:dyno','ready:power','ready:printer'])
+        self.assertEqual(result['dyno']['state'],'READY')
+        self.assertIn('0.12',result['dyno']['detail'])
 
     def test_adapter_sn_mismatch_displays_saved_and_present_serials(self):
         with patch('motor_platform.Canable.detect', return_value=[dict(serial_number='present-adapter')]), \
