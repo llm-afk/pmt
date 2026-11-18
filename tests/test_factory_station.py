@@ -74,22 +74,28 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaises(ValueError): hardware_parts(invalid)
 
     def test_revision_numbers_are_not_a_test_profile_whitelist(self):
-        for value,torque in (('0112',30),('0222',30),('0132',30),('0142',30),('0223',30),('9229',30)):
+        for value in ('0112','0222','0132','0142','0223','9229'):
             config=StationConfig(hardware_version=value,model=value[1:])
             config.validate()
-            self.assertEqual(config.torque,torque)
+            self.assertEqual(config.torque,20.)
 
-    def test_all_hardware_combinations_use_the_current_30_nm_profile(self):
+    def test_shared_torque_default_and_station_override(self):
         for hardware in ('0151','0269','0999','1111'):
             config=StationConfig(hardware_version=hardware,model=hardware[1:])
             config.validate()
             self.assertTrue(config.test_profile_available)
-            self.assertEqual(config.torque,30.)
+            self.assertEqual(config.torque,20.)
         with tempfile.TemporaryDirectory() as folder:
             path=Path(folder)/'station.json'
-            config=StationConfig(kt_error_limit_pct=8.5)
+            path.write_text('{"kt_error_limit_pct": 8.5}',encoding='utf-8')
+            self.assertEqual(load_config(path).torque,20.)
+            config=StationConfig(kt_error_limit_pct=8.5,max_test_torque_nm=17.5)
             save_config(config,path)
-            self.assertEqual(load_config(path).kt_error_limit_pct,8.5)
+            self.assertEqual((load_config(path).kt_error_limit_pct,load_config(path).torque),(8.5,17.5))
+            for invalid in (0,-1,float('nan'),float('inf'),1e40,True):
+                with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                    save_config(StationConfig(max_test_torque_nm=invalid),path)
+            self.assertEqual(load_config(path).torque,17.5)
 
     def test_load_derives_legacy_model_from_single_hardware_field(self):
         with tempfile.TemporaryDirectory() as folder:

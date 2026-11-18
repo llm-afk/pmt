@@ -450,7 +450,7 @@ def run(destination):
             with patch('scripts.factory_test.manual_control.Bench',return_value=bench), \
                  patch('scripts.factory_test.manual_control.Maintenance.read',return_value=245):
                 manual._open_hardware()
-            assert manual.firmware=='245' and manual.profile_known and manual.config.torque==30
+            assert manual.firmware=='245' and manual.profile_known and manual.config.torque==20
             manual.connected=True;manual.profile_known=False
             manual.command('enable')
             assert manual.commands.get_nowait()[0]=='enable'
@@ -628,10 +628,13 @@ def run(destination):
             window.hardware_changed('D')
             assert window.config.hardware_version==previous_hardware
             assert window.apply_config(commit_services=True) is True
-            assert window.config.hardware_version == '0132' and window.config.torque == 30
+            assert window.config.hardware_version == '0132' and window.config.torque == 20
+            window.vars['max_test_torque_nm'].set('18.5')
             window.vars['kt_error_limit_pct'].set('7.5')
             assert window.apply_config(commit_services=True) is True
             assert window.config.kt_error_limit_pct == load_config(config_path).kt_error_limit_pct == 7.5
+            assert window.config.torque == load_config(config_path).torque == 18.5
+            window.vars['max_test_torque_nm'].set('20')
             window.vars['kt_error_limit_pct'].set('5')
             assert window.apply_config(commit_services=True) is True
             assert window.hardware_vars['B'].get() == '1'
@@ -659,7 +662,7 @@ def run(destination):
             window.hardware_vars['A'].set('1')
             window.hardware_vars['D'].set('3')
             assert window.apply_config(commit_services=True) is True and window.config.hardware_version == '1133'
-            assert window.config.test_profile_available and window.config.torque==30  # A/D are revisions, not a whitelist.
+            assert window.config.test_profile_available and window.config.torque==20  # A/D are revisions, not a whitelist.
             window.vars['project'].set('c2')
             window.vars['category'].set(config.category)
             window.vars['subcategory'].set(config.subcategory)

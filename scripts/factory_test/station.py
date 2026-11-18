@@ -309,8 +309,8 @@ class DemoServices(Services):
 
     def measure(self, directory, base_sn):
         from .preview import create_demo
-        summary = create_demo(directory)
-        summary.update(motor_sn=base_sn, motor_id=self.config.target_id, target_torque=self.config.torque)
+        summary = create_demo(directory, torque=self.config.torque, error_limit_pct=self.config.kt_error_limit_pct)
+        summary.update(motor_sn=base_sn, motor_id=self.config.target_id)
         for name in ('kt', 'tn'):
             self.emit('step', dict(name=name, status='RUNNING'))
             self.check_stop()

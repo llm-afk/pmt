@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 import time
 
+from scripts.factory_test.station_config import DEFAULT_TEST_TORQUE_NM
 from motor_platform import MitCommand
 from motor_platform.runtime import MOTOR_FEEDBACK_TIMEOUT_S
 from motor_platform.components.dynamometer.protocol import SPEED_COUNTS_PER_RPM
@@ -23,7 +24,7 @@ MOTOR_ID = 1                     # 选定 CAN 总线上的电机 ID，--id 可�
 CANABLE_SERIAL = None           # 由工位传入已选适配器 SN
 POWER_PORT = 'auto'              # 电源串口自动探测；多台时明确填写 COM 端口
 DYNO_PORT = 'auto'               # 测功机串口自动探测；多台时明确填写 COM 端口
-TORQUE_FF = 30                  # 默认最大前馈扭矩，--torque 可覆盖，允许负值
+TORQUE_FF = DEFAULT_TEST_TORQUE_NM  # 默认最大前馈扭矩，--torque 可覆盖，允许负值
 MOTOR_HZ = 1000
 LOAD_VOLTAGE_V = 24.0
 CURRENT_STEP_A = 0.028125         # 平均每步 28.125 mA，15 Hz 时约 2.37 秒/A；累计目标量化到 1 mA

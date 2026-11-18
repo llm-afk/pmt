@@ -682,6 +682,11 @@ class FactoryWindow:
             if values['production_date'].lower() in ('auto','自动当天'):
                 values['production_date'] = ''
             values['model'] = values['hardware_version'][1:]
+            if 'max_test_torque_nm' in values:
+                try:
+                    values['max_test_torque_nm'] = float(values['max_test_torque_nm'])
+                except ValueError:
+                    raise ValueError('请填写 KT / T-N 最大扭矩，单位 Nm') from None
             if 'kt_error_limit_pct' in values:
                 values['kt_error_limit_pct'] = float(values['kt_error_limit_pct'])
             if 'printer_copies' in values:

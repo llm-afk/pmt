@@ -432,7 +432,7 @@ class ManualTests(unittest.TestCase):
                 session._open_hardware()
             self.assertTrue(session.profile_known)
             self.assertEqual(session.config.hardware_version,hardware)
-            self.assertEqual(session.config.torque,30)
+            self.assertEqual(session.config.torque,20)
             self.assertEqual(session.firmware,'245')
             session.connected=True
             session.command('enable')

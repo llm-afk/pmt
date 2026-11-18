@@ -32,7 +32,8 @@ HARDWARE_D = {}
 HARDWARE_FIELDS = {'A': HARDWARE_A, 'B': HARDWARE_B, 'C': HARDWARE_C, 'D': HARDWARE_D}
 # Production mapping confirmed by the fixture owner: swing / hip / knee.
 JOINT_NODE_IDS = {'HIPX': 1, 'HIPY': 2, 'KNEE': 3}
-DEFAULT_TEST_TORQUE_NM = 30.0
+DEFAULT_TEST_TORQUE_NM = 20.0
+MANUAL_TORQUE_LIMIT_NM = 30.0
 DEFAULT_KT_ERROR_LIMIT_PCT = 5.0
 
 
@@ -52,8 +53,8 @@ def validate_report_url(value):
 
 
 def hardware_torque_limit(hardware):
-    """Current production setting: every valid ABCD combination uses 30 Nm."""
-    return DEFAULT_TEST_TORQUE_NM if isinstance(hardware,str) and re.fullmatch(r'[0-9]{4}',hardware) else None
+    """Return the manual control range for a valid hardware revision."""
+    return MANUAL_TORQUE_LIMIT_NM if isinstance(hardware,str) and re.fullmatch(r'[0-9]{4}',hardware) else None
 MATERIALS = {
     'C2': {'HIPX': ['LFRR', 'LRRF'], 'HIPY': ['LFXX', 'RFXX', 'LRXX', 'RRXX'],
            'KNEE': ['0STD', '0PRO']},
@@ -157,6 +158,7 @@ class StationConfig:
     sn_api_key_header: str = 'X-Api-Key'
     report_api_key_header: str = 'X-Api-Key'
     printer_copies: int = 1
+    max_test_torque_nm: float = DEFAULT_TEST_TORQUE_NM
 
     @property
     def target_id(self):
@@ -176,7 +178,7 @@ class StationConfig:
     def torque(self):
         if not self.test_profile_available:
             raise ValueError('当前平台和电机组合尚未配置产测参数')
-        return hardware_torque_limit(self.hardware_version)
+        return self.max_test_torque_nm
 
     @property
     def test_profile_available(self):
@@ -199,6 +201,8 @@ class StationConfig:
                 datetime.strptime(self.production_date, '%y%m%d')
             except ValueError:
                 raise ValueError('生产日期不是有效的日历日期') from None
+        if type(self.max_test_torque_nm) not in (int, float) or not 0 < self.max_test_torque_nm <= 3.4028234663852886e38:
+            raise ValueError('测试最大扭矩须为运控协议可表示的正数，单位 Nm')
         if not math.isfinite(self.kt_error_limit_pct) or self.kt_error_limit_pct < 0:
             raise ValueError('扭矩误差上限须为有限非负数，单位 %满量程')
         if not math.isfinite(self.calibration_timeout) or self.calibration_timeout <= 0:
