@@ -353,6 +353,10 @@ def build_view(self):
     self.open_error_log_button=ttk.Button(footer,text='打开日志目录',style='Footer.TButton',command=self.open_error_log)
     self.open_error_log_button.pack(side='right',padx=(0,8))
     self.upload_status=tk.StringVar(value='报告上传：离线预览' if self.config.simulation else '报告上传：准备中')
-    ttk.Label(footer,textvariable=self.upload_status,width=1,anchor='w',style='Small.TLabel').pack(side='left',fill='x',expand=True)
+    self.delivery_details = ''
+    self.upload_details_button = tk.Button(footer,textvariable=self.upload_status,width=1,anchor='w',
+        relief='flat',borderwidth=0,background='#FFFFFF',foreground='#245788',cursor='hand2',
+        font=('Microsoft YaHei UI',9,'underline'),command=self.show_delivery_details)
+    self.upload_details_button.pack(side='left',fill='x',expand=True)
     self.control_page=ControlPage(self,self.page_holder)
     build_settings(self)

@@ -350,6 +350,11 @@ class DemoServices(Services):
         return dict(status='SIMULATED', message='模拟上传：未访问网络')
 
 
+def completed_on_station(root, sn):
+    path = Path(root)/'completed.json'
+    return path.exists() and sn in json.loads(path.read_text(encoding='utf-8'))
+
+
 class StationRunner:
     def __init__(self, config, *, root=None, emit=lambda *_: None, cancelled=lambda: False, services=None, delivery=None,
                  log_target=None, firmware_sha256=None, hardware_ports=None, online=None):
@@ -413,8 +418,7 @@ class StationRunner:
         return record
 
     def already_completed(self, sn):
-        path = self.root / 'completed.json'
-        return not self.config.simulation and path.exists() and sn in json.loads(path.read_text(encoding='utf-8'))
+        return not self.config.simulation and completed_on_station(self.root, sn)
 
     def save(self):
         self.record['updated_at'] = datetime.now().astimezone().isoformat()
@@ -760,7 +764,8 @@ class StationRunner:
                 if discard:
                     exc.add_note(note)
             self.emit('step', dict(name=step, status=status))
-            self.emit('failed', dict(local_report_generated=record.get('local_report_generated',False),message=record['error'], notes=record['error_notes'], step=step, status=status,
+            self.emit('failed', dict(label_sn=record.get('module_sn') if all(record['steps'].get(name)=='DONE'
+                for name in ('measure','write_sn','print')) else None, local_report_generated=record.get('local_report_generated',False),message=record['error'], notes=record['error_notes'], step=step, status=status,
                 step_label=dict(STEPS).get(step,'两项性能测试' if step=='measure' else step),
                 diagnostic=record['diagnostic'], log_path=str(self.log.path) if self.log else None))
         return record

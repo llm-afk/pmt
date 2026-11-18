@@ -14,10 +14,10 @@ from tkinter import ttk, messagebox, simpledialog, filedialog
 from dataclasses import asdict, replace
 from contextlib import redirect_stdout, redirect_stderr
 
-from .station_config import (StationConfig, MATERIALS,
+from .station_config import (StationConfig, MATERIALS, JOINT_NODE_IDS,
                              hardware_input_value, material_options, load_config, save_config, state_root,
                              compare_incoming_sn, READINESS_LABELS)
-from .station import StationRunner, PresenceLatch, STEPS
+from .station import StationRunner, PresenceLatch, STEPS, completed_on_station
 from .measurements.console import WindowConsole
 from .maintenance import Maintenance, MotorAbsent, MultipleMotors, MotorIdentityUnreadable
 from .device_status import DeviceHealth, AdapterMonitor, adapter_status
@@ -321,6 +321,7 @@ class FactoryWindow:
     def configure_delivery(self):
         if self.closing:
             return
+        self.delivery_details = ''
         self.delivery_revision += 1
         revision = self.delivery_revision
         if self.delivery is not None:
@@ -1062,6 +1063,7 @@ class FactoryWindow:
         """One owner: idle monitoring -> released -> test -> fresh monitoring."""
         last_message = ''
         last_candidate = last_probe_key = last_station_error = None
+        completed_identity, completed_here = None, False
         recent_node = None
         last_motor_response = None
         firmware_check_at = 0
@@ -1233,12 +1235,19 @@ class FactoryWindow:
                 if config.target_id is None: needed.append('target_id')
                 if self.latch.wait_removal: needed.append('remove')
                 elif present and self.latch.stable < 2: needed.append('stabilizing')
-                ready = not needed
                 profile = compare_incoming_sn(detected,config) if present else {}
+                identity = (probe['connection_id'], detected) if (
+                    not config.simulation and profile.get('kind')=='existing' and not probe_latch.wait_removal) else None
+                if identity != completed_identity:
+                    completed_here = bool(identity and completed_on_station(self.storage_root or state_root(), detected))
+                    completed_identity = identity
+                if completed_here:
+                    needed.append('completed_sn')
+                ready = not needed
                 if present:
                     self.diagnostics.snapshot('connection.product_profile',profile)
                 candidate = dict(probe,ready=ready,support_ready=support_ready,
-                    profile_ready=config.test_profile_available,sn_configured=sn_configured,blockers=needed,product=profile)
+                    profile_ready=config.test_profile_available,sn_configured=sn_configured,blockers=needed,product=profile,device_states=states)
                 candidate.update(firmware_file=firmware_file,firmware_sha256=firmware_sha256,firmware_issue=firmware_issue)
                 last_station_error = None
                 if candidate != last_candidate:
@@ -1297,7 +1306,7 @@ class FactoryWindow:
                                        delivery=self.delivery,log_target=self.diagnostics.current,online=online,
                                        firmware_sha256=firmware_sha256, hardware_ports=hardware_ports)
                 if not resume and runner.already_completed(detected):
-                    self.events.put(('failed',dict(message='当前 SN 已完成生产，不能重复取号',notes=[])))
+                    self.events.put(('completed_motor',detected))
                     self.latch.completed()
                     continue
                 if not resume and runner.pending():
@@ -1365,6 +1374,11 @@ class FactoryWindow:
                     self.busy = False
                     self.events.put(('busy',False))
 
+    def reset_workpiece_progress(self):
+        for index,(name,label) in enumerate(STEPS,1):
+            self.steps.item(name,values=(f'{index:02d}   {label}','等待'),tags=())
+        self.refresh_progress()
+
     def refresh_progress(self):
         completed=sum(self.steps.item(name,'values')[1] in ('完成','沿用旧流程') for name,_ in STEPS)
         self.progress['value']=completed
@@ -1415,6 +1429,8 @@ class FactoryWindow:
             if value.get('connection_id') and not next_motor:
                 return '电机反馈中断，请检查接线','如已取下电机，请等待工位确认断开。'
             return ('请接入下一台电机' if next_motor else '请接入待测电机'), '固定好电机，接好电源和 CAN 线，等候自动识别。'
+        if 'completed_sn' in blockers:
+            return '本机已有完成记录，请更换电机','已完成的正式 SN：'+value['sn']
         missing = [READINESS_LABELS.get(k,k) for k in blockers if k not in ('remove','stabilizing')]
         if missing:
             if any(k in blockers for k in ('firmware','profile','target_id','sn_key','mes_url')):
@@ -1426,7 +1442,13 @@ class FactoryWindow:
             elif 'power' in blockers:
                 title='请检查工装电源连接'
             elif 'printer' in blockers:
-                title='请检查标签打印机'
+                printer_state = value.get('device_states',{}).get('printer')
+                if printer_state == 'CHECKING':
+                    title='正在查询标签打印机，请稍候'
+                elif printer_state == 'UNKNOWN':
+                    title='正在重新确认标签打印机状态'
+                else:
+                    title='请检查标签打印机'
             else:
                 title='请等待工位就绪'
             hint='待就绪：'+'、'.join(missing)+'。'
@@ -1437,6 +1459,9 @@ class FactoryWindow:
         else:
             title,hint='已检测到电机，请稍候','正在确认来料身份和工位设备。'
         product = value.get('product',{})
+        if value.get('ready') and product.get('expected'):
+            expected=product['expected']
+            hint=f"本件配置：{expected['project']} / {expected['category']} / {expected['subcategory']}，目标 ID {JOINT_NODE_IDS.get(expected['category'],'—')}。"
         if product.get('differences'):
             keys = product['differences']
             old = ' / '.join(product['observed'][key] for key in keys)
@@ -1555,10 +1580,18 @@ class FactoryWindow:
                 pending,blocked,done=(value.get(k,0) for k in ('pending','blocked','succeeded'))
                 text=f'报告上传：待传 {pending} · 需处理 {blocked} · 已完成 {done}'
                 if value.get('active'): text+=' · 上传中'
-                elif value.get('error') and not pending and not blocked: text='报告上传：等待配置'
+                elif value.get('error') and not pending and not blocked:
+                    text='报告上传：等待配置' if value.get('configuration_blocked') else '报告上传：队列检查异常'
+                reason = value.get('reason') or value.get('error') or ''
+                details = [str(x) for x in (value.get('error'),reason) if x]
+                if blocked:
+                    details.append('请按上述原因核对原报告目录或服务配置。已有正式 SN 的工件无需重新取号。')
+                elif pending:
+                    details.append('报告已在本地排队，后台会继续处理。')
+                self.delivery_details=self.diagnostics.redact('\n'.join(dict.fromkeys(details)))
                 self.upload_status.set(text)
-                self.status_log('delivery.queue',(pending,blocked,done,bool(value.get('active')),value.get('error')),
-                    '[报告队列] '+text+('；'+value['error'] if value.get('error') else ''),
+                self.status_log('delivery.queue',(pending,blocked,done,bool(value.get('active')),value.get('error'),reason),
+                    '[报告队列] '+text+('；'+reason if reason else ''),
                     level='WARNING' if blocked or value.get('error') else 'INFO')
                 message=value.get('notice') or value.get('error')
                 if message and message != self.last_delivery_message:
@@ -1620,6 +1653,7 @@ class FactoryWindow:
                     # A configuration/page handoff may discard the one-shot removal event.
                     # The controller's current snapshot still carries the removal latch.
                     self.terminal_prompt=None
+                    self.reset_workpiece_progress()
                     self.next_motor=True
                 self.ready_to_start=bool(value['ready'] and not value['waiting_removal'] and not self.terminal_prompt
                                          and not self.busy and not self.config_error and self.config.automatic)
@@ -1633,6 +1667,7 @@ class FactoryWindow:
                     if not self.start_requested and (self.terminal_prompt or not value['waiting_removal']):
                         self.show_idle_prompt(value)
             elif kind=='removed':
+                self.reset_workpiece_progress()
                 self.current_sn.set('—')
                 self.sn_phase.set('SN · 等待识别')
                 self.terminal_prompt=None
@@ -1649,8 +1684,7 @@ class FactoryWindow:
                     self.ready_to_start=False
                     if not self.stopping:
                         self.set_prompt('测试开始，请保持连接','工位正在处理本件电机。','#2563EB')
-                    for index,(name,label) in enumerate(STEPS,1): self.steps.item(name,values=(f'{index:02d}   {label}','等待'),tags=())
-                    self.refresh_progress()
+                    self.reset_workpiece_progress()
                     for name in ('dyno','power'):
                         self.device_state(name,'IN_USE','由当前测试流程管理连接')
                 else:
@@ -1708,6 +1742,9 @@ class FactoryWindow:
                     level='ERROR' if status in ('FAIL','INCOMPLETE') else 'WARNING' if status=='PENDING' else 'INFO'
                     self.write_log(line,persist=False,level=level)
             elif kind=='resultdir': self.latest_result=Path(value)
+            elif kind=='completed_motor':
+                self.terminal_prompt=('本机已有完成记录，请更换电机','已完成的正式 SN：'+value,'#24364D')
+                self.set_prompt(*self.terminal_prompt)
             elif kind=='complete':
                 self.terminal_prompt=('本件通过，请取下电机并核对标签',
                     f'核对标签 SN {value["sn"]} 后贴标。','#138365')
@@ -1715,6 +1752,15 @@ class FactoryWindow:
                 self.current_sn.set(value['sn'])
                 self.sn_phase.set('正式 SN · 已写入核对')
             elif kind=='failed':
+                failed_step = value.get('step')
+                after_failure = False
+                for name,_ in STEPS:
+                    if name == failed_step or (failed_step=='measure' and name=='kt'):
+                        after_failure = True
+                    elif after_failure:
+                        label,state = self.steps.item(name,'values')
+                        if state == '等待':
+                            self.steps.item(name,values=(label,'本次未执行'),tags=())
                 if ((value.get('diagnostic') or {}).get('code')=='TEST_QUALITY_FAILED'
                         and 'can' in self.device_widgets):
                     self.device_state('can','STANDBY','曲线测试已结束，等待下一次识别')
@@ -1766,6 +1812,9 @@ class FactoryWindow:
         if code == 'TEST_QUALITY_FAILED':
             report = '本地报告已保存' if value.get('local_report_generated') else '报告保存未完成，请查看日志'
             return '测试不合格，请隔离本件','KT、T-N 曲线均已采集；'+report+'；不申请正式 SN、不打印、不上传。'
+        if step in ('report','upload') and value.get('label_sn'):
+            issue = '本地报告保存失败' if step == 'report' else '报告入队未确认'
+            return '电机测试通过，请核查报告',f'{issue}。保留本件及标签 {value["label_sn"]}，请工程人员核对原记录，勿重测或重复取号。'
         if code == 'KT_TORQUE_ERROR_LIMIT':
             detail=value.get('message') or '扭矩误差超过工位设定值'
             return '扭矩误差超限，请隔离本件',detail+'；已提前结束，不申请正式 SN，请勿贴合格标签。'
@@ -1823,6 +1872,12 @@ class FactoryWindow:
         except OSError as exc:
             self.diagnostics.current.event('ui.open_log_directory.failed',level='ERROR',error=exc,path=str(path))
             self.write_log('无法打开错误日志：'+str(exc))
+
+    def show_delivery_details(self):
+        text = self.upload_status.get()
+        if self.delivery_details:
+            text += '\n\n'+self.delivery_details
+        messagebox.showinfo('报告上传详情',text,parent=self.root)
 
     def open_test_report(self):
         path = None

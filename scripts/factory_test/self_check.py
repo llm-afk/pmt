@@ -202,6 +202,7 @@ def check_operator_actions(window, summary):
                 deliver('firmware_progress', '旧的进度消息')
                 assert window.banner.get()==stopping and '旧的进度消息' not in window.hint.get()
             deliver('failed', failure)
+            assert window.steps.item('upload','values')[1]=='本次未执行'
             message = window.banner.get()+window.hint.get()
             if outcome=='stop_unconfirmed':
                 assert '先断开工装电源' in window.banner.get(), message
@@ -221,6 +222,7 @@ def check_operator_actions(window, summary):
         deliver('removed', dict(config_revision=window.config_revision,mode_generation=window.mode_generation))
         deliver('candidate', candidate('absent', blockers=['motor'], connection_id=None, node_id=None, sn=''))
         assert '接入' in window.banner.get() and '下一台' in window.banner.get()
+        assert window.progress_text.get()=='0 / 11' and all(window.steps.item(name,'values')[1]=='等待' for name in window.steps.get_children())
     window.config.automatic = window.dependencies_ready = False
     window.auto.set(False)
 
@@ -367,6 +369,10 @@ def run(destination):
             menu = [window.page_menu.entrycget(i, 'label') for i in range(window.page_menu.index('end')+1)]
             assert menu == ['自动产测', '电机调试', '工位配置']
             layout_heights = check_production_layout(window)
+            with patch('scripts.factory_test.gui.messagebox.showinfo') as details:
+                window.delivery_details = '测试回执待核对'
+                window.upload_details_button.invoke()
+                assert '测试回执待核对' in details.call_args.args[1]
             check_operator_manual(window)
             check_startup_logging(window)
             assert not hasattr(window, 'sim_control') and not hasattr(window, 'demo_button')

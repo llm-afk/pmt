@@ -105,6 +105,24 @@ class HealthTests(unittest.TestCase):
         self.assertEqual(compare_incoming_sn('未写入 SN',config)['differences'],[])
         self.assertIn('请点击开始',FactoryWindow.candidate_prompt(dict(present=True,ready=True,product=result))[0])
 
+    def test_printer_check_and_fault_have_different_prompts(self):
+        from scripts.factory_test.gui import FactoryWindow
+        candidate=dict(present=True,ready=False,blockers=['printer'])
+        for state, cue in [('CHECKING','请稍候'),('UNKNOWN','重新确认'),('OFFLINE','请检查')]:
+            title,_=FactoryWindow.candidate_prompt(dict(candidate,device_states={'printer':state}))
+            self.assertIn(cue,title)
+
+    def test_report_failure_shows_passed_unit_only_after_label_confirmation(self):
+        from scripts.factory_test.gui import FactoryWindow
+        for step in ('report','upload'):
+            event=dict(step=step,label_sn='ORIGINAL_SN')
+            title,hint=FactoryWindow.failure_prompt(event)
+            self.assertIn('通过',title)
+            self.assertIn('ORIGINAL_SN',hint)
+            event['notes']=['电机失能未确认']
+            self.assertIn('断开工装电源',FactoryWindow.failure_prompt(event)[0])
+        self.assertNotIn('通过',FactoryWindow.failure_prompt(dict(step='report'))[0])
+
     def test_motor_probe_outcomes_give_distinct_operator_actions(self):
         from scripts.factory_test.gui import FactoryWindow
         cases = (

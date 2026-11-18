@@ -110,7 +110,7 @@ class ReportDelivery:
                 blocked += 1
                 errors.append(str(exc))
         payload = dict(pending=0, blocked=blocked, succeeded=0, active=None,
-                       error=errors[0] if errors else self.error, reason=self.error, notice=None, accepted=None)
+                       error=errors[0] if errors else self.error, reason=self.error, configuration_blocked=True, notice=None, accepted=None)
         if payload != self.last_snapshot:
             self.last_snapshot = dict(payload)
             self.notify(payload)

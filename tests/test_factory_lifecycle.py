@@ -238,6 +238,18 @@ class ReadinessSamplingTests(unittest.TestCase):
             self.assertEqual(maintenance.return_value.discover.call_count,0 if config_changed else 1)
         return host,order
 
+    def test_locally_completed_motor_is_blocked_during_identification(self):
+        sn = 'C2HIPXLFRRXC02232611180002'
+        with patch('scripts.factory_test.gui.completed_on_station',return_value=True) as lookup:
+            host,_ = self.scan(dict(node_id=1,sn=sn))
+        candidate = next(value for kind,value in host.events.queue if kind=='candidate')
+        lookup.assert_called_once()
+        self.assertFalse(candidate['ready'])
+        self.assertIn('completed_sn',candidate['blockers'])
+        title,hint=host.candidate_prompt(candidate)
+        self.assertIn('更换',title)
+        self.assertIn(sn,hint)
+
     def test_motor_removed_during_slow_health_never_publishes_ready_or_starts(self):
         host,order=self.scan(None)
         self.assertEqual(order,['health','motor'])
