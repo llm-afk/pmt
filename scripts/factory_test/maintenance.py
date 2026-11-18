@@ -1,5 +1,5 @@
 """工装侧 SDO 维护协议，单接收者。只在自动工位实际运行时打开硬件。"""
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 import struct
 import time
 
@@ -379,9 +379,13 @@ class Maintenance:
                 pass
         raise TimeoutError(f'电机 ID {motor.node_id} 连续 1 秒无有效状态回包')
 
-    def calibrate(self, node=None, *, bench=None, on_feedback=None):
+    def send_calibration_command(self, bench, node):
+        self.check_stop()
+        self.write(bench, node, 0x2002, 2, 0xF1)
+
+    def calibrate(self, node=None):
         node = self.config.require_target_id() if node is None else node
-        with (self.connect(node) if bench is None else nullcontext(bench)) as bench:
+        with self.connect(node) as bench:
             motor = bench.motor(node)
             initial = self.fresh_feedback(motor).error_code
             log_event('motor.neutral.sent',node_id=node,reason='before_calibration',
@@ -397,7 +401,7 @@ class Maintenance:
                 return False
             self.progress('正在发送编码器校准指令，等待驱动器回执')
             try:
-                self.write(bench, node, 0x2002, 2, 0xF1)
+                self.send_calibration_command(bench, node)
                 self.progress('校准指令已确认，正在等待固件完成')
                 from .measurements import hardware_state
                 hardware_state('motor','校准指令已确认，等待固件完成',motion=True)
@@ -406,8 +410,6 @@ class Maintenance:
                 while time.monotonic() < deadline:
                     self.check_stop()
                     state = self.fresh_feedback(motor, calibration=True)
-                    if on_feedback is not None:
-                        on_feedback(state)
                     error = state.error_code
                     if error & ~0x4000:
                         raise CalibrationFault(node,error)
@@ -421,7 +423,7 @@ class Maintenance:
                         log_event('calibration.confirmed',node_id=node,stable_samples=stable,disable_ack=True)
                         hardware_state('motor','校准已完成，失能回执已确认',state='STANDBY',stopped=True)
                         self.progress('编码器校准已完成，停机回执已确认')
-                        if adm and on_feedback is None:
+                        if adm:
                             settings = {}
                             for index, size, name in ((0x205B,4,'torque_limit_nm'),
                                                       (0x2044,2,'heartbeat_consumer_enable')):

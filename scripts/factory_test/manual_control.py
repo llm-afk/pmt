@@ -36,6 +36,7 @@ class ManualSession:
         self.motor_sn = None
         self.failure = None
         self.calibration_status = None
+        self.calibration_low_torque_since = None
         self.cleanup_confirmed = True
         self.state_change_started = False
 
@@ -154,19 +155,29 @@ class ManualSession:
         self.calibration_status = message
         self._state(message)
 
-    def _calibration_sample(self, state):
-        neutral = asdict(MitCommand())
-        self.emit('control_sample', dict(at=state.received_at, position=state.position,
-                  velocity=state.velocity, torque=state.torque, motor_temperature=state.motor_temperature,
-                  board_temperature=state.board_temperature, error_code=state.error_code,
-                  target=neutral, sent_target=neutral, calibrating=True, enabled=True))
+    def _observe_calibration_feedback(self, sample, previous_sample):
+        at = sample['at']
+        if previous_sample is None or at - previous_sample['at'] >= MOTOR_FEEDBACK_TIMEOUT_S:
+            self.calibration_low_torque_since = None
+        low_torque = abs(sample['torque']) < 0.2
+        if not low_torque:
+            self.calibration_low_torque_since = None
+            return
+        if self.calibration_low_torque_since is None:
+            self.calibration_low_torque_since = at
+        elif at - self.calibration_low_torque_since >= 2.0:
+            self.calibration_status = None
+            self.calibration_low_torque_since = None
+            self.maintenance_busy = False
+            self.state_change_started = False
+            self._state('电机反馈扭矩绝对值连续 2 秒小于 0.2，校准流程结束')
 
     def _maintain(self, kind, *, bench=None):
         if kind in ('zero','calibrate') and not self.profile_known:
             raise RuntimeError('未识别芯片平台，无法确定标零/校准协议')
-        maintenance=Maintenance(self.config,self.stop.is_set,progress=self._calibration_progress)
+        maintenance=Maintenance(self.config,self.stop.is_set)
         if kind=='calibrate':
-            return maintenance.calibrate(self.node,bench=bench,on_feedback=self._calibration_sample)
+            maintenance.send_calibration_command(bench,self.node)
         else:
             with maintenance.connect(self.node) as bench:
                 if kind=='zero' and self.config.model.startswith('2'):
@@ -245,21 +256,18 @@ class ManualSession:
                         if self.enabled:
                             raise RuntimeError('维护操作前电机必须失能')
                         if kind=='calibrate':
-                            result_text='编码器校准完成'
                             self._calibration_progress('正在准备编码器校准，尚未发送校准指令')
                         else:
                             self._state('正在'+{'clear_error':'清除错误','zero':'标零'}[kind])
                         if self.config.simulation:
-                            if kind=='calibrate' and self.stop.wait(1):
-                                break
                             if kind=='zero': p=v=0.0
                         elif kind=='calibrate':
                             bench.stop_runtime()
                             channel=None
-                            if not self._maintain(kind,bench=bench):
-                                result_text='电机已校准，本次跳过重复校准'
+                            self._calibration_progress('正在下发编码器校准指令，回执尚未确认')
+                            self._maintain(kind,bench=bench)
+                            self._calibration_progress('驱动器已确认接收校准指令')
                             if not self.stop.is_set():
-                                self._calibration_progress(result_text+'，正在恢复实时波形')
                                 channel=bench.start(rate_hz=1000).motor(self.node)
                                 start_monitoring(channel,cancelled=self.stop.is_set,wait=self.stop.wait)
                         else:
@@ -267,12 +275,14 @@ class ManualSession:
                             bench=channel=None
                             self._maintain(kind)
                             if not self.stop.is_set(): bench,channel=self._open_hardware()
-                        self.maintenance_busy=False
-                        self.state_change_started=False
                         if kind=='calibrate':
+                            self.calibration_low_torque_since=None
+                            self.calibration_status='校准指令已接收，等待反馈扭矩绝对值连续 2 秒小于 0.2'
                             if not self.stop.is_set():
-                                self._state(result_text+' · 实时波形已恢复')
+                                self._state(('模拟：' if self.config.simulation else '') + self.calibration_status)
                         else:
+                            self.maintenance_busy=False
+                            self.state_change_started=False
                             self._state('维护操作完成 · 电机未使能')
                     log_event('debug.command.complete',command=kind,node_id=self.node,enabled=self.enabled,
                               elapsed_ms=round((time.perf_counter()-command_at)*1000,1))
@@ -322,6 +332,8 @@ class ManualSession:
                 sample['sent_target'] = (neutral_fields if not self.enabled else
                                          requested_fields if self.target == requested else asdict(self.target))
                 sample['enabled'] = self.enabled
+                if self.calibration_status:
+                    self._observe_calibration_feedback(sample, last_sample)
                 last_sample = sample
                 if not recent or sample['at']-recent[-1]['at']>=.1:
                     recent.append(sample)
@@ -737,8 +749,7 @@ class ControlPage:
                 if name in value: status[name]=f'{value[name]:.1f} °C'
             if 'enabled' in value:
                 error=value.get('error_code',0)
-                text=('校准中' if value.get('calibrating') else f'故障 0x{error:04X}' if error
-                      else '已使能' if value['enabled'] else '已连接 / 未使能')
+                text=f'故障 0x{error:04X}' if error else '已使能' if value['enabled'] else '已连接 / 状态监视'
                 status['motor']=text
             for name,text in status.items():
                 if self._status_text.get(name)!=text:

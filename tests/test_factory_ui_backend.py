@@ -275,12 +275,50 @@ class ManualTests(unittest.TestCase):
                     session._maintain(kind)
                 maintenance.write.assert_called_once_with(connection,3,index,2,value)
 
-    def test_calibration_reuses_checked_completion_protocol(self):
+    def test_manual_calibration_only_writes_start_once_and_propagates_missing_ack(self):
         session=ManualSession(StationConfig(category='HIPY'),7,lambda *_:None)
         session.profile_known=True
-        with patch('scripts.factory_test.manual_control.Maintenance') as factory:
-            session._maintain('calibrate')
-            factory.return_value.calibrate.assert_called_once_with(7,bench=None,on_feedback=session._calibration_sample)
+        for failure in (None,TimeoutError('missing SDO ACK')):
+            bench=Mock()
+            with self.subTest(failure=failure), patch(
+                    'scripts.factory_test.manual_control.Maintenance.write',side_effect=failure) as write:
+                if failure:
+                    with self.assertRaisesRegex(TimeoutError,'missing SDO ACK'):
+                        session._maintain('calibrate',bench=bench)
+                else:
+                    session._maintain('calibrate',bench=bench)
+                write.assert_called_once_with(bench,7,0x2002,2,0xF1)
+                self.assertEqual(bench.mock_calls,[])
+
+    def test_manual_calibration_requires_fresh_low_torque_for_two_seconds_regardless_of_speed(self):
+        emit=Mock()
+        session=ManualSession(StationConfig(),1,emit)
+        session.maintenance_busy=True
+        session.calibration_status='等待低扭矩'
+        previous=None
+        for at in (1.6,2.4,3.6,4.4,5.2):
+            sample=dict(at=at,velocity=-8,torque=0)
+            session._observe_calibration_feedback(sample,previous)
+            self.assertTrue(session.maintenance_busy)
+            previous=sample
+        session._observe_calibration_feedback(dict(at=5.7,velocity=12,torque=0),previous)
+        self.assertFalse(session.maintenance_busy)
+        self.assertIsNone(session.calibration_status)
+        self.assertIn('校准流程结束',emit.call_args.args[1]['message'])
+
+    def test_manual_calibration_torque_limit_is_strict_in_both_directions(self):
+        for peak in (-.2, .2, -.3, .3):
+            with self.subTest(peak=peak):
+                session=ManualSession(StationConfig(),1,Mock())
+                session.maintenance_busy=True
+                session.calibration_status='等待低扭矩'
+                previous=None
+                for at,torque in [(0,.1),(.5,-.1),(1,.1),(1.5,peak),(2,-.1999),
+                                  (2.5,.1999),(3,.1),(3.5,0),(4,.1)]:
+                    sample=dict(at=at,velocity=0,torque=torque)
+                    session._observe_calibration_feedback(sample,previous)
+                    self.assertEqual(session.maintenance_busy,at < 4)
+                    previous=sample
 
     def test_maintenance_rejected_while_motor_enabled(self):
         session=ManualSession(StationConfig(),3,lambda *_:None)

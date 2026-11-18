@@ -412,15 +412,6 @@ class MaintenanceTests(unittest.TestCase):
             motor.send_mit.assert_not_called()
             motor.disable.assert_not_called()
 
-    def test_debug_stream_receives_calibration_samples_on_existing_connection(self):
-        maintenance,motor,bench=self.calibration_fixture([],errors=(0x4000,0x4000,0,0))
-        maintenance.connect=Mock(side_effect=AssertionError('second CAN owner'))
-        samples=[]
-        self.assertIs(maintenance.calibrate(bench=bench,on_feedback=samples.append),True)
-        self.assertEqual([s.error_code for s in samples],[0x4000,0,0])
-        maintenance.read.assert_not_called()
-        motor.disable.assert_called_once_with()
-
     def test_calibration_fault_stops_without_pretending_disable_ack_is_cancellation(self):
         maintenance,_,bench=self.calibration_fixture([0],errors=(0x4000,0x0400))
         with self.assertRaisesRegex(RuntimeError,'0x0400') as failure:
