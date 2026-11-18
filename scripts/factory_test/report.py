@@ -340,7 +340,11 @@ def _render_pdf(path, summary):
         for j,m in enumerate(sec['metrics']):
             yy=top-68-j*(25 if sec['name'] == 'tn' else 28)
             text(336,yy,m['label'],9)
-            text(429,yy,m['shown']+' '+m['unit'],9)
+            measured = m['shown']+' '+m['unit']
+            text(429,yy,measured,9)
+            if sec['name'] == 'tn' and m['label'] == '最大转速' and points:
+                note_x = 429 + pdfmetrics.stringWidth(measured, chinese_font, 9) + 6
+                text(note_x, yy, '额定电压下测得', 7, '#788793')
             if sec['name'] == 'kt':
                 text(479,yy,statuses.get(m['status'],('待定',muted))[0],7,statuses.get(m['status'],('',muted))[1])
                 text(527,yy,m['standard'],8)
