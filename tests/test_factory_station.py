@@ -372,45 +372,23 @@ class MaintenanceTests(unittest.TestCase):
         maintenance.read=Mock(side_effect=reads)
         maintenance.write=Mock()
         maintenance.wait=Mock()
-        motor.receive_state.side_effect=[NS(error_code=code) for code in errors]
+        # Fresh feedback received on the hardware clock, a quarter second apart.
+        motor.receive_state.side_effect=[NS(error_code=code,torque=0.05,received_at=i*.25)
+            for i,code in enumerate(errors)]
         return maintenance,motor,bench
 
-    def test_calibration_uses_tpdo_status_and_neutral_control_only(self):
-        # Fresh TPDO5 samples: uncalibrated, in progress, clear, clear.
-        maintenance,motor,_=self.calibration_fixture([0x41F00000,1])
-        with patch('scripts.factory_test.maintenance.log_event') as log:
-            maintenance.calibrate()
-        self.assertEqual([call.args[2:5] for call in maintenance.write.call_args_list],
-                         [(0x2002,2,0xF1)])
-        self.assertEqual(maintenance.read.call_count,2)
-        self.assertEqual([call.args[2] for call in maintenance.read.call_args_list],
-                         [0x205B,0x2044])
-        snapshot=next(call.kwargs for call in log.call_args_list if call.args[0]=='motor.settings.snapshot')
-        self.assertEqual(snapshot['settings']['torque_limit_nm']['value'],30.)
-        self.assertEqual(motor.disable.call_count,1)
-        motor.request_feedback.assert_called_once_with()
-        self.assertEqual(motor.send_mit.call_count,3)
-        self.assertTrue(all(call.args[0].pack()==bytes(16) for call in motor.send_mit.call_args_list))
-
-    def test_optional_settings_read_failure_does_not_undo_confirmed_calibration(self):
-        maintenance,motor,_=self.calibration_fixture([SdoError('unsupported')])
-        with patch('scripts.factory_test.maintenance.log_event') as log:
-            maintenance.calibrate()
-        self.assertEqual(motor.disable.call_count,1)
-        motor.request_feedback.assert_called_once_with()
-        self.assertEqual(motor.send_mit.call_count,3)
-        self.assertTrue(all(call.args[0].pack()==bytes(16) for call in motor.send_mit.call_args_list))
-        self.assertTrue(any(call.args[0]=='motor.settings.unavailable' for call in log.call_args_list))
-        self.assertEqual(maintenance.write.call_count,1)
-
-    def test_zero_feedback_error_skips_calibration_on_both_platforms(self):
+    def test_calibration_always_sends_once_and_waits_for_continuous_low_torque(self):
         for model in ('111','221'):
-            maintenance,motor,_=self.calibration_fixture([],model=model,errors=(0,))
-            self.assertIs(maintenance.calibrate(),False)
-            maintenance.write.assert_not_called()
-            maintenance.read.assert_not_called()
-            motor.send_mit.assert_not_called()
-            motor.disable.assert_not_called()
+            for initial in (0,0x4000):
+                maintenance,motor,_=self.calibration_fixture([],model=model)
+                values=[(.0,.01),(.25,.05),(.75,.01),(1.,-.2),(1.25,.19),(2.5,-.1),
+                        (3.,.1),(3.5,-.1),(4.,0),(4.5,.19)]
+                motor.receive_state.side_effect=[NS(error_code=initial,torque=t,received_at=at) for at,t in values]
+                self.assertTrue(maintenance.calibrate())
+                self.assertEqual([call.args[2:5] for call in maintenance.write.call_args_list],[(0x2002,2,0xF1)])
+                self.assertEqual(motor.receive_state.call_count,len(values))
+                motor.disable.assert_not_called()
+                self.assertTrue(all(call.args[0].pack()==bytes(16) for call in motor.send_mit.call_args_list))
 
     def test_calibration_fault_stops_without_pretending_disable_ack_is_cancellation(self):
         maintenance,_,bench=self.calibration_fixture([0],errors=(0x4000,0x0400))
@@ -444,7 +422,7 @@ class ProductionLoadTests(unittest.TestCase):
         service.motor.calibrate.side_effect = lambda: events.append('calibrate')
         return service,make_power,events,streams
 
-    def test_load_off_receipt_precedes_firmware_and_calibration_and_handles_close(self):
+    def test_load_off_only_at_calibration_and_handles_close(self):
         service,factory,events,streams = self.fixture()
         def firmware(*args,**kwargs): events.append('firmware')
         with patch('scripts.factory_test.station.PowerSupply',side_effect=factory) as power, \
@@ -452,31 +430,25 @@ class ProductionLoadTests(unittest.TestCase):
              patch('motor_platform.transports.serial_scpi.time.sleep'):
             service.firmware(1,'incoming')
             service.calibrate()
-        self.assertEqual(events.count('OUTP OFF'),2)
-        self.assertEqual(events.count('OUTP?'),4)
-        self.assertEqual(events.count('load.closed'),2)
-        first,second = [i for i,value in enumerate(events) if value=='OUTP OFF']
-        self.assertLess(first,events.index('OUTP?'))
-        self.assertLess(events.index('load.closed'),events.index('firmware'))
-        self.assertLess(events.index('firmware'),second)
-        self.assertLess(second,events.index('calibrate'))
+        self.assertEqual(events.count('OUTP?'),2)
+        self.assertEqual(events.count('load.closed'),1)
+        self.assertEqual(events.count('OUTP OFF'),1)
+        self.assertLess(events.index('firmware'),events.index('OUTP OFF'))
+        self.assertLess(events.index('OUTP?'),events.index('calibrate'))
         self.assertEqual(events[-2:],['load.closed','calibrate'])
         self.assertNotIn('OUTP ON',events)
-        self.assertEqual([call.kwargs['port'] for call in power.call_args_list],['COM19','COM19'])
+        self.assertEqual([call.kwargs['port'] for call in power.call_args_list],['COM19'])
         self.assertTrue(all(stream.closed for stream in streams))
 
-    def test_rejected_off_readback_blocks_calibration_and_ota_without_switching_on(self):
-        for operation in ('firmware','calibrate'):
-            with self.subTest(operation=operation):
-                service,factory,events,streams = self.fixture(output_reply=b'ON\n')
-                with patch('scripts.factory_test.station.PowerSupply',side_effect=factory), \
-                     patch('scripts.factory_test.firmware.check_firmware') as firmware, \
-                     patch('motor_platform.transports.serial_scpi.time.sleep'):
-                    with self.assertRaisesRegex(RuntimeError,'readback'):
-                        service.firmware(1,'incoming') if operation=='firmware' else service.calibrate()
-                firmware.assert_not_called();service.motor.calibrate.assert_not_called()
-                self.assertNotIn('OUTP ON',events)
-                self.assertTrue(all(stream.closed for stream in streams))
+    def test_rejected_off_readback_blocks_calibration(self):
+        service,factory,events,streams = self.fixture(output_reply=b'ON\n')
+        with patch('scripts.factory_test.station.PowerSupply',side_effect=factory), \
+             patch('motor_platform.transports.serial_scpi.time.sleep'):
+            with self.assertRaisesRegex(RuntimeError,'readback'):
+                service.calibrate()
+        service.motor.calibrate.assert_not_called()
+        self.assertNotIn('OUTP ON',events)
+        self.assertTrue(all(stream.closed for stream in streams))
 
     def test_off_failure_during_abort_cannot_be_suppressed_by_the_original_exception(self):
         from scripts.factory_test.diagnostics import log_scope

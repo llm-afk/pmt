@@ -52,6 +52,18 @@ class FactoryTests(unittest.TestCase):
         self.assertEqual(report.metric('error',5,hi=5)['status'],'PASS')
 
 
+    def test_tn_power_uses_paired_motor_speed_and_dyno_torque(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)
+            (path/'curve.csv').write_text(
+                'motor_speed_smooth_rad_s,dyno_torque_smooth_nm,motor_torque_smooth,motor_temperature_c\n'
+                '-4,3,90,25\n8,2,,26\n',encoding='utf-8')
+            summary=dict(limits={},stages=dict(kt=dict(status='SKIPPED'),tn=dict(status='COMPLETED',csv='curve.csv')))
+            tn=report.analyze(path,summary)[1]
+            self.assertEqual(tn['power_points'],[(4.,12.),(8.,16.)])
+            self.assertEqual(next(m['shown'] for m in tn['metrics'] if m['label']=='最大功率'),'16.00')
+
     def test_kt_accepts_sparse_pairs_and_does_not_impose_capture_gap_limits(self):
         rows=[dict(time_ms='0',motor_application_target_torque='0',dyno_torque_smooth_nm='0'),
               dict(time_ms='2900',motor_application_target_torque='29',dyno_torque_smooth_nm='29')]

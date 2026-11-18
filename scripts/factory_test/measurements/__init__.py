@@ -41,6 +41,34 @@ def check_cancelled():
         raise InterruptedError('操作员已停止测试')
 
 
+@contextmanager
+def measurement_devices(args, power_port, dyno_port, *, expected_sn=None):
+    from motor_platform import Bench, Canable, Dynamometer, PowerSupply
+    from motor_platform.components.dynamometer import detect_dynamometers
+    from motor_platform.components.power_supply.discovery import resolve_power_port
+    from motor_platform.runtime import start_monitoring
+    from .console import WindowConsole
+    from ..diagnostics import log_event
+    matches = detect_dynamometers() if dyno_port == 'auto' else [dyno_port]
+    if len(matches) != 1:
+        raise RuntimeError(f'无法唯一识别测功机：{matches}')
+    with Dynamometer(port=matches[0]) as dyno:
+        dyno.receive_state(timeout=1)
+        hardware_state('dyno', matches[0]+' · 已收到有效扭矩 / 转速反馈')
+        port = resolve_power_port(power_port)
+        with PowerSupply(port=port,observer=power_observer()) as power:
+            if expected_sn is None or power.read_state().output:
+                power.disable()
+            with Bench(transport=Canable(args.serial),motor_ids=[args.id],rate_hz=1000) as bench:
+                if expected_sn is not None and bench.motor(args.id).read_serial_number() != expected_sn:
+                    raise RuntimeError('性能测试前电机 SN 与本件不一致')
+                with bench.start() as control:
+                    motor = control.motor(args.id)
+                    start_monitoring(motor,cancelled=WindowConsole.cancelled.is_set,wait=WindowConsole.cancelled.wait)
+                    log_event('test.devices.open',motor_id=args.id,power_port=port,dyno_port=matches[0],sn=expected_sn)
+                    yield motor, dyno, power, matches[0], port
+
+
 def check_motor_feedback(motor):
     from motor_platform.runtime import MOTOR_FEEDBACK_TIMEOUT_S
     state = motor.state(max_age=MOTOR_FEEDBACK_TIMEOUT_S)
@@ -65,7 +93,7 @@ def record_shutdown_failure(action):
             target.add_note(note)
 
 
-def stop_with_ramp(motor, torque, ramp_seconds, on_step, *, on_error=None):
+def stop_with_ramp(motor, torque, ramp_seconds, on_step, *, on_error=None, finish_at_zero=False):
     """One stop sequence for both measurements, including failures during the ramp."""
     try:
         if ramp_seconds > 0:
@@ -78,7 +106,11 @@ def stop_with_ramp(motor, torque, ramp_seconds, on_step, *, on_error=None):
                 if ratio >= 1:
                     break
                 time.sleep(.005)
+        if finish_at_zero:
+            motor.finish_at_zero()
+            hardware_state('motor','全零运控目标已发送，已收到电机反馈',state='STANDBY')
     except BaseException as exc:
+        finish_at_zero = False
         if on_error is not None:
             try:
                 on_error()
@@ -86,20 +118,21 @@ def stop_with_ramp(motor, torque, ramp_seconds, on_step, *, on_error=None):
                 exc.add_note('收尾诊断快照未取得：'+str(snapshot_error))
         raise
     finally:
-        try:
-            disabled = False
-            with record_shutdown_failure('电机失能'):
-                motor.disable()
-                disabled = True
-            if disabled:
-                hardware_state('motor','失能回执已确认，正在结束本项测试',state='STANDBY',stopped=True)
-        except Exception as exc:
-            if on_error is not None:
-                try:
-                    on_error()
-                except Exception as snapshot_error:
-                    exc.add_note('收尾诊断快照未取得：'+str(snapshot_error))
-            raise
+        if not finish_at_zero:
+            try:
+                disabled = False
+                with record_shutdown_failure('电机失能'):
+                    motor.disable()
+                    disabled = True
+                if disabled:
+                    hardware_state('motor','失能回执已确认，正在结束本项测试',state='STANDBY',stopped=True)
+            except Exception as exc:
+                if on_error is not None:
+                    try:
+                        on_error()
+                    except Exception as snapshot_error:
+                        exc.add_note('收尾诊断快照未取得：'+str(snapshot_error))
+                raise
 
 
 def capture_shutdown_error(summary, motor, dyno):

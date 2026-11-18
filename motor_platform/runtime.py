@@ -170,6 +170,10 @@ class MotorChannel:
         self._disable_receipt = dict(confirmed=True, via='disable_command', confirmed_at=time.perf_counter())
         return result
 
+    def finish_at_zero(self, timeout=MOTOR_FEEDBACK_TIMEOUT_S):
+        """Send all-zero RPDO6, await this node's feedback, then resume passive monitoring."""
+        return self._runtime._call(self, 'finish_zero', positive(timeout))
+
     def stop_status(self):
         with self._runtime._lock:
             return dict(disable_receipt=dict(self._disable_receipt or {}),
@@ -198,6 +202,9 @@ class MotorChannel:
     def start_recording(self):
         """应用可选逐帧记录；必须在使能前调用，不改变 CAN 发送频率。"""
         self._motor.start_recording()
+
+    def stop_recording(self):
+        self._motor.stop_recording()
 
     def drain_states(self):
         return self._motor.drain_states()
@@ -322,7 +329,10 @@ class ControlRuntime:
                     channel._idle_request_at = 0.0
                     channel._gap_anchor = None
                     channel._last_rx = feedback.received_at
-                    channel._active = True
+                    channel._active = enabled != 'finish_zero'
+                    if enabled == 'finish_zero':
+                        channel._monitoring = True
+                        self._touched.discard(channel.node_id)
                     channel._stats.fault = None
             else:
                 channel._motor.disable(timeout)

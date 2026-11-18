@@ -19,10 +19,10 @@ def feedback(t, torque):
 class RecordingTests(unittest.TestCase):
     def test_main_creates_only_one_csv(self):
         with tempfile.TemporaryDirectory() as folder, \
-             patch.object(app, 'detect_dynamometers', return_value=['COM_TEST']), \
-             patch.object(app, 'resolve_power_port', return_value='COM_POWER'), \
-             patch.object(app, 'Dynamometer'), patch.object(app, 'PowerSupply'), \
-             patch.object(app, 'TerminalConsole') as console, patch.object(app, 'Bench') as bench, \
+             patch('motor_platform.components.dynamometer.detect_dynamometers', return_value=['COM_TEST']), \
+             patch('motor_platform.components.power_supply.discovery.resolve_power_port', return_value='COM_POWER'), \
+             patch('motor_platform.Dynamometer'), patch('motor_platform.PowerSupply'), \
+             patch.object(app, 'TerminalConsole') as console, patch('motor_platform.Bench') as bench, \
              patch.object(app, 'run') as run, patch('builtins.print'):
             console.cancelled.is_set.return_value=False
             motor=bench.return_value.__enter__.return_value.start.return_value.__enter__.return_value.motor.return_value
@@ -55,6 +55,7 @@ class RecordingTests(unittest.TestCase):
         self.assertEqual([float(row[1]) for row in rows if row[1]], [1, 4])
         self.assertEqual(frames.count, 5)
 
+    @patch.object(app,'STALL_HOLD_S',.1)
     def test_start_and_stall_boundary_within_one_batch(self):
         writer = Mock()
         progress = app.Progress(0)
@@ -69,6 +70,7 @@ class RecordingTests(unittest.TestCase):
         frames.record([feedback(10.2, 99)], now=10.2)
         self.assertEqual(frames.count, 6)
 
+    @patch.object(app,'STALL_HOLD_S',.1)
     def test_stale_batch_is_recorded_but_cannot_confirm_stall(self):
         progress = app.Progress(0)
         progress.loading_at = 10.
@@ -111,7 +113,7 @@ class RecordingTests(unittest.TestCase):
         motor.state.return_value = feedback(0, 0)
         motor.stats.return_value = {'fault': None}
         motor.set_mit.side_effect = lambda cmd: events.append(('torque', cmd.torque))
-        motor.disable.side_effect = lambda: events.append(('disable', 0))
+        motor.finish_at_zero.side_effect = lambda: events.append(('neutral', 0))
         def set_current(v):
             events.append(('current', v))
             return v
@@ -121,7 +123,8 @@ class RecordingTests(unittest.TestCase):
         pending.result.return_value = .10
         with patch.object(app, 'STOP_TORQUE_RAMP_S', .01):
             app.graceful_stop(motor, power, pending, -30, ui, Mock())
-        off = events.index(('disable', 0))
+        off = events.index(('neutral', 0))
+        motor.disable.assert_not_called()
         torques = [v for k, v in events[:off] if k == 'torque']
         self.assertEqual(torques[-1], 0)
         self.assertEqual(torques, sorted(torques))
@@ -136,11 +139,13 @@ class RecordingTests(unittest.TestCase):
                 motor.state.return_value=feedback(0,0)
                 failing=motor if action=='motor' else power
                 primary=OSError('no acknowledgement')
-                failing.disable.side_effect=primary
+                method = motor.finish_at_zero if action=='motor' else power.disable
+                method.side_effect=primary
                 with patch.object(app.time,'perf_counter',side_effect=[1.,3.]), self.assertRaises(OSError) as caught:
                     app.graceful_stop(motor,power,None,0,Mock(),Mock())
                 self.assertIs(caught.exception, primary)
-                self.assertTrue(any('工装停机未确认' in n for n in primary.__notes__))
+                if action=='power': self.assertTrue(any('工装停机未确认' in n for n in primary.__notes__))
+                else: motor.disable.assert_called_once()
 
     def test_stop_fault_does_not_delay_disable_for_unload(self):
         motor, power = Mock(), Mock()

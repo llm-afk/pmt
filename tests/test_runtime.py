@@ -323,6 +323,26 @@ class RuntimeTests(unittest.TestCase):
         finally:
             rt.close()
 
+    def test_two_measurements_share_channel_and_finish_without_disable_write(self):
+        tr,bus,rt=self.make()
+        rt.start()
+        try:
+            motor=rt.motor('J1')
+            motor.monitor()
+            for torque in (2,3):
+                motor.start_recording()
+                motor.enable()
+                motor.set_mit(MitCommand(torque=torque))
+                time.sleep(.015)
+                motor.finish_at_zero()
+                self.assertTrue(motor.drain_states())
+                motor.stop_recording()
+                self.assertFalse(motor.stats()['control_active'])
+            self.assertEqual([f.data for f in tr.sent if f.can_id==0x401][-1],bytes(16))
+        finally:
+            rt.close()
+        self.assertFalse(any(f.can_id==0x601 for f in tr.sent))
+
     def test_monitor_schedule_uses_one_millisecond_period_without_catchup(self):
         tr,bus,rt=self.make()
         one=rt.motor('J1')

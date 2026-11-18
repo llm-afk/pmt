@@ -7,12 +7,10 @@ from pathlib import Path
 import sys
 import time
 
-from motor_platform import Bench, MitCommand, Dynamometer, PowerSupply, Canable
-from motor_platform.runtime import MOTOR_FEEDBACK_TIMEOUT_S, start_monitoring
-from motor_platform.components.dynamometer import detect_dynamometers
+from motor_platform import MitCommand
+from motor_platform.runtime import MOTOR_FEEDBACK_TIMEOUT_S
 from motor_platform.components.dynamometer.protocol import SPEED_COUNTS_PER_RPM
-from motor_platform.components.power_supply.discovery import resolve_power_port
-from .. import (SAMPLE_MAX_GAP_S, power_off, record_shutdown_failure, power_observer,
+from .. import (measurement_devices, SAMPLE_MAX_GAP_S, power_off, record_shutdown_failure,
                 device_snapshot, log_measurement_snapshot, stop_with_ramp, capture_shutdown_error,
                 check_motor_feedback, hardware_state, finish_capture, record_progress, check_cancelled)
 from ..console import WindowConsole as TerminalConsole
@@ -34,7 +32,7 @@ TORQUE_SETTLE_S = 1.0            # 下发最大前馈扭矩后等待，再开始
 TORQUE_RAMP_S = 1.0              # 从 0 线性增加到 TORQUE_FF 的时间，支持负目标
 STOP_TORQUE_RAMP_S = 1.0         # 正常停止：维持阻尼，电机扭矩用此时间线性降到 0
 STALL_SPEED_RAD_S = 0.5
-STALL_HOLD_S = 0.100
+STALL_HOLD_S = 0.5
 DYNO_FEEDBACK_TIMEOUT_S = 1.0
 DYNO_TORQUE_SCALE = 100.0         # 沿用已验证接收组件；实测标定另行核对
 DYNO_SPEED_SCALE = SPEED_COUNTS_PER_RPM
@@ -113,8 +111,8 @@ def load_target(step_number):
     return round(step_number*CURRENT_STEP_A, 3)
 
 
-def graceful_stop(motor, power, pending, torque, ui, drain, *, on_error=None, summary=None):
-    """正常停机：1 秒降扭矩，再失能并直接关闭电源。
+def graceful_stop(motor, power, pending, torque, ui, drain, *, on_error=None, summary=None, finish_at_zero=True):
+    """正常停机：1 秒降扭矩，再提交全零目标并关闭电源。
 
     CAN/反馈故障时上层走立即失能，不延长故障状态来执行斜坡。
     """
@@ -125,12 +123,12 @@ def graceful_stop(motor, power, pending, torque, ui, drain, *, on_error=None, su
         drain('stopping_torque')
         ui._notice = f'停止中：电机扭矩 {remaining_torque:.3f}，保持阻尼'
         ui.app.invalidate()
-    stop_with_ramp(motor,torque,STOP_TORQUE_RAMP_S,on_step,on_error=on_error)
+    stop_with_ramp(motor,torque,STOP_TORQUE_RAMP_S,on_step,on_error=on_error,finish_at_zero=finish_at_zero)
     # 串口操作顺序完成后关闭输出，不再阶梯降低电流。
     if pending is not None:
         pending.result()
     power_off(power,summary)
-    ui._notice = '停止完成：电机已失能，电源输出已关闭'
+    ui._notice = '停止完成：电机收尾完成，磁粉加载已关闭'
     ui.app.invalidate()
 
 
@@ -213,7 +211,7 @@ def run(motor, dyno, power, pool, ui, writer, summary, *, torque=None):
                     f'前馈扭矩 {applied_torque:.3f}/{torque}  加载电流设定 {current:.3f} A\n'
                     f'电机速度 {state.velocity:+.3f} rad/s  扭矩 {state.torque:+.4f}\n'
                     f'温度 {state.motor_temperature:.1f}/{state.board_temperature:.1f} C\n'
-                    f'测功机 {ds.speed:.3f} rad/s  {ds.torque:+.4f} Nm  {ds.power:+.3f} W\n'
+                    f'测功机 {ds.speed:.3f} rad/s  {ds.torque:+.4f} Nm  轴功率 {abs(state.velocity * ds.torque):.3f} W\n'
                     f'已记录 {recorder.count} 行   CAN {stats["actual_tx_hz"]:.1f} Hz  '
                     f'通信异常报告 {stats.get("can_protocol_reports", 0)} 次')
                 ui._notice = (progress.stability_text if progress.loading_at is None
@@ -231,7 +229,8 @@ def run(motor, dyno, power, pool, ui, writer, summary, *, torque=None):
         try:
             if motor_started and (active_error is None or isinstance(active_error, (KeyboardInterrupt,InterruptedError))):
                 graceful_stop(motor, power, pending, applied_torque, ui, drain,
-                              on_error=lambda: capture_shutdown_error(summary,motor,dyno),summary=summary)
+                              on_error=lambda: capture_shutdown_error(summary,motor,dyno),summary=summary,
+                              finish_at_zero=reason=='stall_confirmed' and active_error is None)
                 summary['controlled_stop_completed'] = True
             else:
                 with record_shutdown_failure('电机失能'):
@@ -273,48 +272,34 @@ def parse_args(argv=None):
     return args
 
 
-def main(argv=None, *, output_dir, quiet=False, power_port=None, dyno_port=None):
+def main(argv=None, *, output_dir, quiet=False, power_port=None, dyno_port=None, devices=measurement_devices):
     args = parse_args(argv)
     # Passive dyno discovery first; keep its port out of active SCPI discovery.
     dyno_port = DYNO_PORT if dyno_port is None else dyno_port
     power_port = POWER_PORT if power_port is None else power_port
-    matches = detect_dynamometers() if dyno_port == 'auto' else [dyno_port]
-    if len(matches) != 1:
-        raise RuntimeError(f'Expected one dynamometer, found {matches}; set DYNO_PORT')
     directory = Path(output_dir)
     directory.mkdir(parents=True)
     summary = {'motor_id': args.id, 'target_torque': args.torque, 'config': {k: v for k, v in globals().items()
                if k.isupper() and k != 'COLUMNS'}, 'timestamp': 'host perf_counter reception; no interpolation'}
     try:
-        with Dynamometer(port=matches[0], torque_scale=DYNO_TORQUE_SCALE,
-                         speed_scale=DYNO_SPEED_SCALE) as dyno:
-            dyno.receive_state(timeout=1)
-            hardware_state('dyno',matches[0]+' · 已收到有效扭矩 / 转速反馈')
-            port = resolve_power_port(power_port)
-            summary.update(power_port=port, dynamometer_port=matches[0])
-            with PowerSupply(port=port, observer=power_observer()) as power:
-                try:
-                    power.disable()
-                    power.set_current(0)
-                    power.set_voltage(LOAD_VOLTAGE_V)
-                    with TerminalConsole(title='电机 T-N 曲线测试', prompt='tn> ', commands='status | quit') as ui, \
-                         (directory/'curve.csv').open('x', encoding='utf-8', newline='') as csvfile, \
-                         ThreadPoolExecutor(max_workers=1, thread_name_prefix='load-power') as pool:
-                        writer = csv.writer(csvfile)
-                        writer.writerow(COLUMNS)
-                        with Bench(transport=Canable(args.serial), motor_ids=[args.id], rate_hz=MOTOR_HZ) as bench:
-                            with bench.start() as control:
-                                motor = control.motor(args.id)
-                                start_monitoring(motor,cancelled=TerminalConsole.cancelled.is_set,
-                                                 wait=TerminalConsole.cancelled.wait)
-                                check_motor_feedback(motor)
-                                dyno.state(max_age=DYNO_FEEDBACK_TIMEOUT_S)
-                                check_cancelled()
-                                power.enable()  # Zero current limit, independent motor battery.
-                                run(motor, dyno, power, pool, ui, writer, summary, torque=args.torque)
-                finally:
-                    # Executor has joined any in-flight set_current before OFF.
-                    power_off(power, summary)
+        with devices(args,power_port,dyno_port) as (motor,dyno,power,dyno_name,port):
+            summary.update(power_port=port, dynamometer_port=dyno_name)
+            try:
+                power.set_current(0)
+                power.set_voltage(LOAD_VOLTAGE_V)
+                with TerminalConsole(title='电机 T-N 曲线测试', prompt='tn> ', commands='status | quit') as ui, \
+                     (directory/'curve.csv').open('x', encoding='utf-8', newline='') as csvfile, \
+                     ThreadPoolExecutor(max_workers=1, thread_name_prefix='load-power') as pool:
+                    writer = csv.writer(csvfile)
+                    writer.writerow(COLUMNS)
+                    check_motor_feedback(motor)
+                    dyno.state(max_age=DYNO_FEEDBACK_TIMEOUT_S)
+                    check_cancelled()
+                    power.enable()
+                    run(motor,dyno,power,pool,ui,writer,summary,torque=args.torque)
+            finally:
+                power_off(power,summary)
+                motor.stop_recording()
     except BaseException as exc:
         summary['error'] = repr(exc)
         summary['reason'] = 'operator_stop' if isinstance(exc, (KeyboardInterrupt,InterruptedError)) else 'error'

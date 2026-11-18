@@ -24,6 +24,7 @@ class FakeMotor:
         self.failure = None
     def start_recording(self): pass
     def enable(self): self.events.append('motor_on')
+    def finish_at_zero(self): self.events.append('motor_zero')
     def disable(self): self.events.append('motor_off')
     def state(self, **kwargs):
         if self.failure:
@@ -92,7 +93,7 @@ class ConsistencyTests(unittest.TestCase):
 
     def test_complete_ramp_capture_cutoff_and_controlled_stop(self):
         clock, events, result, motor = self.exercise()
-        self.assertEqual(events, ['motor_on', 'motor_off'])
+        self.assertEqual(events, ['motor_on', 'motor_zero'])
         self.assertEqual(result['reason'], 'completed')
         self.assertAlmostEqual(result['recorder'].cutoff, 100.05)
         self.assertTrue(all(at <= 100.05 for at, _, _ in result['recorder'].events))
@@ -125,7 +126,7 @@ class ConsistencyTests(unittest.TestCase):
         self.assertAlmostEqual(result['recorder'].cutoff,100.6)
         self.assertEqual(max(torque for _,torque in motor.commands),30.)
         self.assertEqual(motor.commands[-1][1],0.)
-        self.assertEqual(events,['motor_on','motor_off'])
+        self.assertEqual(events,['motor_on','motor_zero'])
         self.assertTrue(result['recorder'].events)
         self.assertTrue(all(sample.torque==.3 for _,_,sample in result['recorder'].events))
 
@@ -199,11 +200,11 @@ class ConsistencyTests(unittest.TestCase):
             rec.add('dyno', [state(.005)])
             result.update(recorder=rec, reason='completed')
         with tempfile.TemporaryDirectory() as directory, \
-             patch.object(app, 'detect_dynamometers', return_value=['fake']), \
-             patch.object(app, 'resolve_power_port', return_value='fake'), \
-             patch.object(app, 'Dynamometer', return_value=dyno), \
-             patch.object(app, 'PowerSupply', return_value=power), \
-             patch.object(app, 'Canable'), patch.object(app, 'Bench', return_value=bench), \
+             patch('motor_platform.components.dynamometer.detect_dynamometers', return_value=['fake']), \
+             patch('motor_platform.components.power_supply.discovery.resolve_power_port', return_value='fake'), \
+             patch('motor_platform.Dynamometer', return_value=dyno), \
+             patch('motor_platform.PowerSupply', return_value=power), \
+             patch('motor_platform.Canable'), patch('motor_platform.Bench', return_value=bench), \
              patch.object(app, 'TerminalConsole', return_value=nullcontext(None)) as console, \
              patch.object(app, 'run', side_effect=run), \
              patch.object(app.time, 'sleep', side_effect=lambda seconds: events.append(('wait', seconds))), \
@@ -224,8 +225,8 @@ class ConsistencyTests(unittest.TestCase):
             self.assertNotEqual(rows[0]['motor_torque_smooth'], '')
             self.assertNotIn('motor_speed_smooth_rad_s', rows[0])
             self.assertNotIn('dyno_speed_smooth_rad_s', rows[0])
-        self.assertEqual(events, ['off', ('current', 0), ('voltage', 24.), ('current', 3.),
-                                  'monitor', 'on', ('wait', .5), 'run', 'off'])
+        self.assertEqual(events, ['off', 'monitor', ('current', 0), ('voltage', 24.), ('current', 3.),
+                                  'on', ('wait', .5), 'run', 'off'])
 
 
 if __name__ == '__main__':

@@ -1,4 +1,5 @@
 """顺序执行两个测量内核，并核对每项开始前的电机身份。"""
+from contextlib import nullcontext
 from datetime import datetime
 import time
 
@@ -21,7 +22,7 @@ def read_motor_sn(args):
 
 
 def execute(args, directory, *, stages=STAGES, identify=read_motor_sn, pause=time.sleep,
-            motor_sn=None):
+            motor_sn=None, connections=None):
     """复用入口函数：子脚本负责设备与停机，总测负责顺序、身份核对及归档。"""
     argv = ['--id', str(args.id), '--serial', args.serial, '--torque', str(args.torque)]
     summary = dict(schema_version=1, demo=False, started_at=datetime.now().astimezone().isoformat(),
@@ -34,24 +35,25 @@ def execute(args, directory, *, stages=STAGES, identify=read_motor_sn, pause=tim
         if summary['motor_sn'] is None:
             summary['motor_sn'] = identify(args)
         print(f'电机 SN: {summary["motor_sn"]}', flush=True)
-        for i, (name, module, _) in enumerate(stages):
-            stage = summary['stages'][name]
-            stage.update(status='RUNNING', started_at=datetime.now().astimezone().isoformat())
-            if identify(args) != summary['motor_sn']:
-                raise RuntimeError('电机SN变化，停止总测，避免混入其他电机数据')
-            print(f'[{i+1}/{len(stages)}] {name.upper()}', flush=True)
-            stage_argv = [*argv,'--error-limit-pct',str(summary['limits']['kt_linearity_max_pct'])] if name=='kt' else argv
-            result = module.main(stage_argv, output_dir=directory/name, quiet=True)
-            stage['result'] = result
-            reason = result.get('reason', result.get('status', 'unknown'))
-            completed = (result.get('reason') == 'completed' if name == 'kt' else
-                         result.get('reason') == 'stall_confirmed')
-            stage.update(status='COMPLETED' if completed else 'ERROR', reason=reason,
-                         finished_at=datetime.now().astimezone().isoformat())
-            if not completed:
-                raise RuntimeError(f'{name}: {reason}')
-            if i+1 < len(stages):
-                pause(BETWEEN_TESTS_S)
+        with connections if connections is not None else nullcontext():
+            for i, (name, module, _) in enumerate(stages):
+                stage = summary['stages'][name]
+                stage.update(status='RUNNING', started_at=datetime.now().astimezone().isoformat())
+                if connections is None and identify(args) != summary['motor_sn']:
+                    raise RuntimeError('电机SN变化，停止总测，避免混入其他电机数据')
+                print(f'[{i+1}/{len(stages)}] {name.upper()}', flush=True)
+                stage_argv = [*argv,'--error-limit-pct',str(summary['limits']['kt_linearity_max_pct'])] if name=='kt' else argv
+                result = module.main(stage_argv, output_dir=directory/name, quiet=True)
+                stage['result'] = result
+                reason = result.get('reason', result.get('status', 'unknown'))
+                completed = (result.get('reason') == 'completed' if name == 'kt' else
+                             result.get('reason') == 'stall_confirmed')
+                stage.update(status='COMPLETED' if completed else 'ERROR', reason=reason,
+                             finished_at=datetime.now().astimezone().isoformat())
+                if not completed:
+                    raise RuntimeError(f'{name}: {reason}')
+                if connections is None and i+1 < len(stages):
+                    pause(BETWEEN_TESTS_S)
     except (Exception, KeyboardInterrupt) as exc:
         from scripts.factory_test.diagnostics import error_details, log_event, unconfirmed_cleanup_notes
         log_event('test.exception', '性能测试异常', level='ERROR', error=exc, stages=summary['stages'])
@@ -63,6 +65,8 @@ def execute(args, directory, *, stages=STAGES, identify=read_motor_sn, pause=tim
             for note in unconfirmed_cleanup_notes(cause.get('notes', [])):
                 if note not in summary['error_notes']:
                     summary['error_notes'].append(note)
+        if connections is not None and all(stage['status']=='COMPLETED' for stage in summary['stages'].values()):
+            summary['stages']['tn'].update(status='ERROR', reason='设备会话收尾异常：'+str(exc))
         for stage in summary['stages'].values():
             if stage['status'] == 'RUNNING':
                 stage.update(status='ERROR', reason=summary['error'])

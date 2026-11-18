@@ -113,7 +113,7 @@ class FrozenPortTests(unittest.TestCase):
                 calls.append((kwargs['power_port'],kwargs['dyno_port']))
                 return dict(reason=_reason)
             module.main=main;modules.append((name,module,name+'.csv'))
-        def execute(args,directory,*,stages,motor_sn,after_stage=None):
+        def execute(args,directory,*,stages,motor_sn,connections=None,after_stage=None):
             for name,module,_ in stages:module.main([],output_dir=directory/name,quiet=True)
             return dict(stages={},sections=[])
         service=Services(StationConfig(),lambda:False,lambda *_:None,
@@ -148,9 +148,9 @@ class MeasurementReadyOrderTests(unittest.TestCase):
             events.append(('run',clock[0]));motor.enable()
         with ExitStack() as patches:
             for name,value in (('Dynamometer',dyno),('PowerSupply',power),('Bench',bench)):
-                patches.enter_context(patch.object(module,name,return_value=value))
-            patches.enter_context(patch.object(module,'Canable'))
-            patches.enter_context(patch.object(module,'resolve_power_port',return_value='COM19'))
+                patches.enter_context(patch('motor_platform.'+name,return_value=value))
+            patches.enter_context(patch('motor_platform.Canable'))
+            patches.enter_context(patch('motor_platform.components.power_supply.discovery.resolve_power_port',return_value='COM19'))
             console=patches.enter_context(patch.object(module,'TerminalConsole',return_value=nullcontext(None)))
             console.cancelled.is_set.side_effect=lambda:cancel and clock[0]>=100.2
             console.cancelled.wait.side_effect=wait

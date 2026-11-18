@@ -7,12 +7,9 @@ import sys
 import time
 
 from scripts.factory_test.station_config import DEFAULT_KT_ERROR_LIMIT_PCT
-from motor_platform import Bench, Canable, Dynamometer, MitCommand, PowerSupply
-from motor_platform.runtime import MOTOR_FEEDBACK_TIMEOUT_S, start_monitoring
-from motor_platform.components.dynamometer import detect_dynamometers
+from motor_platform import MitCommand
 from motor_platform.components.dynamometer.protocol import SPEED_COUNTS_PER_RPM
-from motor_platform.components.power_supply.discovery import resolve_power_port
-from .. import (SAMPLE_MAX_GAP_S, power_off, record_shutdown_failure, power_observer,
+from .. import (measurement_devices, SAMPLE_MAX_GAP_S, power_off,
                 device_snapshot, log_measurement_snapshot, stop_with_ramp, capture_shutdown_error,
                 check_motor_feedback, hardware_state, finish_capture, record_progress, check_cancelled)
 from ..console import WindowConsole as TerminalConsole
@@ -82,11 +79,11 @@ def check_motor(motor):
     return state, stats
 
 
-def stop_motor(motor, torque, controlled, collect, *, on_error=None):
+def stop_motor(motor, torque, controlled, collect, *, on_error=None, finish_at_zero=False):
     def on_step(remaining_torque):
         check_motor(motor)
         collect()
-    stop_with_ramp(motor,torque,STOP_RAMP_S if controlled else 0,on_step,on_error=on_error)
+    stop_with_ramp(motor,torque,STOP_RAMP_S if controlled else 0,on_step,on_error=on_error,finish_at_zero=finish_at_zero)
 
 
 def run(motor, dyno, ui, args, result):
@@ -161,10 +158,10 @@ def run(motor, dyno, ui, args, result):
             result['runtime_snapshot'] = device_snapshot(motor,dyno,target=applied,loop_at=locals().get('now',time.perf_counter()))
             result['snapshot_phase'] = 'acquisition_complete'
         try:
-            ui._notice = '正在降扭矩、失能；随后关闭阻尼器电源'
+            ui._notice = '正在撤去电机扭矩，随后关闭磁粉加载'
             ui.app.invalidate()
             stop_motor(motor, applied, enabled and (original is None or isinstance(original, (KeyboardInterrupt,InterruptedError))), collect,
-                       on_error=lambda: capture_shutdown_error(result,motor,dyno))
+                       on_error=lambda: capture_shutdown_error(result,motor,dyno),finish_at_zero=result['reason']=='completed' and original is None)
         except Exception as exc:
             capture_shutdown_error(result,motor,dyno)
             result['reason'] = 'error'
@@ -177,13 +174,10 @@ def run(motor, dyno, ui, args, result):
             finish_capture(collect)
 
 
-def main(argv=None, *, output_dir, quiet=False, power_port=None, dyno_port=None):
+def main(argv=None, *, output_dir, quiet=False, power_port=None, dyno_port=None, devices=measurement_devices):
     args = parse_args(argv)  # 所有参数校验先于连接和输出操作。
     dyno_port = DYNO_PORT if dyno_port is None else dyno_port
     power_port = POWER_PORT if power_port is None else power_port
-    matches = detect_dynamometers() if dyno_port == 'auto' else [dyno_port]
-    if len(matches) != 1:
-        raise RuntimeError(f'Expected one dynamometer, found {matches}; set DYNO_PORT')
     result = {'reason': 'error'}
     directory = Path(output_dir)
     directory.mkdir(parents=True)
@@ -191,37 +185,23 @@ def main(argv=None, *, output_dir, quiet=False, power_port=None, dyno_port=None)
     try:
         with csv_path.open('x', encoding='utf-8', newline='') as target:
             try:
-                with Dynamometer(port=matches[0], torque_scale=DYNO_TORQUE_SCALE,
-                                 speed_scale=DYNO_SPEED_SCALE) as dyno:
-                    dyno.receive_state(timeout=1)
-                    hardware_state('dyno',matches[0]+' · 已收到有效扭矩 / 转速反馈')
-                    # 先占用被动测功机串口，再探测 SCPI 电源。
-                    port = resolve_power_port(power_port)
-                    result.update(power_port=port,dynamometer_port=matches[0])
-                    with PowerSupply(port=port, observer=power_observer()) as power:
-                        try:
-                            power.disable()
-                            power.set_current(0)
-                            power.set_voltage(args.voltage)
-                            power.set_current(args.current)
-                            with TerminalConsole(title='关节输出扭矩一致性测试', prompt='torque> ',
-                                                 commands='status | quit') as ui:
-                                with Bench(transport=Canable(args.serial), motor_ids=[args.id], rate_hz=MOTOR_HZ) as bench:
-                                    with bench.start() as control:
-                                        motor = control.motor(args.id)
-                                        start_monitoring(motor,cancelled=TerminalConsole.cancelled.is_set,
-                                                         wait=TerminalConsole.cancelled.wait)
-                                        try:
-                                            check_motor(motor)
-                                            dyno.state(max_age=DYNO_FEEDBACK_TIMEOUT_S)
-                                            check_cancelled()
-                                            power.enable()  # 建立阻尼期间保持零目标监视。
-                                            time.sleep(LOAD_SETTLE_S)
-                                            run(motor, dyno, ui, args, result)
-                                        finally:
-                                            power_off(power,result)  # 降扭矩、失能之后立即关闭阻尼输出。
-                        finally:
-                            power_off(power,result)
+                with devices(args,power_port,dyno_port) as (motor,dyno,power,dyno_name,port):
+                    result.update(power_port=port,dynamometer_port=dyno_name)
+                    try:
+                        power.set_current(0)
+                        power.set_voltage(args.voltage)
+                        power.set_current(args.current)
+                        with TerminalConsole(title='关节输出扭矩一致性测试', prompt='torque> ',
+                                             commands='status | quit') as ui:
+                            check_motor(motor)
+                            dyno.state(max_age=DYNO_FEEDBACK_TIMEOUT_S)
+                            check_cancelled()
+                            power.enable()
+                            time.sleep(LOAD_SETTLE_S)
+                            run(motor,dyno,ui,args,result)
+                    finally:
+                        power_off(power,result)
+                        motor.stop_recording()
             except BaseException as exc:
                 result['reason'] = 'operator_stop' if isinstance(exc, (KeyboardInterrupt,InterruptedError)) else 'error'
                 raise

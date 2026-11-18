@@ -1,4 +1,5 @@
 """可恢复的工位流程；模拟硬件与真实业务共用状态机。"""
+from contextlib import ExitStack, nullcontext
 from dataclasses import asdict
 from datetime import datetime
 import json
@@ -65,9 +66,9 @@ def emit_measurement_steps(emit, summary):
 
 
 HARDWARE_PHASES = {
-    'firmware': dict(can='MAINTENANCE',motor='MAINTENANCE',load='OFF',dyno='WAIT',printer='WAIT'),
-    'assign_id': dict(can='MAINTENANCE',motor='MAINTENANCE',load='OFF',dyno='WAIT',printer='WAIT'),
-    'base_sn': dict(can='MAINTENANCE',motor='MAINTENANCE',load='OFF',dyno='WAIT',printer='WAIT'),
+    'firmware': dict(can='MAINTENANCE',motor='MAINTENANCE',load='UNCHANGED',dyno='WAIT',printer='WAIT'),
+    'assign_id': dict(can='MAINTENANCE',motor='MAINTENANCE',load='UNCHANGED',dyno='WAIT',printer='WAIT'),
+    'base_sn': dict(can='MAINTENANCE',motor='MAINTENANCE',load='UNCHANGED',dyno='WAIT',printer='WAIT'),
     'calibrate': dict(can='MAINTENANCE',motor='CALIBRATION',load='OFF',dyno='WAIT',printer='WAIT'),
     'measure': dict(can='PERIODIC',motor='PREPARE',load='CONTROLLED',dyno='CAPTURE',printer='WAIT'),
     'kt': dict(can='PERIODIC',motor='KT',load='CONTROLLED',dyno='CAPTURE',printer='WAIT'),
@@ -127,7 +128,7 @@ class Services:
                         '维护通道使用中' if policy['can']=='MAINTENANCE' else '当前工序不使用 CAN',
                         motor={'MAINTENANCE':'维护操作中；不下发运动目标','CALIBRATION':'准备校准；先关闭加载并发送全零目标',
                                'PREPARE':'准备性能测试；先确认零目标与新反馈','KT':'准备 KT 测试；就绪后才使能',
-                               'TN':'准备 T-N 测试；就绪后才使能','STOPPED':'性能测试已结束，电机失能结果见回执'}[policy['motor']],
+                               'TN':'准备 T-N 测试；就绪后才使能','STOPPED':'性能测试已结束，零目标与加载关闭见回执'}[policy['motor']],
                         dyno='性能测试使用被动扭矩 / 转速反馈' if policy['dyno']=='CAPTURE' else '当前工序不采集扭矩 / 转速',
                         printer='正在检查打印服务并提交标签' if policy['printer']=='PRINT' else '当前工序不提交打印；打印前重新检查服务')
         for device, detail in messages.items():
@@ -188,7 +189,6 @@ class Services:
         self.disable_load('production_aborted')
 
     def firmware(self, node, expected_sn):
-        self.prepare_phase('firmware')
         from .firmware import check_firmware
         return check_firmware(self.config,self.motor,node,expected_sn,
                               lambda message:self.emit('firmware_progress',message), expected_sha256=self.firmware_sha256)
@@ -215,33 +215,41 @@ class Services:
         stages = []
         power_port = self.hardware_ports.get('power') or self.config.power_port
         dyno_port = self.hardware_ports.get('dyno') or self.config.dyno_port
-        for name, module, csv in app.STAGES:
-            def run(*argv, _name=name, _module=module, **kwargs):
-                self.check_stop()
-                started = time.perf_counter()
-                log_event('test.stage.start', stage=_name, output_directory=str(directory/_name),
-                          motor_id=self.config.target_id, target_torque=self.config.torque,
-                          power_port=power_port, dyno_port=dyno_port,
-                          parameters={key:value for key,value in vars(_module).items() if key.isupper() and
-                                      key not in ('COLUMNS','OUTPUT_COLUMNS')})
-                self.emit('step', dict(name=_name, status='RUNNING'))
-                self.enter_phase(_name)
-                try:
-                    result = _module.main(*argv, power_port=power_port,dyno_port=dyno_port,**kwargs)
-                except BaseException as exc:
-                    log_event('test.stage.failed', level='ERROR', error=exc, stage=_name,
-                              output_directory=str(directory/_name),
-                              elapsed_s=round(time.perf_counter()-started,4))
-                    self.emit('step',dict(name=_name,status='FAILED'))
-                    raise
-                self.check_stop()
-                complete = result.get('reason') == ('completed' if _name == 'kt' else 'stall_confirmed')
-                log_event('test.stage.end', stage=_name, result=result, complete=complete,
-                          elapsed_s=round(time.perf_counter()-started, 4))
-                self.emit('step', dict(name=_name, status='COLLECTED' if complete else 'INCOMPLETE'))
-                return result
-            stages.append((name, SimpleNamespace(main=run), csv))
-        summary = app.execute(args,directory,stages=stages,motor_sn=base_sn)
+        from .measurements import measurement_devices
+        with ExitStack() as stack:
+            shared = None
+            def devices(args,power_port,dyno_port):
+                nonlocal shared
+                if shared is None:
+                    shared = stack.enter_context(measurement_devices(args,power_port,dyno_port,expected_sn=base_sn))
+                return nullcontext(shared)
+            for name, module, csv in app.STAGES:
+                def run(*argv, _name=name, _module=module, **kwargs):
+                    self.check_stop()
+                    started = time.perf_counter()
+                    log_event('test.stage.start', stage=_name, output_directory=str(directory/_name),
+                              motor_id=self.config.target_id, target_torque=self.config.torque,
+                              power_port=power_port, dyno_port=dyno_port,
+                              parameters={key:value for key,value in vars(_module).items() if key.isupper() and
+                                          key not in ('COLUMNS','OUTPUT_COLUMNS')})
+                    self.emit('step', dict(name=_name, status='RUNNING'))
+                    self.enter_phase(_name)
+                    try:
+                        result = _module.main(*argv, power_port=power_port,dyno_port=dyno_port,devices=devices,**kwargs)
+                    except BaseException as exc:
+                        log_event('test.stage.failed', level='ERROR', error=exc, stage=_name,
+                                  output_directory=str(directory/_name),
+                                  elapsed_s=round(time.perf_counter()-started,4))
+                        self.emit('step',dict(name=_name,status='FAILED'))
+                        raise
+                    self.check_stop()
+                    complete = result.get('reason') == ('completed' if _name == 'kt' else 'stall_confirmed')
+                    log_event('test.stage.end', stage=_name, result=result, complete=complete,
+                              elapsed_s=round(time.perf_counter()-started, 4))
+                    self.emit('step', dict(name=_name, status='COLLECTED' if complete else 'INCOMPLETE'))
+                    return result
+                stages.append((name, SimpleNamespace(main=run), csv))
+            summary = app.execute(args,directory,stages=stages,motor_sn=base_sn,connections=stack)
         summary['sections'] = report.analyze(directory, summary)
         summary['status'] = report.overall(summary['sections'],summary['stages'])
         return summary

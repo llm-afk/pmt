@@ -217,6 +217,11 @@ class Motor:
             self._samples = deque()
             self._dropped_samples = 0
 
+    def stop_recording(self):
+        """Release the current stage's frame queue while keeping CAN feedback active."""
+        with self._samples_lock:
+            self._samples = None
+
     def drain_states(self):
         """一次取出尚未消费的全部真实反馈；重复调用不会重复返回。"""
         with self._samples_lock:

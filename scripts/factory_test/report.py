@@ -171,7 +171,7 @@ def analyze(directory, summary):
                         hi=limits.get('kt_linearity_max_pct'), precision=2)])
             elif name == 'tn':
                 required = ('dyno_torque_smooth_nm',
-                            'motor_speed_smooth_rad_s', 'motor_torque_smooth')
+                            'motor_speed_smooth_rad_s')
                 if any(key not in rows[0] for key in required):
                     raise ValueError('电机特性曲线缺少平滑后的速度或扭矩列')
                 samples = []
@@ -180,18 +180,17 @@ def analyze(directory, summary):
                         continue
                     speed = abs(float(row['motor_speed_smooth_rad_s']))
                     torque = abs(float(row['dyno_torque_smooth_nm']))
-                    motor_power = abs(float(row['motor_speed_smooth_rad_s']) *
-                                      float(row['motor_torque_smooth']))
-                    if not all(math.isfinite(value) for value in (speed, torque, motor_power)):
+                    shaft_power = speed * torque
+                    if not all(math.isfinite(value) for value in (speed, torque, shaft_power)):
                         continue
-                    samples.append((speed, torque, motor_power))
+                    samples.append((speed, torque, shaft_power))
                 if not samples:
                     raise ValueError('电机特性曲线没有实际配对数据')
                 peak_sample = max(samples, key=lambda sample: sample[2])
                 section.update(points=[(speed, torque) for speed, torque, _ in samples],
                     power_points=[(speed, power) for speed, _, power in samples],
                     xlabel='转速 rad/s', ylabel='测功机扭矩 / Nm',
-                    note='', detail='',
+                    note='', detail='轴功率幅值 = |电机反馈转速 × 测功机扭矩|',
                     metrics=[
                         dict(label='最大扭矩', shown=f'{max(s[1] for s in samples):.3f}', unit='Nm'),
                         dict(label='最大转速', shown=f'{max(s[0] for s in samples):.2f}', unit='rad/s'),
@@ -333,7 +332,7 @@ def _render_pdf(path, summary):
                 c.drawPath(p)
                 text(x,y-25,sec['xlabel'],7,muted)
                 line(154,top-28,165,top-28,blue,.7);text(168,top-30,'扭矩 / Nm',7,muted)
-                line(224,top-28,235,top-28,power_color,.7);text(238,top-30,'电机功率 / W',7,muted)
+                line(224,top-28,235,top-28,power_color,.7);text(238,top-30,'轴功率 / W',7,muted)
         else:
             text(x+25,y+40,'没有可用的完整测量数据',10,muted)
         text(336,top-46,'项目',8,muted);text(435,top-46,'实测',8,muted)

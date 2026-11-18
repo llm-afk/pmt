@@ -1,6 +1,5 @@
 """工装侧 SDO 维护协议，单接收者。只在自动工位实际运行时打开硬件。"""
 from contextlib import contextmanager
-import struct
 import time
 
 from motor_platform import Bench, Canable, CanFrame, MitCommand, SdoError
@@ -399,53 +398,41 @@ class Maintenance:
             adm = self.config.model[0] == '2'
             log_event('calibration.preflight',node_id=node,initial_error=f'0x{initial:04X}',
                       platform='ADM' if adm else 'GD',timeout_s=self.config.calibration_timeout)
-            if initial == 0:
-                self.progress('电机状态回报已校准，本次跳过重复校准')
-                log_event('calibration.already_calibrated',node_id=node,error_code=0,source='TPDO5')
-                return False
             self.progress('正在发送编码器校准指令，等待驱动器回执')
             try:
                 self.send_calibration_command(bench, node)
-                self.progress('校准指令已确认，正在等待固件完成')
+                self.progress('校准指令已确认，正在等待反馈扭矩绝对值连续 2 秒小于 0.2')
                 from .measurements import hardware_state
-                hardware_state('motor','校准指令已确认，等待固件完成',motion=True)
+                hardware_state('motor','校准指令已确认，等待反馈扭矩绝对值连续 2 秒小于 0.2',motion=True)
                 deadline = time.monotonic()+self.config.calibration_timeout
-                stable = 0
+                low_since = last_rx = None
                 while time.monotonic() < deadline:
                     self.check_stop()
                     state = self.fresh_feedback(motor, calibration=True)
-                    error = state.error_code
-                    if error & ~0x4000:
-                        raise CalibrationFault(node,error)
-                    complete = error == 0
-                    stable = stable+1 if complete else 0
+                    if state.error_code & ~0x4000:
+                        raise CalibrationFault(node,state.error_code)
+                    at = state.received_at
+                    if last_rx is None or at > last_rx:
+                        if last_rx is None or at-last_rx >= 1.0:
+                            low_since = None
+                        last_rx = at
+                        if abs(state.torque) < 0.2:
+                            if low_since is None:
+                                low_since = at
+                        else:
+                            low_since = None
+                    held = at-low_since if low_since is not None else 0.0
                     if current_log():
-                        current_log().sample('calibration.progress',error_code=error,complete=complete,stable_samples=stable)
-                    if stable >= 2:
-                        log_event('motor.disable.request',node_id=node,reason='after_calibration')
-                        motor.disable()
-                        log_event('calibration.confirmed',node_id=node,stable_samples=stable,disable_ack=True)
-                        hardware_state('motor','校准已完成，失能回执已确认',state='STANDBY',stopped=True)
-                        self.progress('编码器校准已完成，停机回执已确认')
-                        if adm:
-                            settings = {}
-                            for index, size, name in ((0x205B,4,'torque_limit_nm'),
-                                                      (0x2044,2,'heartbeat_consumer_enable')):
-                                if self.cancelled():
-                                    break
-                                try:
-                                    value = self.read(bench,node,index,size,timeout=.15,diagnostic_probe=True)
-                                except Exception as exc:
-                                    log_event('motor.settings.unavailable',level='WARNING',node_id=node,
-                                              index=f'0x{index:04X}',error=exc,settings=settings)
-                                    break
-                                settings[name] = dict(index=f'0x{index:04X}',raw_hex=value.to_bytes(size,'little').hex(),
-                                    value=struct.unpack('<f',value.to_bytes(4,'little'))[0]
-                                          if name=='torque_limit_nm' else value)
-                            log_event('motor.settings.snapshot',node_id=node,phase='after_calibration',settings=settings)
+                        current_log().sample('calibration.progress',error_code=state.error_code,
+                                             feedback_torque=state.torque,low_torque_s=held)
+                    if held >= 2.0:
+                        log_event('calibration.confirmed','反馈扭矩满足工序结束条件',node_id=node,
+                                  feedback_torque=state.torque,low_torque_s=held,error_code=state.error_code)
+                        hardware_state('motor','反馈扭矩连续 2 秒低于阈值，校准工序结束',state='STANDBY')
+                        self.progress('电机反馈扭矩绝对值连续 2 秒小于 0.2，进入性能测试')
                         return True
                     self.wait(.2)
-                raise TimeoutError('校准完成等待超时')
+                raise TimeoutError('校准等待超时：未收到持续 2 秒低于 0.2 的电机反馈扭矩')
             except BaseException as exc:
                 # ADM 校准态会重新置 RunSignal=1；SDO disable ACK 不足以证明校准被取消。
                 try:

@@ -76,7 +76,9 @@ class CurveTests(unittest.TestCase):
         self.assertFalse(p.update(state(3.10, -1)))
         self.assertFalse(p.update(state(4, 0)))
         self.assertFalse(p.update(state(4.02, 0)))
-        self.assertTrue(p.update(state(4.101, 0)))
+        for i in range(3,50):
+            self.assertFalse(p.update(state(4+i*.01, 0)))
+        self.assertTrue(p.update(state(4.5, 0)))
 
     def test_feedback_gap_does_not_restart_settle_but_cached_frames_are_not_new(self):
         progress=app.Progress(0)
@@ -174,7 +176,7 @@ class CurveTests(unittest.TestCase):
         self.assertEqual(reason, 'stall_confirmed')
         self.assertEqual(summary['termination'],'normal_end')
         self.assertEqual(summary['end_condition']['name'],'sustained_low_speed')
-        motor.disable.assert_called_once()
+        motor.finish_at_zero.assert_called_once()
         self.assertEqual(power.set_current.call_args_list[0].args, (app.load_target(1),))
         power.disable.assert_called_once()
 
@@ -208,10 +210,10 @@ class CurveTests(unittest.TestCase):
         self.assertGreater(summary['end_condition']['confirmed_feedback_at'],130.)
         self.assertGreater(summary['end_condition']['last_confirmed_load_current_a'],5.)
         self.assertEqual(summary['end_condition']['speed_threshold_rad_s'],.5)
-        self.assertEqual(summary['end_condition']['hold_s'],.1)
+        self.assertEqual(summary['end_condition']['hold_s'],.5)
         self.assertGreater(summary['rows'],100)
         self.assertEqual(motor.set_mit.call_args.args[0].torque,0.)
-        motor.disable.assert_called_once()
+        motor.finish_at_zero.assert_called_once()
         power.disable.assert_called_once()
 
     def test_motor_error_preserved_when_disable_fails(self):
