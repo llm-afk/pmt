@@ -521,11 +521,14 @@ class PipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             runner,svc=self.runner(tmp)
             probe=Mock(return_value=True)
-            network=ProductionNetwork(lambda:'https://mes.example.test',Event(),Mock(),probe=probe)
+            clock = [100.]
+            network=ProductionNetwork(lambda:'https://mes.example.test',Event(),Mock(),probe=probe, clock=lambda:clock[0])
             runner.online=network.begin()
             def allocate(payload):
                 probe.return_value=False
-                network.refresh()
+                for elapsed in (0,6,6):
+                    clock[0] += elapsed
+                    network.refresh()
                 probe.return_value=True
                 return SN
             svc.allocate=allocate
@@ -546,13 +549,16 @@ class PipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             runner, svc = self.runner(tmp)
             probe = Mock(return_value=True)
-            network = ProductionNetwork(lambda:'https://mes.example.test',Event(),Mock(),probe=probe)
+            clock = [100.]
+            network = ProductionNetwork(lambda:'https://mes.example.test',Event(),Mock(),probe=probe, clock=lambda:clock[0])
             runner.online = network.begin()
             measure = svc.measure
             def interrupted_measure(*args):
                 result = measure(*args)
                 probe.return_value = False
-                network.refresh()
+                for elapsed in (0,6,6):
+                    clock[0] += elapsed
+                    network.refresh()
                 return result
             svc.measure = interrupted_measure
             svc.allocate = Mock()

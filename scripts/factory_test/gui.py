@@ -20,7 +20,7 @@ from .station_config import (StationConfig, MATERIALS, JOINT_NODE_IDS,
 from .station import StationRunner, PresenceLatch, STEPS, completed_on_station
 from .measurements.console import WindowConsole
 from .maintenance import Maintenance, MotorAbsent, MultipleMotors, MotorIdentityUnreadable
-from .device_status import DeviceHealth, AdapterMonitor, adapter_status
+from .device_status import DeviceHealth, AdapterMonitor, ConnectionCheck, adapter_status
 from .diagnostics import DiagnosticLogs, log_scope, log_event, error_details, LOCAL_TIME, unconfirmed_cleanup_notes
 from .service_credentials import CredentialStore, CredentialStoreError, FIELDS as SECRET_FIELDS
 from tkinter.scrolledtext import ScrolledText
@@ -391,13 +391,18 @@ class FactoryWindow:
         self.selection_changed(name)
 
     def show_adapter_status(self):
-        if self.adapter_devices is not None:
+        if (getattr(self,'adapter_inventory',None) or {}).get('checking'):
+            self.device_state('can', 'CHECKING', '正在复核 CANable USB 连接')
+        elif self.adapter_devices is not None:
             info = (dict(state='ERROR', detail='USB 枚举失败：'+str(self.adapter_error)) if self.adapter_error
                     else adapter_status(self.adapter_devices, self.config.adapter_sn))
             self.device_state('can', info['state'], info['detail'])
 
     def update_adapters(self, value):
         self.adapter_inventory = value
+        if value.get('checking'):
+            self.show_adapter_status()
+            return
         self.adapter_devices = value['devices']
         self.adapter_error = value.get('error')
         serials = sorted({item['serial_number'] for item in self.adapter_devices})
@@ -622,7 +627,10 @@ class FactoryWindow:
             return
         if not self.config.simulation and not self.production_network.ready():
             self.stop.config(state='disabled')
-            self.set_prompt('请连接网络并确认 MES 可达','恢复网络后可开始正式产测。')
+            if self.production_network.state() == 'OFFLINE':
+                self.set_prompt('请连接网络并确认 MES 可达','恢复网络后可开始正式产测。')
+            else:
+                self.set_prompt('正在确认 MES 网络，请稍候','确认连通后可开始正式产测。')
             return
         WindowConsole.cancelled.clear()
         with self.lock:
@@ -632,7 +640,7 @@ class FactoryWindow:
                                        device_health=self.health_states,identity=self.requested_identity)
         self.stop.config(state='disabled')
         self.banner.set('请保持连接，正在核对本件电机')
-        self.hint.set('测试将自动完成，请等待结果。')
+        self.hint.set('正在复核电机身份和 MES 网络，确认后自动开始。')
 
     def device_state(self, name, state, detail):
         if self.device_display.get(name)==(state,detail):
@@ -1066,6 +1074,7 @@ class FactoryWindow:
         completed_identity, completed_here = None, False
         recent_node = None
         last_motor_response = None
+        motor_loss = ConnectionCheck(MOTOR_FEEDBACK_TIMEOUT_S)
         firmware_check_at = 0
         firmware_revision = None
         firmware_issue = firmware_file = firmware_sha256 = ''
@@ -1085,6 +1094,7 @@ class FactoryWindow:
                     start_before_probe = self.start_requested
                     WindowConsole.cancelled.clear()
             if paused:
+                motor_loss = ConnectionCheck(MOTOR_FEEDBACK_TIMEOUT_S)
                 last_motor_response = None
                 try:
                     if not self.configuring:
@@ -1153,10 +1163,6 @@ class FactoryWindow:
                             motor_state, detected_id = 'identity_error', exc.node_id
                         else:
                             motor_state = 'error'
-                        if detail != last_message:
-                            # The idle poll already owns the complete diagnostic evidence.
-                            self.events.put(('logged_line','电机探测：'+detail))
-                            last_message = detail
                 if self.station_cancelled():
                     raise InterruptedError('产测已暂停，正在交接连接')
                 generation = dict(config_revision=revision, mode_generation=mode_generation)
@@ -1171,14 +1177,19 @@ class FactoryWindow:
                 if last_motor_response and last_motor_response[0] != response_key:
                     last_motor_response = None
                 observed_at = time.monotonic()
+                failed = not config.simulation and motor_state in ('absent','error','identity_error')
+                confirming = motor_loss.confirming(response_key, failed, observed_at,
+                        last_success=last_motor_response[1] if last_motor_response else None)
                 if motor_state == 'present' and not config.simulation:
                     last_motor_response = (response_key, observed_at, detected_id)
-                elif (motor_state == 'absent' and last_motor_response
-                        and 0 <= observed_at-last_motor_response[1] < MOTOR_FEEDBACK_TIMEOUT_S):
-                    motor_state = 'confirming'
-                    detected_id = last_motor_response[2]
-                    detail = f'正在重新确认电机 ID {detected_id} 通信'
-                elif motor_state != 'absent':
+                elif failed:
+                    if confirming:
+                        motor_state = 'confirming'
+                        detail = '正在重新确认电机通信'
+                    elif detail != last_message:
+                        self.events.put(('logged_line','电机探测：'+detail))
+                        last_message = detail
+                else:
                     last_motor_response = None
                 present = motor_state == 'present'
                 if present:
@@ -1221,10 +1232,15 @@ class FactoryWindow:
                 with self.lock:
                     health_snapshot = dict(self.health_states)
                 states = {name:info['state'] for name,info in health_snapshot.items()}
+                if (getattr(self,'adapter_inventory',None) or {}).get('checking'):
+                    states['can'] = 'CHECKING'
                 self.diagnostics.record_health(health_snapshot)
                 needed = [] if config.simulation else [key for key in ('can','dyno','power','printer') if states.get(key)!='READY']
-                if not config.simulation and not (getattr(self,'production_network',None) and self.production_network.ready()):
-                    needed.append('network')
+                if not config.simulation:
+                    network = getattr(self,'production_network',None)
+                    network_state = network.state() if network else 'CHECKING'
+                    if network_state != 'READY':
+                        needed.append('network' if network_state=='OFFLINE' else 'network_check')
                 support_ready = not needed
                 sn_configured=self.sn_configuration_ready(config)
                 if firmware_issue and not config.simulation: needed.append('firmware')
@@ -1283,6 +1299,7 @@ class FactoryWindow:
                             or mode_generation != self.mode_generation):
                         continue
                     self.busy = True
+                    motor_loss = ConnectionCheck(MOTOR_FEEDBACK_TIMEOUT_S)
                     last_motor_response = None
                 hardware_ports = {name:port for name in ('power','dyno')
                     if isinstance(port:=getattr(self.device_health,name+'_port',None),str) and port}
@@ -1415,6 +1432,8 @@ class FactoryWindow:
         probe=value.get('motor_probe')
         if probe=='station_error':
             return '工位检查异常，请联系工程人员','开测已暂停，具体错误见下方日志。'
+        if value.get('device_states',{}).get('can') == 'CHECKING':
+            return '正在确认 CAN 适配器，请稍候','正在重新枚举 USB 设备。'
         if probe=='unavailable' or 'can' in blockers:
             return '请检查 CAN 适配器','确认 USB 已接好。接有多只适配器时，请在工位设备中选择本工位的 CANable。'
         if probe=='multiple':
@@ -1435,10 +1454,16 @@ class FactoryWindow:
         if missing:
             if any(k in blockers for k in ('firmware','profile','target_id','sn_key','mes_url')):
                 title='请联系工程人员完善工位配置'
+            elif 'network_check' in blockers:
+                title='正在确认 MES 网络，请稍候'
             elif 'network' in blockers:
                 title='请连接网络并确认 MES 可达'
+            elif 'dyno' in blockers and value.get('device_states',{}).get('dyno') == 'CHECKING':
+                title='正在确认测功机连接，请稍候'
             elif 'dyno' in blockers:
                 title='请检查测功机连接'
+            elif 'power' in blockers and value.get('device_states',{}).get('power') == 'CHECKING':
+                title='正在确认加载电源连接，请稍候'
             elif 'power' in blockers:
                 title='请检查工装电源连接'
             elif 'printer' in blockers:
@@ -1515,7 +1540,7 @@ class FactoryWindow:
             if kind=='driver_setup':
                 self.driver_event(value)
             elif kind=='mes_reachability':
-                self.write_log('[产测网络] '+('MES 网络可达' if value else 'MES 网络不可达，请检查工位网络或服务地址。'))
+                self.write_log('[产测网络] '+('MES 网络可达' if value else 'MES 网络持续不可达，请检查工位网络或服务地址。'))
                 if not value and not self.busy and not self.config.simulation:
                     self.ready_to_start=self.start_requested=self.resume_requested=False
                     self.stop.config(state='disabled')
@@ -1562,7 +1587,7 @@ class FactoryWindow:
                 self.update_adapters(value)
             elif kind=='device_health':
                 name, info = value['name'], value['info']
-                if name in ('dyno','power'):
+                if name in ('dyno','power') and info['state'] != 'CHECKING':
                     key = name + '_port'
                     result = (tuple(info.get('matched_ports', ())), info.get('active_port'))
                     if self.serial_results.get(key) != result:

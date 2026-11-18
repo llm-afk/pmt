@@ -20,27 +20,78 @@ def snapshot(state='Up'):
 
 
 class NetworkTests(unittest.TestCase):
-    def test_outage_is_latched_for_one_run_and_ignored_after_handoff(self):
-        from scripts.factory_test.network_status import NetworkLost, ProductionNetwork
-        probe = Mock(return_value=False)
-        stop = Mock(); stop.wait.return_value = False
-        network = ProductionNetwork(lambda:'https://mes.example.test',stop,Mock(),probe=probe)
-        with self.assertRaises(NetworkLost): network.begin()
-        probe.return_value=True
+    def network_fixture(self, *, online=True):
+        from scripts.factory_test.network_status import ProductionNetwork
+        now = [100.]
+        def wait(seconds):
+            now[0] += seconds
+            self.assertLess(now[0], 300)
+        stop = Mock()
+        stop.is_set.return_value = False
+        stop.wait.side_effect = wait
+        probe, notify = Mock(return_value=online), Mock()
+        network = ProductionNetwork(lambda:'https://mes.example.test', stop, notify, probe=probe, clock=lambda:now[0])
+        return network, now, probe, notify
+
+    def test_short_outages_and_delayed_monitor_do_not_discard_work_or_toggle_messages(self):
+        network,now,probe,notify = self.network_fixture()
         run = network.begin()
+        for duration in (6, 4, 11):
+            probe.return_value = False
+            network.refresh()
+            now[0] += duration
+            network.refresh()
+            run.check()
+            probe.return_value = True
+            network.refresh()
+        now[0] += 15
+        self.assertEqual(network.state(),'CHECKING')
+        run.check()
+        persist=Mock()
+        probe.side_effect = [False,False,True]
+        run.confirm_pass(persist)
+        persist.assert_called_once()
+        notify.assert_called_once_with(True)
+
+    def test_start_must_wait_for_real_success_and_cold_start_failure_is_debounced(self):
+        from scripts.factory_test.network_status import NetworkLost
+        network,now,probe,notify = self.network_fixture(online=False)
+        network.refresh()
+        self.assertEqual(network.state(),'CHECKING')
+        notify.assert_not_called()
+        with self.assertRaises(NetworkLost):
+            network.begin()
+        self.assertGreaterEqual(now[0],112)
+        notify.assert_called_once_with(False)
+        probe.return_value=True
+        network.begin()
+        probe.side_effect=[False,False,True]
+        before = now[0]
+        network.begin()
+        self.assertEqual(now[0]-before,4)
+
+    def test_confirmed_outage_latches_only_before_pass_even_if_connection_recovers(self):
+        from scripts.factory_test.network_status import NetworkLost
+        network,now,probe,notify = self.network_fixture()
+        run = network.begin()
+        passed = network.begin()
+        passed.confirm_pass(Mock())
         probe.return_value=False
         network.refresh()
+        now[0]+=12
+        network.refresh()
+        run.check()  # Only two failures, even though twelve seconds elapsed.
+        persist=Mock()
+        with self.assertRaises(NetworkLost):
+            run.confirm_pass(persist)
+        self.assertEqual(network.state(),'OFFLINE')
+        persist.assert_not_called()
         probe.return_value=True
         network.refresh()
-        persist=Mock()
-        with self.assertRaises(NetworkLost): run.confirm_pass(persist)
-        persist.assert_not_called()
-        fresh=network.begin()
-        fresh.confirm_pass(persist)
-        probe.return_value=False
-        network.refresh()
-        fresh.check()
-        persist.assert_called_once()
+        with self.assertRaises(NetworkLost): run.check()
+        passed.check()
+        network.begin().check()
+        self.assertEqual([c.args[0] for c in notify.call_args_list],[True,False,True])
 
     def test_local_snapshot_parses_unicode_and_keeps_dns_without_requesting_services(self):
         data=snapshot()

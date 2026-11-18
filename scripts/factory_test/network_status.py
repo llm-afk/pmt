@@ -33,48 +33,96 @@ def mes_reachable(url):
         return False
 
 
+MES_POLL_S = 2
+MES_LOSS_GRACE_S = 12
+MES_MIN_FAILURES = 3
+
+
 class ProductionNetwork:
-    def __init__(self, endpoint, shutdown, notify, probe=mes_reachable):
+    def __init__(self, endpoint, shutdown, notify, probe=mes_reachable, *, clock=time.monotonic):
         self.endpoint, self.shutdown, self.notify, self.probe = endpoint, shutdown, notify, probe
+        self.clock = clock
         self.lock = threading.RLock()
         self.poll_lock = threading.Lock()
-        self.url, self.online, self.checked, self.epoch = '', False, 0., 0
+        self.url, self.online, self.checked, self.epoch = '', None, None, 0
+        self.failed_since, self.failures = None, 0
+        self.sample_count, self.last_probe_ok = 0, False
         self.thread = None
 
     def refresh(self):
+        # A start click and the watcher can share a sample taken while both were waiting.
+        with self.lock:
+            previous_count = self.sample_count
         with self.poll_lock:
             url = self.endpoint()
-            online = bool(url and self.probe(url))
-            if not online and url and not self.shutdown.wait(.25):
-                online = self.probe(url)
             with self.lock:
-                now = time.monotonic()
-                if url != self.endpoint():
-                    online = False
-                changed = (url, online) != (self.url, self.online) or not self.checked
-                if changed or now-self.checked > 10:
+                if previous_count != self.sample_count and self.url == url:
+                    return self.last_probe_ok
+            ok = bool(url and self.probe(url))
+            with self.lock:
+                if self.endpoint() != url:
+                    return False
+                if self.url != url:
+                    self.url, self.online = url, None
+                    self.failed_since, self.failures = None, 0
                     self.epoch += 1
-                self.url, self.online, self.checked = url, online, now
+                previous = self.online
+                now = self.clock()
+                self.checked, self.last_probe_ok = now, ok
+                self.sample_count += 1
+                if ok:
+                    self.failed_since, self.failures = None, 0
+                    self.online = True
+                else:
+                    if self.failed_since is None:
+                        self.failed_since = now
+                    self.failures += 1
+                    if self.failures >= MES_MIN_FAILURES and now-self.failed_since >= MES_LOSS_GRACE_S:
+                        self.online = False
+                changed = self.online != previous
+                if changed and self.online is False:
+                    self.epoch += 1
+                online = self.online
             if changed:
                 self.notify(online)
+            return ok
+
+    def state(self):
+        with self.lock:
+            if self.url != self.endpoint() or self.online is None or self.clock()-self.checked > 10:
+                return 'CHECKING'
+            return 'READY' if self.online else 'OFFLINE'
 
     def ready(self):
-        with self.lock:
-            return self.online and self.url == self.endpoint() and time.monotonic()-self.checked <= 10
+        return self.state() == 'READY'
+
+    def verify(self):
+        # Entry and PASS need an actual successful sample. Wait out an unsettled
+        # failure on the station worker, never on the UI or acquisition thread.
+        while not self.shutdown.is_set():
+            if self.refresh():
+                return True
+            if self.state() == 'OFFLINE':
+                return False
+            self.shutdown.wait(MES_POLL_S)
+        raise InterruptedError('工位已关闭，停止核对 MES 网络。')
 
     def start(self):
         def watch():
             while not self.shutdown.is_set():
                 self.refresh()
-                self.shutdown.wait(2)
+                self.shutdown.wait(MES_POLL_S)
         self.thread = threading.Thread(target=watch, name='production-network', daemon=True)
         self.thread.start()
 
     def begin(self, *, resume=False):
-        self.refresh()
+        if not resume and not self.verify():
+            raise NetworkLost('MES 网络持续不可达，未开始测试。')
+        if resume:
+            self.refresh()
         with self.lock:
             if not resume and not self.ready():
-                raise NetworkLost('MES 网络未就绪，未开始测试。')
+                raise NetworkLost('MES 网络状态已变化，未开始测试。')
             return OnlineWorkpiece(self, self.epoch)
 
 
@@ -87,12 +135,14 @@ class OnlineWorkpiece:
         with self.network.lock:
             if self.committed:
                 return
-            if self.lost or self.network.epoch != self.epoch or not self.network.ready():
+            if (self.lost or self.network.epoch != self.epoch or self.network.online is False
+                    or self.network.url != self.network.endpoint()):
                 self.lost = True
                 raise NetworkLost('测试通过前 MES 网络中断，本次测试数据报废。')
 
     def confirm_pass(self, persist):
-        self.network.refresh()
+        if not self.network.verify():
+            self.lost = True
         with self.network.lock:
             self.check()
             persist()

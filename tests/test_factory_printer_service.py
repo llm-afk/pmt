@@ -222,6 +222,20 @@ class PrinterServiceTests(unittest.TestCase):
             hold.set()
             monitor.thread.join(2)
 
+    def test_only_new_queries_confirm_printer_disconnect(self):
+        clock = Mock(return_value=0)
+        replies = [dict(state='UNKNOWN',detail='timeout'),dict(state='READY',detail='USB001'),
+                   dict(state='OFFLINE',detail='offline'),dict(state='OFFLINE',detail='offline'),
+                   dict(state='OFFLINE',detail='缺纸',hardware_fault=True)]
+        monitor = PrinterMonitor(lambda config:(replies.pop(0),0), clock=clock)
+        for at, expected in ((0,'CHECKING'),(1,'CHECKING'),(3,'READY'),(6,'CHECKING'),(7,'CHECKING'),
+                             (9,'OFFLINE'),(12,'OFFLINE')):
+            clock.return_value = at
+            monitor.poll(self.config,1)
+            monitor.thread.join(2)
+            self.assertEqual(monitor.poll(self.config,1)['state'],expected)
+        self.assertEqual(replies,[])
+
     def test_timeout_query_failure_and_confirmed_offline_are_distinct(self):
         responses=(TimeoutError(),dict(data=dict(online=False,errorCode='WINDOWS_PRINTER_QUERY_FAILED')),
                    dict(data=dict(online=False,reason='缺纸')),dict(data=None))

@@ -20,6 +20,24 @@ def adapter_status(devices, selected=''):
     return status('OFFLINE', '未检测到 CANable' if not devices else '发现多只 CANable，请配置指定 SN')
 
 
+class ConnectionCheck:
+    """Require repeated failed observations spanning the grace period on the same route."""
+    def __init__(self, grace=3.0):
+        self.grace = grace
+        self.first_failure = self.route = None
+
+    def confirming(self, route, failed, now, *, last_success=None):
+        if not failed:
+            self.first_failure = None
+            return False
+        if self.first_failure is None or self.route != route:
+            self.route = route
+            self.first_failure = (last_success if last_success is not None and
+                                  0 <= now - last_success < self.grace else now)
+            return True
+        return now - self.first_failure < self.grace
+
+
 class AdapterMonitor:
     """Independent, read-only USB enumeration; no serial ports or CAN traffic."""
     def __init__(self, emit, stop, *, detect=None, interval=.5):
@@ -32,6 +50,8 @@ class AdapterMonitor:
         from motor_platform import Canable
         detect = self.detect or Canable.detect
         previous = None
+        accepted = set()
+        loss = ConnectionCheck()
         while not self.stop.is_set():
             started = time.monotonic()
             try:
@@ -40,8 +60,14 @@ class AdapterMonitor:
             except Exception as exc:
                 devices, error = [], exc
                 signature = (type(exc).__name__, str(exc))
+            paths = {(item['serial_number'], item['path']) for item in devices}
+            lost = not paths or bool(accepted - paths)
+            checking = loss.confirming(None, lost, time.monotonic())
+            if not checking:
+                accepted = paths
+            signature = ('checking',) if checking else ('inventory', signature)
             if signature != previous:
-                self.emit(dict(devices=devices, error=error))
+                self.emit(dict(devices=devices, error=error, checking=checking))
                 previous = signature
             self.stop.wait(max(0, self.interval-(time.monotonic()-started)))
 
@@ -86,6 +112,8 @@ def check_printer(config):
         state = 'OFFLINE' if code == 'PRINTER_OFFLINE' else (
             'UNKNOWN' if code in ('PRINTER_STATUS_TIMEOUT','PRINTER_QUEUE_QUERY_FAILED') else 'ERROR')
         info = status(state, str(exc))
+        if data.get('detectedErrorState') in (4, 6, 7, 8, 11):
+            info['hardware_fault'] = True
     names = data.get('allPrinters')
     if isinstance(names, list):
         info['printer_names'] = [name for name in names if isinstance(name,str)]
@@ -102,6 +130,7 @@ class PrinterMonitor:
     """At most one read-only HTTP check; results belong to one configuration and page generation."""
     def __init__(self, check=check_printer, clock=time.monotonic):
         self.check, self.clock = check, clock
+        self.loss = ConnectionCheck()
         self.lock = threading.Lock()
         self.thread = self.key = self.result = None
         self.next_check = self.sample_at = 0.0
@@ -113,6 +142,7 @@ class PrinterMonitor:
             now = self.clock()
             if self.key != key:
                 self.key, self.result, self.next_check = key, None, now
+                self.loss = ConnectionCheck()
             if now >= self.next_check and not (self.thread and self.thread.is_alive()):
                 self.thread = threading.Thread(target=self._run, args=(config,key,target),
                                                name='printer-service-status', daemon=True)
@@ -141,6 +171,9 @@ class PrinterMonitor:
         with self.lock:
             if self.key == key:
                 now = self.clock()
+                failed = info['state'] != 'READY' and not info.get('hardware_fault')
+                if self.loss.confirming(key, failed, now):
+                    info = dict(info, **status('CHECKING', '正在复核打印队列连接'))
                 self.result, self.sample_at, self.next_check = info, now-age_s, now+3
 
 
@@ -157,6 +190,7 @@ class DeviceHealth:
     def __init__(self):
         self.power_port = self.dyno_port = None
         self.printer = PrinterMonitor()
+        self.serial_checks = {name: ConnectionCheck() for name in ('dyno', 'power')}
         self._power = self._power_route = self._power_reading = None
         self.release_error = ''
         self._power_matches = ()
@@ -269,6 +303,8 @@ class DeviceHealth:
             devices, error = adapter_inventory['devices'], adapter_inventory.get('error')
         info = status('ERROR', str(error)) if error is not None else adapter_status(devices, config.adapter_sn)
         serials = tuple(item['serial_number'] for item in devices)
+        if adapter_inventory is not None and adapter_inventory.get('checking'):
+            info = status('CHECKING', '正在复核 CANable USB 连接')
         record_probe('can', info, 'CAN_'+info['state'], started, dict(devices=devices,selected=config.adapter_sn),
                      route=(config.adapter_sn,serials),error=error)
         report('can', info)
@@ -340,6 +376,10 @@ class DeviceHealth:
             info, code, error = status('ERROR',str(exc)), 'DYNO_READ_FAILED', exc
         record_probe('dyno',info,code,started,evidence,route=(tuple(candidates),self.dyno_port),error=error)
         info.update(matched_ports=dyno_matches, active_port=self.dyno_port)
+        route_key = (generation, config.dyno_port, config.power_port)
+        if generation is not None and self.serial_checks['dyno'].confirming(
+                route_key, info['state'] != 'READY' and code != 'DYNO_MULTIPLE', time.monotonic()):
+            info.update(status('CHECKING', '正在复核测功机串口反馈'))
         report('dyno', info)
 
         started = time.monotonic()
@@ -352,7 +392,10 @@ class DeviceHealth:
                         candidates=candidates, observations=observed, query_timeout_s=.2)
         error = None
         if not self.dyno_port and config.power_port == 'auto':
-            self.release('dyno_not_identified')
+            # During one missed dynamometer scan keep the identified idle handle,
+            # but never send a supply query until the serial routes are confirmed.
+            if result['dyno']['state'] != 'CHECKING':
+                self.release('dyno_not_identified')
             info, code = status('WAITING', '等待测功机串口识别'), 'POWER_WAIT_DYNO'
             evidence.update(candidates=[],query_attempted=False)
         else:
@@ -397,6 +440,9 @@ class DeviceHealth:
                 info, code, error = status('ERROR',str(exc)), getattr(exc,'diagnostic_code','POWER_PROBE_FAILED'), exc
         record_probe('power',info,code,started,evidence,route=(tuple(evidence['candidates']),self.power_port),error=error)
         info.update(matched_ports=list(power_matches), active_port=self.power_port if info['state']=='READY' else None)
+        uncertain = info['state'] in ('OFFLINE', 'ERROR') and code not in ('POWER_MULTIPLE', 'POWER_STATE_UNSTABLE') and not self.release_error
+        if generation is not None and self.serial_checks['power'].confirming(route_key, uncertain, time.monotonic()):
+            info.update(status('CHECKING', '正在复核加载电源通信'))
         report('power', info)
         report('printer', printer if printer is not None else check_printer(config)[0])
         return result

@@ -276,8 +276,7 @@ class Services:
             except IntegrationError as exc:
                 if not network or exc.diagnostic_code != 'MES_RETRIES_EXHAUSTED':
                     raise
-                network.refresh()
-                if network.ready():
+                if network.verify():
                     raise
 
     def print_sn(self, sn):
@@ -470,6 +469,8 @@ class StationRunner:
             evidence = measurement_evidence(record.get('summary'))
             self.online.committed = evidence['summary_status'] == 'PASS' and all(
                 state == 'DONE' for state in evidence['step_states'].values())
+        if self.online and not self.online.committed:
+            self.online = self.online.network.begin()
         original_fields=record['config']
         target_id = self.config.require_target_id()
         if original_fields.get('target_id', target_id) != target_id:

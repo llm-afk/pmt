@@ -201,16 +201,32 @@ class HealthTests(unittest.TestCase):
         stop, changes = threading.Event(), []
         first = dict(serial_number='first',path='first-path')
         second = dict(serial_number='second',path='second-path')
-        detect = Mock(side_effect=[[first],[first],[first,second],[],OSError('PnP unavailable')])
-        def emit(value):
-            changes.append(value)
-            if len(changes) == 4: stop.set()
+        samples = [[first],[first,second],[],[first,second],[],OSError('PnP unavailable'),[]]
+        clock = [0]
+        def detect():
+            clock[0] += 2
+            item = samples.pop(0)
+            if not samples:
+                stop.set()
+            if isinstance(item, Exception):
+                raise item
+            return item
         with patch('motor_platform.Canable.open',side_effect=AssertionError('CAN open')), \
-             patch('serial.Serial',side_effect=AssertionError('Serial open')):
-            AdapterMonitor(emit,stop,detect=detect,interval=0).run()
-        self.assertEqual(detect.call_count,5)
-        self.assertEqual([value['devices'] for value in changes],[[first],[first,second],[],[]])
-        self.assertIsInstance(changes[-1]['error'],OSError)
+             patch('serial.Serial',side_effect=AssertionError('Serial open')), \
+             patch('scripts.factory_test.device_status.time.monotonic',side_effect=lambda:clock[0]):
+            AdapterMonitor(changes.append,stop,detect=detect,interval=0).run()
+        self.assertEqual([v['checking'] for v in changes],[False,False,True,False,True,False])
+        self.assertEqual([v['devices'] for v in changes if not v['checking']],[[first],[first,second],[first,second],[]])
+
+    def test_serial_connection_loss_requires_repeated_samples_on_the_same_route(self):
+        from scripts.factory_test.device_status import ConnectionCheck
+        loss = ConnectionCheck()
+        self.assertTrue(loss.confirming('COM18', True, 0))
+        self.assertFalse(loss.confirming('COM18', False, 2))
+        self.assertTrue(loss.confirming('COM18', True, 4))
+        self.assertTrue(loss.confirming('COM18', True, 6))
+        self.assertTrue(loss.confirming('COM19', True, 8))
+        self.assertFalse(loss.confirming('COM19', True, 11))
 
     def test_device_results_are_emitted_before_the_last_service_finishes(self):
         emitted=[]

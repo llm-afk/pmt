@@ -542,20 +542,21 @@ class IdleMotorConfirmationTests(unittest.TestCase):
             lambda host:setattr(host,'adapter_devices',[dict(serial_number='chosen',path='different-usb-path')]),
         )
         _, first = self.scan([(100,False,None)])
-        self.assertEqual(first[0]['motor_probe'], 'absent')
+        self.assertEqual(first[0]['motor_probe'], 'confirming')
         for change in changes:
             with self.subTest(change=change):
                 _, candidates = self.scan([(100,True,None),(100.6,False,change)])
-                self.assertEqual(candidates[-1]['motor_probe'], 'absent')
+                self.assertEqual(candidates[-1]['motor_probe'], 'confirming')
         _, paused = self.scan([(100,True,None),(100.3,None,lambda host:setattr(host,'page','control')),
                               (100.6,False,lambda host:setattr(host,'page','production'))])
-        self.assertEqual(paused[-1]['motor_probe'], 'absent')
+        self.assertEqual(paused[-1]['motor_probe'], 'confirming')
 
-    def test_valid_response_restores_presence_but_real_errors_bypass_the_grace(self):
+    def test_transient_read_errors_require_confirmation_and_fresh_feedback_recovers(self):
         _, recovered = self.scan([(100,True,None),(100.6,False,None),(100.8,True,None)])
         self.assertEqual([item['motor_probe'] for item in recovered], ['present','confirming','present'])
-        _, failed = self.scan([(100,True,None),(100.3,OSError('USB failed'),None),(100.6,False,None)])
-        self.assertEqual([item['motor_probe'] for item in failed], ['present','error','absent'])
+        _, failed = self.scan([(100,True,None),(100.3,OSError('USB failed'),None),(100.6,False,None),
+                              (101.4,OSError('USB failed'),None)])
+        self.assertEqual([item['motor_probe'] for item in failed], ['present','confirming','error'])
 
     def test_confirming_candidate_disables_a_previously_enabled_start_button(self):
         host, candidates = self.scan([(100,True,None),(100.6,False,None)])
