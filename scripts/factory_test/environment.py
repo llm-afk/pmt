@@ -48,7 +48,7 @@ def environment_summary(config, saved, *, config_path, storage_root, dependency_
              '配置文件：' + str(config_path),
              '数据目录：' + str(root),
              '驱动器固件目录：'+str(firmware_root(config)),
-             '日志：每次电机连接单独记录，保留 30 天；报告不自动删除。',
+             '日志：每次启动一份，最多保留 30 天。旧日志和已上报报告的曲线、图片按容量清理，保留 SN 和上传回执。',
              '', '以下为已保存配置；未联网验证服务可达性或密钥有效性。',
              'SN 取号：' + config.mes_url.rstrip('/') + config.mes_sn_path,
              '标签打印：' + config.printer_url.rstrip('/') + config.printer_status_path,

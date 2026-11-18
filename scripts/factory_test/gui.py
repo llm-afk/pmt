@@ -927,6 +927,12 @@ class FactoryWindow:
                         elapsed_s=round(time.perf_counter()-started,4))
                     self.events.put(('dependency',dict(module=module,package=package,ok=True)))
             self.events.put(('ready', missing))
+            if not self.config.simulation and not self.shutdown.is_set():
+                try:
+                    from .retention import trim_history
+                    trim_history(self.diagnostics, self.shutdown.is_set)
+                except Exception as exc:
+                    self.diagnostics.station.event('retention.failed','容量检查未完成',level='WARNING',error=exc)
         self.bootstrap_thread = threading.Thread(target=worker,name='dependency-check',daemon=True)
         self.bootstrap_thread.start()
 
