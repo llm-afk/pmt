@@ -219,13 +219,27 @@ try {
             $script:delegated=$true
             $exitCode=$process.ExitCode
         } else {
+            $failures=[Collections.Generic.List[string]]::new()
             foreach ($task in $before.plan) {
                 Add-Stage 'install.start' ('正在准备 '+$task.name+'。') $task
-                if ($task.kind -eq 'printer') { Install-Printer $task }
-                elseif ($task.kind -eq 'usb') {
-                    $inf=Join-Path $driverRoot $task.inf
-                    Invoke-Native (Join-Path $env:SystemRoot 'System32/pnputil.exe') @('/add-driver',$inf,'/install')
-                } else { throw '安装任务类型不受支持。' }
+                try {
+                    if ($task.kind -eq 'printer') { Install-Printer $task }
+                    elseif ($task.kind -eq 'usb') {
+                        $inf=Join-Path $driverRoot $task.inf
+                        Invoke-Native (Join-Path $env:SystemRoot 'System32/pnputil.exe') @('/add-driver',$inf,'/install')
+                    } else { throw '安装任务类型不受支持。' }
+                } catch {
+                    $why=$_.Exception.Message
+                    if ($task.kind -eq 'usb' -and $why.StartsWith('安装程序退出码 -536870330；')) {
+                        $flag=(Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services\DeviceInstall\Parameters' -Name DeviceInstallDisabled -ErrorAction SilentlyContinue).DeviceInstallDisabled
+                        $why='Windows 未能将驱动安装到设备 (0xE0000246)；'
+                        if ($flag -eq 1) { $why+='设备安装开关已禁用，请联系工位管理员。' }
+                        else { $why+='请核对本次 Windows INF\setupapi.dev.log 中的安装原因。' }
+                    }
+                    $msg=$task.name+'：'+$why
+                    $failures.Add($msg)
+                    Add-Stage 'install.unconfirmed' $msg @{task=$task;position=$_.InvocationInfo.PositionMessage;stack=$_.ScriptStackTrace}
+                }
             }
             Add-Stage 'verify' '正在回读型号驱动、设备绑定和打印队列。'
             for ($attempt=1; $attempt -le 4; $attempt++) {
@@ -245,8 +259,9 @@ try {
                 Add-Stage 'verify.wait' '正在等待 Windows 更新设备绑定和打印队列。' @{attempt=$attempt;remaining=$remaining;unconfirmed=$failed}
                 if ($attempt -lt 4) { Start-Sleep -Seconds 1 }
             }
-            if ($remaining.Count -or $failed.Count) {
+            if ($remaining.Count -or $failed.Count -or $failures.Count) {
                 $reason='安装程序已结束，但设备绑定或队列回读未通过；请查看日志中的安装前后快照。'
+                if ($failures.Count) { $reason=($failures -join '；')+'。已继续检查其他设备；详见安装回执。' }
                 if ($script:result.reboot_required) { $reason+='Windows 要求重启，请由现场负责人安排后重新检查。' }
                 throw $reason
             }
@@ -261,6 +276,7 @@ try {
     }
 } catch {
     $script:result.error=$_.Exception.Message
+    [Console]::Error.WriteLine(($script:result.error+" 回执："+$ResultPath))
     $script:result.native_error=if ($_.Exception.PSObject.Properties['NativeErrorCode']) { $_.Exception.NativeErrorCode } else { $null }
     Add-Stage 'failed' '驱动准备未完成，请联系工程人员查看日志或运行根目录 install_drivers.cmd。' @{error=$_.Exception.Message;type=$_.Exception.GetType().FullName;native_error=$script:result.native_error;position=$_.InvocationInfo.PositionMessage;stack=$_.ScriptStackTrace}
 } finally {

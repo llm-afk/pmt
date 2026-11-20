@@ -145,9 +145,19 @@ class HealthTests(unittest.TestCase):
                 self.assertIn(cue, title + hint)
                 self.assertNotIn('请点击开始', title)
 
+    def test_fixture_torque_direction_on_recorded_com4_frame(self):
+        from motor_platform.components.dynamometer.protocol import parse_frame
+        from scripts.factory_test.station_config import StationConfig
+        frame = bytes.fromhex("099b00007257")
+        for direction, expected in (("反向", -24.59), ("保持原始", 24.59)):
+            cfg = StationConfig(dyno_torque_direction=direction)
+            sample = parse_frame(frame, torque_sign=cfg.dyno_torque_sign)
+            self.assertEqual((sample.raw_torque, sample.torque), (2459, expected))
+        self.assertEqual(StationConfig().dyno_torque_sign, -1)
+
     def test_passive_dyno_probe_separates_open_error_bytes_and_valid_frames(self):
         from motor_platform.components.dynamometer.discovery import detect_dynamometers
-        def device(*,port,baudrate):
+        def device(*,port,baudrate,torque_sign):
             if port=='COM1': raise PermissionError('port busy')
             instrument=Mock()
             instrument.state.return_value=port+' sample'

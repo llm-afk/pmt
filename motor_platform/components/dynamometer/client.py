@@ -33,8 +33,11 @@ class Dynamometer:
             return list(_port_owners.values())
 
     def __init__(self, *, port, baudrate=115200, torque_scale=100.0,
-                 speed_scale=SPEED_COUNTS_PER_RPM, transport=None):
+                 speed_scale=SPEED_COUNTS_PER_RPM, transport=None, torque_sign=-1):
         self.torque_scale, self.speed_scale = positive(torque_scale), positive(speed_scale)
+        if torque_sign not in (-1, 1):
+            raise ValueError("invalid dynamometer torque sign")
+        self.torque_sign = torque_sign
         self.port = port
         self._port_key = port.strip().casefold()
         self._transport = transport if transport is not None else SerialStream(port, baudrate=baudrate)
@@ -125,7 +128,7 @@ class Dynamometer:
                 received = time.perf_counter()
                 frames = parser.feed(data)
                 states = [parse_frame(frame, torque_scale=self.torque_scale,
-                                      speed_scale=self.speed_scale, received_at=received) for frame in frames]
+                                      speed_scale=self.speed_scale, received_at=received, torque_sign=self.torque_sign) for frame in frames]
                 with self._condition:
                     self._bytes += len(data)
                     self._discarded = parser.discarded_bytes
@@ -196,7 +199,7 @@ class Dynamometer:
                         last_feedback=asdict(state) if state is not None else None,
                         last_raw_frame=self._latest_frame.hex() if self._latest_frame is not None else None,
                         feedback_age_ms=(at-state.received_at)*1000 if state is not None else None,
-                        torque_scale=self.torque_scale,speed_scale=self.speed_scale,torque_sign=-1,
+                        torque_scale=self.torque_scale,speed_scale=self.speed_scale,torque_sign=self.torque_sign,
                         reader_alive=bool(self._thread and self._thread.is_alive()))
 
     def stats(self):

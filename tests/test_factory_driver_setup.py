@@ -399,8 +399,9 @@ function Add-Printer { throw 'Live printer queue creation is forbidden' }
                 self.assertEqual(document['events'][-1]['stage'],'failed' if fail else 'complete')
                 self.assertEqual([x.name for x in receipt.parent.iterdir()],['result.json'])
                 if fail:
-                    self.assertEqual(document['error'],'test.install.failure')
-                    details=document['events'][-1]['details']
+                    self.assertIn('Test Queue',document['error'])
+                    self.assertIn('test.install.failure',document['error'])
+                    details=next(e['details'] for e in document['events'] if e['stage']=='install.unconfirmed')
                     self.assertIn('mock-entry.ps1',details['position'])
                     self.assertIn('Install-Printer',details['stack'])
                 else:

@@ -4,7 +4,7 @@ from .client import Dynamometer
 from .protocol import positive
 
 
-def detect_dynamometers(*, ports=None, baudrate=115200, duration=0.3, observations=None, readings=None):
+def detect_dynamometers(*, ports=None, baudrate=115200, duration=0.3, observations=None, readings=None, torque_sign=-1):
     positive(duration)
     if ports is None:
         from serial.tools.list_ports import comports
@@ -14,7 +14,7 @@ def detect_dynamometers(*, ports=None, baudrate=115200, duration=0.3, observatio
         started = time.perf_counter()
         evidence = dict(port=port, baudrate=baudrate, opened=False, matched=False)
         try:
-            with Dynamometer(port=port, baudrate=baudrate) as device:
+            with Dynamometer(port=port, baudrate=baudrate, torque_sign=torque_sign) as device:
                 evidence['opened'] = True
                 deadline = time.perf_counter()+duration
                 while True:

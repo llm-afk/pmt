@@ -872,7 +872,7 @@ class FactoryWindow:
         target = config.target_id if config.target_id is not None else '未定义'
         self.write_log(f'[工位] 产品目标 ID {target}；产品 {config.project} / {config.category} / '+
             f'{config.subcategory}；工厂 {config.factory}；硬件 ABCD {config.hardware_version}')
-        self.write_log(f'[串口] 测功机 {config.dyno_port}；电源 {config.power_port}')
+        self.write_log(f'[串口] 测功机 {config.dyno_port}（扭矩方向：{config.dyno_torque_direction}）；电源 {config.power_port}')
         self.write_log('[SN] 临时 SN '+config.base_sn+'；正式 SN 由 MES 分配。')
         self.write_log('[固件] APP 文件夹：'+str(firmware_root(config))+'；APP 文件校验在后台进行。')
         self.write_log('[取号配置] '+config.mes_url.rstrip('/')+config.mes_sn_path)

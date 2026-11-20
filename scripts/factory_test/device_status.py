@@ -343,7 +343,7 @@ class DeviceHealth:
         dyno_matches = []
         try:
             readings = {}
-            matches = detect_dynamometers(ports=candidates, duration=.25, observations=observed, readings=readings)
+            matches = detect_dynamometers(ports=candidates, duration=.25, observations=observed, readings=readings, torque_sign=config.dyno_torque_sign)
             evidence['matches'] = matches
             dyno_matches = list(matches)
             self._dyno_matches = tuple(matches)
@@ -355,7 +355,7 @@ class DeviceHealth:
                 reading = readings.get(selected)
                 if reading is None or time.perf_counter() - reading.received_at > .4:
                     # A full scan of several ports may outlive the first port's sample.
-                    with Dynamometer(port=selected) as dyno:
+                    with Dynamometer(port=selected, torque_sign=config.dyno_torque_sign) as dyno:
                         reading = dyno.receive_state(timeout=.4)
                 evidence['reading'] = reading
                 self.dyno_port = selected

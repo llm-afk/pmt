@@ -93,7 +93,8 @@ def build_settings(self):
     self.dyno_port_combo = self.field_widgets['dyno_port']
     field(basic,3,'kt_error_limit_pct','扭矩误差上限 / %满量程')
     field(basic,4,'max_test_torque_nm','KT / T-N 最大扭矩 / Nm')
-    self.firmware_panel = FirmwarePanel(self, basic, 5)
+    field(basic,5,"dyno_torque_direction","测功机扭矩方向",("反向","保持原始"))
+    self.firmware_panel = FirmwarePanel(self, basic, 6)
     sn_group=ttk.LabelFrame(mes,text='工位产品配置 · 临时 SN / MES 取号共用',padding=12)
     sn_group.pack(fill='both',expand=True)
     field(sn_group, 0, 'project', '项目', list(MATERIALS), editable=True)

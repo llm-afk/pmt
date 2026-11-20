@@ -143,6 +143,12 @@ class StationConfig:
     api_key_env: str = 'MIRRORME_MES_API_KEY'
     printer_url: str = 'http://127.0.0.1:9876'
     printer_name: str = DEFAULT_PRINTER_NAME
+    dyno_torque_direction: str = "反向"
+
+    @property
+    def dyno_torque_sign(self):
+        return {"反向": -1, "保持原始": 1}[self.dyno_torque_direction]
+
     kt_error_limit_pct: float = DEFAULT_KT_ERROR_LIMIT_PCT
     calibration_timeout: float = 120.0
     report_upload_url: str = DEFAULT_REPORT_URL  # 显式清空后仍可沿用外置配置的 mes_url。
@@ -204,6 +210,8 @@ class StationConfig:
                 raise ValueError('生产日期不是有效的日历日期') from None
         if type(self.max_test_torque_nm) not in (int, float) or not 0 < self.max_test_torque_nm <= 3.4028234663852886e38:
             raise ValueError('测试最大扭矩须为运控协议可表示的正数，单位 Nm')
+        if self.dyno_torque_direction not in ("反向", "保持原始"):
+            raise ValueError("无效的测功机扭矩方向")
         if not math.isfinite(self.kt_error_limit_pct) or self.kt_error_limit_pct < 0:
             raise ValueError('扭矩误差上限须为有限非负数，单位 %满量程')
         if not math.isfinite(self.calibration_timeout) or self.calibration_timeout <= 0:

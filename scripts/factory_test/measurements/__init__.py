@@ -54,7 +54,7 @@ def check_cancelled():
 
 
 @contextmanager
-def measurement_devices(args, power_port, dyno_port, *, expected_sn=None):
+def measurement_devices(args, power_port, dyno_port, *, expected_sn=None, torque_sign=-1):
     from motor_platform import Bench, Canable, Dynamometer, PowerSupply
     from motor_platform.components.dynamometer import detect_dynamometers
     from motor_platform.components.power_supply.discovery import resolve_power_port
@@ -64,7 +64,7 @@ def measurement_devices(args, power_port, dyno_port, *, expected_sn=None):
     matches = detect_dynamometers() if dyno_port == 'auto' else [dyno_port]
     if len(matches) != 1:
         raise RuntimeError(f'无法唯一识别测功机：{matches}')
-    with Dynamometer(port=matches[0]) as dyno:
+    with Dynamometer(port=matches[0], torque_sign=torque_sign) as dyno:
         dyno.receive_state(timeout=1)
         hardware_state('dyno', matches[0]+' · 已收到有效扭矩 / 转速反馈')
         port = resolve_power_port(power_port)

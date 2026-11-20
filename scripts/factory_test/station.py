@@ -222,7 +222,7 @@ class Services:
             def devices(args,power_port,dyno_port):
                 nonlocal shared
                 if shared is None:
-                    shared = stack.enter_context(measurement_devices(args,power_port,dyno_port,expected_sn=base_sn))
+                    shared = stack.enter_context(measurement_devices(args,power_port,dyno_port,expected_sn=base_sn,torque_sign=self.config.dyno_torque_sign))
                 return nullcontext(shared)
             for name, module, csv in app.STAGES:
                 def run(*argv, _name=name, _module=module, **kwargs):
@@ -230,7 +230,7 @@ class Services:
                     started = time.perf_counter()
                     log_event('test.stage.start', stage=_name, output_directory=str(directory/_name),
                               motor_id=self.config.target_id, target_torque=self.config.torque,
-                              power_port=power_port, dyno_port=dyno_port,
+                              power_port=power_port, dyno_port=dyno_port, dyno_torque_sign=self.config.dyno_torque_sign,
                               parameters={key:value for key,value in vars(_module).items() if key.isupper() and
                                           key not in ('COLUMNS','OUTPUT_COLUMNS')})
                     self.emit('step', dict(name=_name, status='RUNNING'))

@@ -41,7 +41,7 @@ class DynamometerState:
         return self.torque * self.speed
 
 
-def parse_frame(data, *, torque_scale=100.0, speed_scale=SPEED_COUNTS_PER_RPM, received_at=0.0):
+def parse_frame(data, *, torque_scale=100.0, speed_scale=SPEED_COUNTS_PER_RPM, received_at=0.0, torque_sign=-1):
     positive(torque_scale)
     positive(speed_scale)
     if not valid_frame(data):
@@ -50,8 +50,9 @@ def parse_frame(data, *, torque_scale=100.0, speed_scale=SPEED_COUNTS_PER_RPM, r
     raw_torque = -magnitude if data[2] & 0x80 else magnitude
     raw_speed = ((data[2] & 0x7F) << 8) | data[3]
     rpm = raw_speed / speed_scale
-    # The fixture reports torque in the opposite direction to the motor.
-    return DynamometerState(-raw_torque/torque_scale, rpm*math.pi/30, rpm,
+    if torque_sign not in (-1, 1):
+        raise ValueError("invalid dynamometer torque sign")
+    return DynamometerState(torque_sign * raw_torque/torque_scale, rpm*math.pi/30, rpm,
                             raw_torque, raw_speed, received_at)
 
 
