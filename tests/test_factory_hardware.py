@@ -101,6 +101,13 @@ class HardwareEventTests(unittest.TestCase):
             host.events.put(('hardware_state',dict(base,**data)));host.process_events()
             self.assertEqual(host.set_prompt.call_args.args[0],title)
 
+    def test_unconfirmed_preturn_reports_its_reason(self):
+        from scripts.factory_test.gui import FactoryWindow
+        reason = '预转反馈向相反方向移动超过 3°'
+        title, hint = FactoryWindow.failure_prompt(dict(message=reason, diagnostic={'code':'KT_PRETURN_INCOMPLETE'}))
+        self.assertEqual(title, 'KT 预转未完成')
+        self.assertIn(reason, hint)
+
 
 class FrozenPortTests(unittest.TestCase):
     def test_each_measurement_receives_effective_ports_without_mutating_module_defaults(self):
@@ -157,6 +164,8 @@ class MeasurementReadyOrderTests(unittest.TestCase):
             patches.enter_context(patch.object(module.time,'perf_counter',lambda:clock[0]))
             patches.enter_context(patch.object(module.time,'sleep',wait))
             patches.enter_context(patch.object(module,'run',side_effect=run))
+            if hasattr(module, 'prepare_shaft'):
+                patches.enter_context(patch.object(module, 'prepare_shaft', side_effect=lambda *_: wait(.7)))
             patches.enter_context(patch('builtins.print'))
             if cancel:
                 with self.assertRaises(InterruptedError):
@@ -174,7 +183,7 @@ class MeasurementReadyOrderTests(unittest.TestCase):
             with self.subTest(module=module.__name__),tempfile.TemporaryDirectory() as root:
                 events=self.exercise(module,Path(root)/'result',cancel=False)
                 on=next(at for event,at in events if event=='load.on')
-                self.assertEqual(on,100.)
+                self.assertAlmostEqual(on, 100.7 if module is kt else 100.)
                 self.assertTrue(any(event=='motor.enable' for event,_ in events))
                 self.assertEqual(events[0][0],'off');self.assertEqual(events[-1][0],'off')
 

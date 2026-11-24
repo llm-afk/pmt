@@ -16,6 +16,7 @@ from ..console import WindowConsole as TerminalConsole
 from scripts.factory_test.measurements.smoothing import append_smoothed_columns
 from scripts.factory_test.measurements.csv_streams import pack_streams
 from scripts.factory_test.measurements.kt_curve.recording import Recorder, OUTPUT_COLUMNS
+from .preturn import prepare_shaft
 
 # 测量参数由工位流程使用；硬件组件不保存工位 ID、SN 或加载参数。
 MOTOR_ID = 1
@@ -189,7 +190,8 @@ def main(argv=None, *, output_dir, quiet=False, power_port=None, dyno_port=None,
                 with devices(args,power_port,dyno_port) as (motor,dyno,power,dyno_name,port):
                     result.update(power_port=port,dynamometer_port=dyno_name)
                     try:
-                        power.set_current(0)
+                        result['preturn'] = prepare_shaft(motor, dyno, power, args.torque)
+                        check_cancelled()
                         power.set_voltage(args.voltage)
                         power.set_current(args.current)
                         with TerminalConsole(title='关节输出扭矩一致性测试', prompt='torque> ',
@@ -227,7 +229,7 @@ def main(argv=None, *, output_dir, quiet=False, power_port=None, dyno_port=None,
             print(f'Test result: {result["reason"]}\nCSV: {csv_path}')
     termination = ('normal_end' if result['reason']=='completed' else
                    'operator_stop' if result['reason']=='operator_stop' else 'fault')
-    return {'reason': result['reason'], 'termination':termination,
+    return {'reason': result['reason'], 'termination':termination, 'preturn': result['preturn'],
             'end_condition':result.get('end_condition'), 'csv': str(csv_path),
             'capture_duration_s': recorder.cutoff - recorder.origin,
             'config': {k: v for k, v in globals().items() if k.isupper()}, 'arguments': vars(args)}

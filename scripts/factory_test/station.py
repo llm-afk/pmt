@@ -128,7 +128,7 @@ class Services:
         messages = dict(can='周期通信使用中' if policy['can']=='PERIODIC' else
                         '维护通道使用中' if policy['can']=='MAINTENANCE' else '当前工序不使用 CAN',
                         motor={'MAINTENANCE':'维护操作中；不下发运动目标','CALIBRATION':'准备校准；先关闭加载并发送全零目标',
-                               'PREPARE':'准备性能测试；先确认零目标与新反馈','KT':'准备 KT 测试；就绪后才使能',
+                               'PREPARE':'准备性能测试；先确认零目标与新反馈','KT':'准备 KT 测试，先卸载预转并确认停稳',
                                'TN':'准备 T-N 测试；就绪后才使能','STOPPED':'性能测试已结束，零目标与加载关闭见回执'}[policy['motor']],
                         dyno='性能测试使用被动扭矩 / 转速反馈' if policy['dyno']=='CAPTURE' else '当前工序不采集扭矩 / 转速',
                         printer='正在检查打印服务并提交标签' if policy['printer']=='PRINT' else '当前工序不提交打印；打印前重新检查服务')

@@ -1,5 +1,7 @@
 import csv
 import io
+import math
+from contextlib import nullcontext
 from pathlib import Path
 import tempfile
 import time
@@ -8,6 +10,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from scripts.factory_test.measurements.kt_curve import app
+from scripts.factory_test.measurements.kt_curve import preturn
 from scripts.factory_test.measurements.kt_curve.recording import Recorder, COLUMNS, OUTPUT_COLUMNS
 
 
@@ -40,6 +43,174 @@ class FakeDyno:
     def state(self, **kwargs): return state(self.clock[0])
     def stats(self): return dict(dropped_samples=0)
     def drain(self): return [state(self.clock[0])]
+
+
+class PreturnTests(unittest.TestCase):
+    def setUp(self):
+        self.now = 100.
+        self.origin = self.position = -4.2
+        self.velocity = 0.
+        self.response = 1.
+        self.start_delay = 0.
+        self.source = None
+        self.frames = []
+        self.motor = Mock()
+        self.motor.stats.return_value = dict(fault=None, actual_tx_hz=1000)
+        self.motor.state.side_effect = self.feedback
+        self.motor.set_mit_source.side_effect = self.control
+        self.motor.finish_at_zero.side_effect = self.neutral
+        self.dyno = FakeDyno([self.now])
+        self.power = Mock()
+        self.power.read_state.return_value = NS(output=False, current=0.)
+        for name, func in [('perf_counter', lambda: self.now), ('sleep', self.tick)]:
+            self.enterContext(patch.object(preturn.time, name, func))
+
+    def feedback(self, **_):
+        return NS(received_at=self.now, velocity=self.velocity, position=self.position, torque=.1,
+                  error_code=0, motor_temperature=30., board_temperature=25.)
+
+    def control(self, source):
+        self.source = source
+        self.turn_at = self.now
+
+    def neutral(self):
+        self.source = None
+        self.neutral_at = self.now
+
+    def tick(self, dt):
+        command = self.source(self.now) if self.source else preturn.ZERO
+        self.velocity = 0.
+        if command.kp:
+            self.frames.append((self.now, self.position, command))
+            if self.now >= self.turn_at + self.start_delay:
+                self.velocity = self.response * max(-1., min(1., 12 * (command.position - self.position)))
+        self.position += self.velocity * dt
+        self.now += dt
+        self.dyno.clock[0] = self.now
+
+    def prepare(self, torque=20):
+        return preturn.prepare_shaft(self.motor, self.dyno, self.power, torque)
+
+    def test_signed_relative_motion_and_new_feedback_after_release(self):
+        for torque in (20, -20):
+            with self.subTest(torque=torque):
+                self.start_delay = 0.8
+                self.origin = self.position
+                self.frames.clear()
+                result = self.prepare(torque)
+                direction = math.copysign(1., torque)
+                self.assertLessEqual(abs(result['travel_deg'] - direction * 15), 3)
+                self.assertGreaterEqual(result['first_motion_s'], self.start_delay)
+                self.assertGreaterEqual(self.now - self.neutral_at, preturn.STILL_HOLD_S)
+                self.assertTrue(self.frames)
+                for _, position, command in self.frames:
+                    self.assertLessEqual(direction * (command.position - self.origin), preturn.ANGLE + 1e-8)
+                    self.assertLessEqual(direction * (command.position - position), preturn.MAX_LEAD + .01)
+                    self.assertEqual(command.torque, 0)
+                self.motor.disable.assert_not_called()
+                self.power.enable.assert_not_called()
+        self.assertEqual(self.power.set_current.call_args.args, (0,))
+
+    def test_stuck_or_reversed_axis_never_starts_kt(self):
+        for response, message in ((0., '预转约 15°'), (-1., '相反方向')):
+            with self.subTest(response=response), tempfile.TemporaryDirectory() as folder:
+                self.response = response
+                self.source = None
+                self.position = self.origin
+                self.motor.reset_mock()
+                devices = lambda *_: nullcontext((self.motor, self.dyno, self.power, 'dyno', 'load'))
+                with self.assertRaisesRegex(preturn.PreturnIncomplete, message):
+                    app.main(['--serial','test','--torque','20'], output_dir=Path(folder)/'kt', devices=devices, quiet=True)
+                self.motor.set_mit.assert_called_once_with(preturn.ZERO)
+                self.motor.disable.assert_called_once()
+                self.motor.start_recording.assert_not_called()
+                self.power.enable.assert_not_called()
+                with (Path(folder)/'kt'/'kt_curve.csv').open(encoding='utf8') as raw:
+                    self.assertEqual(list(csv.DictReader(raw)), [])
+
+    def test_output_on_blocks_first_motion(self):
+        self.power.read_state.return_value.output = True
+        with self.assertRaisesRegex(preturn.PreturnIncomplete, '磁粉'):
+            self.prepare()
+        self.motor.enable.assert_not_called()
+
+    def test_complete_kt_starts_capture_and_load_only_after_unloaded_turn_and_settle(self):
+        load_on, recordings = [], []
+        self.power.enable.side_effect = lambda: load_on.append(self.now)
+        self.motor.start_recording.side_effect = lambda: recordings.append(self.now)
+        old = self.feedback()
+        old.torque = 999
+        self.motor.drain_states.side_effect = lambda: [old, self.feedback()]
+        devices = lambda *_: nullcontext((self.motor, self.dyno, self.power, 'dyno', 'load'))
+        with tempfile.TemporaryDirectory() as folder, patch('sys.stdout', io.StringIO()):
+            run = app.main(['--serial','test','--torque','20'], output_dir=Path(folder)/'kt', devices=devices, quiet=True)
+            with Path(run['csv']).open(encoding='utf8') as raw:
+                rows = list(csv.DictReader(raw))
+        self.assertEqual(run['reason'], 'completed')
+        self.assertLessEqual(abs(run['preturn']['travel_deg'] - 15), 3)
+        self.assertGreaterEqual(load_on[0] - self.turn_at, preturn.ANGLE / preturn.REFERENCE_SPEED + preturn.STILL_HOLD_S)
+        self.assertAlmostEqual(recordings[0] - load_on[0], app.LOAD_SETTLE_S)
+        self.assertAlmostEqual(run['capture_duration_s'], app.RAMP_DURATION_S)
+        targets = [float(row['motor_application_target_torque']) for row in rows if row['motor_application_target_torque']]
+        torques = [float(row['motor_torque']) for row in rows if row['motor_torque']]
+        self.assertLess(min(targets), .01)
+        self.assertGreater(max(targets), 19.9)
+        self.assertEqual(set(torques), {.1})
+
+    def test_cancel_during_turn_releases_motor_and_preserves_stop_failure(self):
+        def cancel():
+            if self.frames:
+                raise InterruptedError('operator stopped')
+        self.motor.disable.side_effect = TimeoutError('no stop receipt')
+        with patch.object(preturn, 'check_cancelled', side_effect=cancel), self.assertRaises(InterruptedError) as caught:
+            self.prepare()
+        self.assertTrue(any('停机未确认' in note for note in caught.exception.__notes__))
+        self.motor.set_mit.assert_called_once_with(preturn.ZERO)
+        self.power.enable.assert_not_called()
+
+    def test_stale_feedback_does_not_hold_position_target_or_prove_standstill(self):
+        def delayed_feedback(**kwargs):
+            value = self.feedback(**kwargs)
+            if self.source and self.now > self.turn_at + .25:
+                value.received_at = self.turn_at + .25
+            return value
+        self.motor.state.side_effect = delayed_feedback
+        with self.assertRaisesRegex(preturn.PreturnIncomplete, '预转约 15°'):
+            self.prepare()
+        self.assertTrue(self.frames)
+        self.assertLess(self.frames[-1][0], self.turn_at + .25 + preturn.SAMPLE_MAX_GAP_S + .01)
+        self.assertEqual(self.source(self.now), preturn.ZERO)
+
+    def test_position_offset_without_motion_feedback_is_not_a_turn(self):
+        def jumped_position(**kwargs):
+            value = self.feedback(**kwargs)
+            if self.source:
+                value.position = self.origin + preturn.ANGLE
+                value.velocity = 0.
+            return value
+        self.motor.state.side_effect = jumped_position
+        with self.assertRaises(preturn.PreturnIncomplete):
+            self.prepare()
+        self.motor.finish_at_zero.assert_not_called()
+        self.power.enable.assert_not_called()
+
+    def test_motion_after_zero_or_frozen_final_feedback_prevents_loading(self):
+        for frozen in (True, False):
+            with self.subTest(frozen=frozen):
+                if hasattr(self, 'neutral_at'):
+                    del self.neutral_at
+                def final_feedback(**kwargs):
+                    value = self.feedback(**kwargs)
+                    if hasattr(self, 'neutral_at'):
+                        if frozen:
+                            value.received_at = self.neutral_at + .001
+                        else:
+                            value.velocity = 1.
+                    return value
+                self.motor.state.side_effect = final_feedback
+                with self.assertRaisesRegex(preturn.PreturnIncomplete, '停稳'):
+                    self.prepare()
+                self.power.enable.assert_not_called()
 
 
 class ConsistencyTests(unittest.TestCase):
@@ -206,6 +377,7 @@ class ConsistencyTests(unittest.TestCase):
              patch('motor_platform.PowerSupply', return_value=power), \
              patch('motor_platform.Canable'), patch('motor_platform.Bench', return_value=bench), \
              patch.object(app, 'TerminalConsole', return_value=nullcontext(None)) as console, \
+             patch.object(app, 'prepare_shaft', side_effect=lambda *args: events.append('preturn')) as prepare, \
              patch.object(app, 'run', side_effect=run), \
              patch.object(app.time, 'sleep', side_effect=lambda seconds: events.append(('wait', seconds))), \
              patch('sys.stdout', io.StringIO()):
@@ -225,7 +397,8 @@ class ConsistencyTests(unittest.TestCase):
             self.assertNotEqual(rows[0]['motor_torque_smooth'], '')
             self.assertNotIn('motor_speed_smooth_rad_s', rows[0])
             self.assertNotIn('dyno_speed_smooth_rad_s', rows[0])
-        self.assertEqual(events, ['off', 'monitor', ('current', 0), ('voltage', 24.), ('current', 3.),
+        prepare.assert_called_once_with(motor, dyno, power, 30.)
+        self.assertEqual(events, ['off', 'monitor', 'preturn', ('voltage', 24.), ('current', 3.),
                                   'on', ('wait', .5), 'run', 'off'])
 
 

@@ -1843,6 +1843,9 @@ class FactoryWindow:
         if code == 'KT_TORQUE_ERROR_LIMIT':
             detail=value.get('message') or '扭矩误差超过工位设定值'
             return '扭矩误差超限，请隔离本件',detail+'；已提前结束，不申请正式 SN，请勿贴合格标签。'
+        if code == 'KT_PRETURN_INCOMPLETE':
+            reason = value.get('message') or '预转位移或停稳反馈未确认'
+            return 'KT 预转未完成', reason + '。请等待转轴停止，联系工程人员检查工装。'
         if code == 'MOTOR_FEEDBACK_STALE':
             return '请取下并隔离本件电机','电机反馈中断，本件测试已停止。请勿贴合格标签，联系工程人员查看日志。'
         stage=value.get('step_label') or dict(STEPS).get(step,'本件测试')
