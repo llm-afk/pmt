@@ -402,6 +402,17 @@ class DiagnosticTests(unittest.TestCase):
         self.assertEqual(error_details(OSError(errno.EIO,'I/O error'))['code'],'UNEXPECTED_EXCEPTION')
         self.assertEqual(error_details(RuntimeError('new firmware failure'))['code'],'UNEXPECTED_EXCEPTION')
 
+    def test_device_failure_is_distinct_from_access_errors_during_idle_retries(self):
+        error = PermissionError(errno.EACCES, 'device not functioning')
+        error.winerror = 31
+        self.assertEqual(error_details(error)['code'], 'WINDOWS_DEVICE_FAILURE')
+        self.logs.poll_result(self.logs.station,'motor',{}, {'transport.open':{}},error=error)
+        self.assertIn('WARNING [devices.poll.changed]', self.logs.station.path.read_text(encoding='utf-8'))
+        for code in (5, 32):
+            denied = PermissionError(errno.EACCES, 'denied or busy')
+            denied.winerror = code
+            self.assertEqual(error_details(denied)['code'], 'ACCESS_DENIED_OR_BUSY')
+
     def response(self, body, status=200):
         value = io.BytesIO(body)
         value.status = status

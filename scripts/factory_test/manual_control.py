@@ -553,7 +553,7 @@ class ControlPage:
         if config.simulation:
             return True
         info = inventory_status(getattr(self.host,'adapter_inventory',None), config.adapter_sn)
-        return bool(config.adapter_sn and (info is None or info['state']=='READY'))
+        return bool(config.adapter_sn and (info is None or info['state']=='CONNECTING'))
 
     def tick(self):
         if (not self.want_connection or self.active or self.host.page != 'control'

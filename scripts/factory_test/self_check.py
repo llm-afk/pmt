@@ -1,6 +1,6 @@
 """Check the bundled UI, persistence and simulated report without device I/O."""
 from contextlib import ExitStack
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import importlib.util
 import json
 from pathlib import Path
@@ -510,6 +510,18 @@ def run(destination):
             assert load_config(config_path).adapter_sn == 'self-check-can-a'
             assert load_config(config_path).project == saved_project
             window.vars['project'].set(saved_project)
+            previous_config = window.config
+            window.config = replace(previous_config, automatic=True)
+            try:
+                window.show_adapter_status()
+                value, label, hint = window.device_widgets['can']
+                assert value.get()=='● 连接中' and str(label.cget('foreground'))=='#B27813'
+                assert '正在建立通信' in hint.get()
+                window.adapter_handshake.observe(time.monotonic())
+                window.show_adapter_status()
+                assert value.get()=='● 已连接' and str(label.cget('foreground'))=='#138365'
+            finally:
+                window.config = previous_config
             assert tuple(window.devices.cget('values')) == ('self-check-can-a',)
             popup_values = window.devices.tk.globalgetvar('ttk::combobox::Values('+str(window.devices)+')')
             assert tuple(window.devices.tk.splitlist(popup_values)) == ('self-check-can-a',)
@@ -597,7 +609,6 @@ def run(destination):
             assert all(name in window.vars for name in service_names)
             assert window.printer_check_button.cget('text')=='检查打印服务'
             assert window.printer_test_button.cget('text')=='试打测试标签'
-            from dataclasses import replace
             saved_config=window.config
             try:
                 window.config=replace(saved_config,simulation=False)

@@ -104,6 +104,8 @@ def error_details(error):
             code, hint = 'CONNECTION_REFUSED', '目标端口拒绝连接；检查服务进程是否启动及地址、端口是否正确。'
         elif types & {'TimeoutError', 'SdoReplyTimeout', 'MotorAbsent', 'Timeout', 'ReadTimeout', 'ConnectTimeout'} or errno.ETIMEDOUT in errnos or 10060 in windows_codes:
             code, hint = 'TIMEOUT', '在期限内未收到确认；检查链路和设备/服务日志。超时本身不能证明命令未执行。'
+        elif 31 in windows_codes:
+            code, hint = 'WINDOWS_DEVICE_FAILURE', 'Windows 报告设备操作失败（31）。查看出错设备、操作和之后的重试结果。'
         elif isinstance(error, PermissionError) or errno.EACCES in errnos or any(n in windows_codes for n in (5, 32)):
             code, hint = 'ACCESS_DENIED_OR_BUSY', '检查目录权限、文件是否被占用，以及设备是否被其他程序占用。'
         elif errno.ENOSPC in errnos or 112 in windows_codes:
@@ -381,8 +383,12 @@ class DiagnosticLogs:
             if changed:
                 recovered = state=='READY' and previous is not None and previous['state']!='READY'
                 event = 'devices.poll.recovered' if recovered else 'devices.poll.changed'
+                retrying_usb = (device=='motor' and 'transport.open' in evidence and 'transport.connected' not in evidence
+                                and diagnostic is not None and any(item.get('winerror') in (2, 5, 21, 31, 32, 1167)
+                                    for item in diagnostic['exception_chain']))
                 target.event(event,'空闲电机探测恢复' if recovered else '空闲电机探测状态变化',
-                    level='ERROR' if state=='ERROR' else 'INFO',error=error if state=='ERROR' else None,
+                    level='WARNING' if retrying_usb else 'ERROR' if state=='ERROR' else 'INFO',
+                    error=error if state=='ERROR' else None,
                     device=device,route=route,state=state,code=code,
                     previous_state=previous['state'] if previous else None,
                     evidence=evidence,elapsed_ms=round(elapsed*1000,1),count=1)

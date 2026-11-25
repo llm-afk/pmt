@@ -1,10 +1,10 @@
 from collections import deque
 import struct
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from motor_platform import CanFrame, MitCommand, MotorBus, SdoError, control_frame, mit_frame, parse_state
-from motor_platform.transports.canable import Canable, bit_timing, decode_usb, encode_usb
+from motor_platform.transports.canable import Canable, _Usb, bit_timing, decode_usb, encode_usb
 
 
 def status(node=1, error=None):
@@ -242,6 +242,20 @@ class UsbTests(unittest.TestCase):
         self.assertEqual(can.recv().can_id, 0x192)
         self.assertEqual(can.recv().can_id, 0x191)
         self.assertIsNone(can.recv())
+
+    def test_control_failure_records_the_actual_request_and_windows_error(self):
+        from scripts.factory_test.diagnostics import error_details
+        usb = Mock()
+        error = PermissionError(13, 'device not functioning')
+        error.winerror = 31
+        usb.w.WinUsb_ControlTransfer.side_effect = error
+        with self.assertRaises(PermissionError) as caught:
+            _Usb.control(usb, 5, length=12)
+        detail = error_details(caught.exception)
+        self.assertIs(caught.exception,error)
+        self.assertEqual(detail['code'],'CAN_USB_CONTROL_FAILED')
+        self.assertEqual(detail['exception_chain'][0]['diagnostic_context'],
+                         dict(operation='WinUsb_ControlTransfer',request=5,direction='IN',length=12))
 
     def test_inspect_only_gets_and_closes(self):
         class Usb:

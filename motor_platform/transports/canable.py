@@ -122,9 +122,17 @@ class _Usb:
         buf = C.create_string_buffer(size) if incoming else C.create_string_buffer(data, size)
         n = C.c_uint32()
         setup = Setup(0xC1 if incoming else 0x41, request, 0, 0, size)
-        _check(self.w.WinUsb_ControlTransfer(self.usb, setup, buf, size, C.byref(n), None))
-        if n.value != size:
-            raise OSError(f"short USB control transfer: {n.value}/{size}")
+        try:
+            _check(self.w.WinUsb_ControlTransfer(self.usb, setup, buf, size, C.byref(n), None))
+            if n.value != size:
+                raise OSError(f"short USB control transfer: {n.value}/{size}")
+        except OSError as exc:
+            exc.diagnostic_context = dict(operation='WinUsb_ControlTransfer', request=request,
+                                          direction='IN' if incoming else 'OUT', length=size)
+            if getattr(exc, 'winerror', None) == 31:
+                exc.diagnostic_code = 'CAN_USB_CONTROL_FAILED'
+                exc.diagnostic_hint = 'CANable 的 USB 控制传输失败。核对请求编号、适配器重试记录和 Windows 设备状态。'
+            raise
         return buf.raw
 
     def transfer(self, pipe, data=None, timeout=1.0):

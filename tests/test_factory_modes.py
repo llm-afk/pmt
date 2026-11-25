@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from scripts.factory_test.gui import FactoryWindow, WindowConsole, GUI_EVENT_LIMIT
+from scripts.factory_test.device_status import AdapterHandshake
 from scripts.factory_test.manual_control import ControlPage, ManualSession
 from scripts.factory_test.station import PresenceLatch
 from scripts.factory_test.station_config import StationConfig
@@ -39,6 +40,7 @@ def window():
     host.mode_generation=0
     host.config_revision=0
     host.adapter_generation=0
+    host.adapter_handshake=AdapterHandshake()
     host.configuring=host.closing=False
     host.delivery_revision=0
     host.retiring_deliveries=[]
@@ -96,11 +98,12 @@ class SelectionTests(unittest.TestCase):
             host.update_adapters(dict(devices=[dict(serial_number='chosen',path='p')],error=None))
             save.assert_not_called()
         self.assertEqual(host.config.adapter_sn,'chosen')
-        self.assertEqual(host.device_state.call_args.args,('can','READY','chosen'))
-        host.adapter_open_failed = True
+        self.assertEqual(host.device_state.call_args.args[1],'CONNECTING')
+        host.adapter_handshake.observe(time.monotonic())
         host.show_adapter_status()
-        self.assertEqual(host.device_state.call_args.args[1],'ERROR')
-        self.assertIn('USB 通信接口',host.device_state.call_args.args[2])
+        self.assertEqual(host.device_state.call_args.args,('can','READY','chosen'))
+        host.update_adapters(dict(devices=[dict(serial_number='chosen',path='new-path')],error=None))
+        self.assertEqual(host.device_state.call_args.args[1],'CONNECTING')
 
     def test_single_adapter_is_selected_only_while_idle(self):
         host=window()
@@ -539,6 +542,9 @@ class IdleMotorConfirmationTests(unittest.TestCase):
                 change(host)
             return False
         def discover(**kwargs):
+            maintenance.return_value.discovery_opened_at = now[0]
+            if getattr(response[0], 'winerror', None) == 31:
+                maintenance.return_value.discovery_opened_at = None
             if response[0] is False:
                 raise MotorAbsent('short probe timed out')
             if isinstance(response[0], Exception):
@@ -560,6 +566,36 @@ class IdleMotorConfirmationTests(unittest.TestCase):
         candidates = [value for kind,value in host.events.queue if kind == 'candidate']
         self.assertFalse(any(call.args[0]=='controller.exception' for call in host.diagnostics.current.event.call_args_list))
         return host, candidates
+
+    def test_enumerated_adapter_needs_handshake_and_recovers_without_a_motor(self):
+        failure = PermissionError(13, 'device operation failed')
+        failure.winerror = 31
+        def enumerate_adapter(host):
+            host.adapter_inventory = dict(devices=host.adapter_devices, error=None)
+            host.adapter_handshake = AdapterHandshake()
+        host, candidates = self.scan([(100,failure,enumerate_adapter),(101.5,failure,None),
+                                      (105,failure,None),(106,False,None),(107.1,False,None)])
+        self.assertEqual([v['device_states']['can'] for v in candidates], ['CONNECTING','ERROR','READY','READY'])
+        self.assertTrue(all(not v['ready'] for v in candidates))
+        self.assertIn('can', candidates[0]['blockers'])
+        self.assertNotIn('can', candidates[-1]['blockers'])
+        self.assertEqual(FactoryWindow.candidate_prompt(candidates[0])[0], '正在连接 CANable，请稍候')
+        transitions = [c for c in host.diagnostics.current.event.call_args_list
+                       if c.args[0].startswith('devices.can.handshake.')]
+        self.assertEqual([c.args[0].split('.')[-1] for c in transitions], ['retrying','failed','recovered'])
+        self.assertEqual(transitions[-1].kwargs['failed_attempts'], 3)
+        self.assertEqual(transitions[-1].kwargs['retry_elapsed_s'], 6)
+        self.assertEqual(transitions[-1].kwargs['last_winerror'], 31)
+
+    def test_short_usb_retry_never_turns_red_and_first_success_is_recorded_once(self):
+        failure = OSError('USB control transfer failed')
+        failure.winerror = 31
+        host, candidates = self.scan([(100,True,None),(101,failure,None),(102,failure,None),(103,True,None),
+                                      (104,True,None)])
+        self.assertEqual([v['device_states']['can'] for v in candidates], ['READY','CONNECTING','READY','READY'])
+        changes = [c.args[0].split('.')[-1] for c in host.diagnostics.current.event.call_args_list
+                   if c.args[0].startswith('devices.can.handshake.')]
+        self.assertEqual(changes, ['ready','retrying','recovered'])
 
     def test_one_continuous_second_of_clean_misses_unlocks_changeover(self):
         host, candidates = self.scan([(100,True,None),(100.25,False,None),(100.6,False,None),

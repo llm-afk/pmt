@@ -344,7 +344,8 @@ class HealthTests(unittest.TestCase):
              patch('scripts.factory_test.device_status.json_http',return_value=dict(data=dict(online=True))):
             result=DeviceHealth().check(StationConfig(simulation=False,adapter_sn='adapter'))
         self.assertEqual(detect_power.call_args.kwargs['ports'],['COM2'])
-        self.assertTrue(all(v['state']=='READY' for v in result.values()))
+        self.assertEqual(result['can']['state'], 'CONNECTING')
+        self.assertTrue(all(result[k]['state']=='READY' for k in ('dyno','power','printer')))
         power.enable.assert_not_called()
         power.disable.assert_not_called()
         power.set_voltage.assert_not_called()

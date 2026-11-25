@@ -58,6 +58,7 @@ class Maintenance:
     def __init__(self, config, cancelled=lambda: False, bench_factory=Bench, *, diagnostic_poll=False, progress=lambda message:None):
         self.config, self.cancelled, self.bench_factory = config, cancelled, bench_factory
         self.diagnostic_poll = diagnostic_poll
+        self.discovery_opened_at = None
         self.progress = progress
 
     def event(self, name, **details):
@@ -185,6 +186,7 @@ class Maintenance:
             return sn
 
     def discover(self, *, exhaustive=False, fallback=True, recent_ids=(), fallback_ids=None):
+        self.discovery_opened_at = None
         if self.diagnostic_poll:
             with idle_poll('motor',dict(adapter_sn=self.config.adapter_sn,target_id=self.config.target_id)):
                 return self._discover(exhaustive=exhaustive,fallback=fallback,recent_ids=recent_ids,fallback_ids=fallback_ids)
@@ -199,6 +201,7 @@ class Maintenance:
         started = time.perf_counter()
         self.event('discovery.start', preferred_ids=preferred, exhaustive=exhaustive, fallback=fallback)
         with self.connect(1) as bench:
+            self.discovery_opened_at = time.monotonic()
             found = []
             scanned, timeouts = [], []
             def find(nodes):

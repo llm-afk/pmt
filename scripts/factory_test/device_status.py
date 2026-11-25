@@ -14,7 +14,7 @@ def adapter_status(devices, selected=''):
         return status('OFFLINE', '请选择 CANable' if devices else '未检测到 CANable')
     matched = [item for item in devices if not selected or item['serial_number'] == selected]
     if len(matched) == 1:
-        return status('READY', matched[0]['serial_number'])
+        return status('CONNECTING', '已发现 CANable，正在建立通信 · '+selected)
     if selected and devices and not matched:
         return status('OFFLINE', f'绑定 SN {selected}；当前 ' + ', '.join(d['serial_number'] for d in devices))
     return status('OFFLINE', '未检测到 CANable' if not devices else '发现多只 CANable，请配置指定 SN')
@@ -28,6 +28,50 @@ def inventory_status(inventory, selected):
     if inventory.get('error'):
         return status('ERROR', 'USB 枚举失败：'+str(inventory['error']))
     return adapter_status(inventory['devices'], selected)
+
+
+class AdapterHandshake:
+    """One selected USB connection. Enumeration permits probing, an actual reply confirms it."""
+    def __init__(self):
+        self.started = time.monotonic()
+        self.state = 'CONNECTING'
+        self.first_failure = None
+        self.failures = 0
+        self.winerror = None
+
+    def observe(self, at, error=None):
+        previous = self.state
+        if error is None:
+            if previous == 'READY':
+                return None
+            event = 'recovered' if self.failures else 'ready'
+            self.state = 'READY'
+        else:
+            self.failures += 1
+            self.winerror = getattr(error, 'winerror', None)
+            if self.first_failure is None:
+                self.first_failure = at
+            self.state = 'ERROR' if self.failures >= 2 and at-self.first_failure >= 5.0 else 'CONNECTING'
+            if self.failures > 1 and previous == self.state:
+                return None
+            event = 'failed' if self.state == 'ERROR' else 'retrying'
+        details = dict(failed_attempts=self.failures, elapsed_s=round(max(0, at-self.started), 3),
+                       retry_elapsed_s=round(at-self.first_failure, 3) if self.first_failure is not None else 0,
+                       last_winerror=self.winerror)
+        if error is None:
+            self.first_failure = self.winerror = None
+            self.failures = 0
+        return event, details
+
+    def info(self, serial):
+        if self.state == 'READY':
+            return status('READY', serial)
+        if self.state == 'ERROR':
+            code = f'（Windows {self.winerror}）' if self.winerror is not None else ''
+            return status('ERROR', 'CANable USB 通信持续失败'+code+'，正在自动重试')
+        if self.failures:
+            return status('CONNECTING', '已发现 CANable，正在重试 USB 通信 · '+serial)
+        return status('CONNECTING', '已发现 CANable，正在建立通信 · '+serial)
 
 
 class ConnectionCheck:
@@ -274,7 +318,8 @@ class DeviceHealth:
         self._power_reading = values
         return reading
 
-    def check(self, config, *, emit=None, cancelled=None, generation=None, inventory_emit=None, adapter_inventory=None):
+    def check(self, config, *, emit=None, cancelled=None, generation=None, inventory_emit=None,
+              adapter_inventory=None, handshake_info=None):
         def check_stop():
             if cancelled is not None and cancelled():
                 self.release('probe_cancelled')
@@ -313,8 +358,11 @@ class DeviceHealth:
         else:
             devices, error = adapter_inventory['devices'], adapter_inventory.get('error')
         info = inventory_status(adapter_inventory, config.adapter_sn)
+        if info['state']=='CONNECTING' and handshake_info is not None:
+            info = handshake_info
         serials = tuple(item['serial_number'] for item in devices)
-        record_probe('can', info, 'CAN_'+info['state'], started, dict(devices=devices,selected=config.adapter_sn),
+        code = 'CAN_ENUMERATED' if info['state']=='CONNECTING' else 'CAN_'+info['state']
+        record_probe('can', info, code, started, dict(devices=devices,selected=config.adapter_sn),
                      route=(config.adapter_sn,serials),error=error)
         report('can', info)
         # The local print service has no serial dependencies. Its worker can run

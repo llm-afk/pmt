@@ -228,6 +228,7 @@ class ReadinessSamplingTests(unittest.TestCase):
             return ready
         def discover(*args,**kwargs):
             order.append('motor')
+            maintenance.return_value.discovery_opened_at=time.monotonic()
             if live[0] is None:raise MotorAbsent('no response')
             return live[0]
         host.device_health.check.side_effect=health

@@ -20,7 +20,7 @@ from .station_config import (StationConfig, MATERIALS, JOINT_NODE_IDS,
 from .station import StationRunner, PresenceLatch, STEPS, completed_on_station
 from .measurements.console import WindowConsole
 from .maintenance import Maintenance, MotorAbsent, MultipleMotors, MotorIdentityUnreadable
-from .device_status import DeviceHealth, AdapterMonitor, ConnectionCheck, inventory_status
+from .device_status import AdapterHandshake, DeviceHealth, AdapterMonitor, ConnectionCheck, inventory_status
 from .diagnostics import DiagnosticLogs, log_scope, log_event, error_details, LOCAL_TIME, unconfirmed_cleanup_notes
 from .service_credentials import CredentialStore, CredentialStoreError, FIELDS as SECRET_FIELDS
 from tkinter.scrolledtext import ScrolledText
@@ -188,7 +188,7 @@ class FactoryWindow:
         self.last_health = 0.0
         self.adapter_monitor = None
         self.adapter_generation = 0
-        self.adapter_open_failed = False
+        self.adapter_handshake = AdapterHandshake()
         self.adapter_devices = None
         self.adapter_error = None
         from .operator_view import build_view
@@ -398,8 +398,13 @@ class FactoryWindow:
     def show_adapter_status(self):
         info = inventory_status(getattr(self,'adapter_inventory',None), self.config.adapter_sn)
         if info:
-            if info['state']=='READY' and getattr(self,'adapter_open_failed',False):
-                info = dict(state='ERROR',detail='Windows 已识别 CANable，USB 通信接口暂不可用，正在重试')
+            if info['state']=='CONNECTING':
+                if self.busy:
+                    return
+                with self.lock:
+                    info = self.adapter_handshake.info(self.config.adapter_sn)
+                if self.page=='production' and not self.config.automatic:
+                    info = dict(state='WAITING',detail='已发现 CANable，设备监视已暂停 · '+self.config.adapter_sn)
             self.device_state('can', info['state'], info['detail'])
             if self.terminal_prompt and self.latch.wait_removal and not self.busy and self.page=='production':
                 self.show_idle_prompt(dict(waiting_removal=True, device_states={'can':info['state']}))
@@ -488,6 +493,7 @@ class FactoryWindow:
             if inventory is not None:
                 self.adapter_inventory = inventory
             self.adapter_generation += 1
+            self.adapter_handshake = AdapterHandshake()
             self.latch.reset_observations()
             self.last_health = 0
             if self.busy:
@@ -576,6 +582,7 @@ class FactoryWindow:
             self.page = name
             self.start_requested = self.resume_requested = self.ready_to_start = False
             self.mode_generation += 1
+            self.adapter_handshake = AdapterHandshake()
         WindowConsole.cancelled.set()
         self.control_page.leave()
         self.production_page.pack_forget()
@@ -625,6 +632,7 @@ class FactoryWindow:
             self.latch.reset_observations()
             WindowConsole.cancelled.clear()
             self.production_pause.clear()
+            self.show_adapter_status()
             if getattr(self,'terminal_prompt',None):
                 self.set_prompt(*self.terminal_prompt)
             else:
@@ -660,9 +668,9 @@ class FactoryWindow:
         if self.device_display.get(name)==(state,detail):
             return
         self.device_display[name]=(state,detail)
-        titles={'READY':'已连接','OFFLINE':'未连接','ERROR':'连接异常','SIMULATED':'模拟就绪',
+        titles={'READY':'已连接','CONNECTING':'连接中','OFFLINE':'未连接','ERROR':'连接异常','SIMULATED':'模拟就绪',
                 'CHECKING':'检测中','IN_USE':'测试使用中','UNKNOWN':'待确认','WAITING':'等待检测','STANDBY':'工序待用'}
-        colors={'READY':'#138365','SIMULATED':'#138365','ERROR':'#C13F50','OFFLINE':'#8491A4',
+        colors={'READY':'#138365','CONNECTING':'#B27813','SIMULATED':'#138365','ERROR':'#C13F50','OFFLINE':'#8491A4',
                 'CHECKING':'#2563EB','IN_USE':'#2563EB','UNKNOWN':'#B27813','STANDBY':'#8491A4'}
         route=str(detail)
         if name in ('dyno','power') and state in ('READY','IN_USE'):
@@ -692,6 +700,8 @@ class FactoryWindow:
 
     def invalidate_readiness(self, devices=None):
         devices = {'can','motor','dyno','power','printer'} if devices is None else set(devices)
+        if 'can' in devices:
+            self.adapter_handshake = AdapterHandshake()
         if devices:
             self.last_health = 0.0
             self.health_states = {k:v for k,v in self.health_states.items() if k not in devices}
@@ -1104,6 +1114,7 @@ class FactoryWindow:
                 revision, mode_generation = self.config_revision, self.mode_generation
                 adapter_generation = getattr(self, 'adapter_generation', 0)
                 inventory = getattr(self, 'adapter_inventory', None)
+                handshake_info = self.adapter_handshake.info(config.adapter_sn) if inventory and config.adapter_sn else None
                 generation = dict(config_revision=revision, mode_generation=mode_generation, adapter_generation=adapter_generation)
                 if self.drivers_blocking():
                     # Re-emit the current operator prompt when driver preparation ends.
@@ -1144,7 +1155,7 @@ class FactoryWindow:
                         health = self.device_health.check(config,
                             emit=lambda name,info:self.events.put(('device_health',dict(name=name,info=info,
                                 **generation))),cancelled=self.station_cancelled,
-                                generation=(mode_generation,), adapter_inventory=inventory,
+                                generation=(mode_generation,), adapter_inventory=inventory, handshake_info=handshake_info,
                                 inventory_emit=lambda info:self.events.put(('serial_inventory',dict(info,**generation))))
                     with self.lock:
                         if (self.configuring or revision != self.config_revision or config != self.config
@@ -1169,20 +1180,22 @@ class FactoryWindow:
                         continue
                 motor_state, detail = 'unavailable', '请连接或选择 CAN 适配器'
                 adapter_info = inventory_status(inventory, config.adapter_sn)
+                opened_at = adapter_failure = None
                 detected, detected_id = '', None
                 if config.simulation:
                     motor_state = 'present' if self.demo_present else 'absent'
                     if self.demo_present:
                         detected, detected_id = 'DEMO-UNPROGRAMMED', 1
                     detail = '离线模拟反馈'
-                elif config.adapter_sn and (adapter_info is None or adapter_info['state']=='READY'):
+                elif config.adapter_sn and (adapter_info is None or adapter_info['state']=='CONNECTING'):
                     config.validate()
                     extra_ids = [n for n in (recent_node, probe_latch.finished_node if probe_latch.wait_removal else None)
                                  if n is not None]
                     fallback_ids = range(next_scan_id, min(next_scan_id+12,128))
+                    maintenance = Maintenance(config,self.station_cancelled,diagnostic_poll=True)
                     try:
                         with log_scope(self.diagnostics.current.bind(phase='discovery')):
-                            incoming = Maintenance(config,self.station_cancelled,diagnostic_poll=True).discover(
+                            incoming = maintenance.discover(
                                 fallback=not probe_latch.wait_removal, recent_ids=extra_ids, fallback_ids=fallback_ids)
                         detected, detected_id = incoming['sn'], incoming['node_id']
                         next_scan_id = 1
@@ -1191,7 +1204,12 @@ class FactoryWindow:
                         raise
                     except (OSError, RuntimeError, ValueError) as exc:
                         detail = str(exc)
-                        if isinstance(exc, MotorAbsent):
+                        cause = exc.__cause__ if isinstance(exc, MotorIdentityUnreadable) and exc.__cause__ else exc
+                        usb_control = (getattr(cause, 'diagnostic_context', None) or {}).get('operation')=='WinUsb_ControlTransfer'
+                        if maintenance.discovery_opened_at is None or getattr(cause, 'winerror', None) is not None or usb_control:
+                            motor_state, adapter_failure = 'adapter_error', cause
+                            detail = '等待 CANable 的 USB 通信恢复'
+                        elif isinstance(exc, MotorAbsent):
                             motor_state = 'absent'
                             if not probe_latch.wait_removal:
                                 next_scan_id = fallback_ids.stop if fallback_ids.stop<128 else 1
@@ -1199,10 +1217,9 @@ class FactoryWindow:
                             motor_state = 'multiple'
                         elif isinstance(exc, MotorIdentityUnreadable):
                             motor_state, detected_id = 'identity_error', exc.node_id
-                        elif isinstance(exc, OSError) and getattr(exc, 'winerror', None) in (2,5,31,32,1167):
-                            motor_state = 'adapter_error'
                         else:
                             motor_state = 'error'
+                    opened_at = maintenance.discovery_opened_at
                 if self.station_cancelled():
                     raise InterruptedError('产测已暂停，正在交接连接')
                 with self.lock:
@@ -1210,6 +1227,24 @@ class FactoryWindow:
                             or mode_generation != self.mode_generation or probe_latch is not self.latch
                             or adapter_generation != getattr(self, 'adapter_generation', 0)):
                         continue
+                    can_info = adapter_info
+                    transition = None
+                    if adapter_failure is not None or opened_at is not None:
+                        handshake = self.adapter_handshake
+                        transition = (handshake.observe(time.monotonic(), adapter_failure) if adapter_failure is not None
+                                      else handshake.observe(opened_at))
+                        can_info = handshake.info(config.adapter_sn)
+                    if can_info is not None and not config.simulation:
+                        self.health_states = dict(self.health_states, can=can_info)
+                if transition:
+                    change, timing = transition
+                    label = {'ready':'USB 握手已确认','retrying':'USB 通信暂未就绪，正在重试',
+                             'failed':'USB 通信持续失败','recovered':'USB 通信已恢复'}[change]
+                    self.diagnostics.current.event('devices.can.handshake.'+change, label,
+                        level={'failed':'ERROR','retrying':'WARNING'}.get(change,'INFO'),
+                        adapter_sn=config.adapter_sn, **timing)
+                    if change=='recovered':
+                        self.events.put(('logged_line',f"[CAN 适配器] USB 通信已恢复，首次失败后 {timing['retry_elapsed_s']:.2f} 秒，期间失败 {timing['failed_attempts']} 次。"))
                 adapter_paths = tuple(item.get('path') for item in (getattr(self,'adapter_devices',None) or ())
                                       if item.get('serial_number') == config.adapter_sn)
                 response_key = (revision, mode_generation, adapter_generation, config.adapter_sn, adapter_paths,
@@ -1218,7 +1253,7 @@ class FactoryWindow:
                     last_motor_response = None
                 observed_at = time.monotonic()
                 observed_presence = {'present':True,'absent':False}.get(motor_state)
-                failed = not config.simulation and motor_state in ('absent','error','identity_error','adapter_error')
+                failed = not config.simulation and motor_state in ('absent','error','identity_error')
                 confirming = motor_loss.confirming(response_key, failed, observed_at,
                         last_success=last_motor_response[1] if last_motor_response else None)
                 if motor_state == 'present' and not config.simulation:
@@ -1239,9 +1274,12 @@ class FactoryWindow:
                 observation = present if motor_state in ('present','absent') else None
                 probe = dict(motor_probe=motor_state, motor_detail=detail, present=present,
                              node_id=detected_id, sn=detected, target_id=config.target_id, **generation)
+                if can_info is not None and not config.simulation:
+                    probe['can_status'] = can_info
                 known_connection = self.diagnostics.current.context.get('connection_id')
                 probe.update(connection_id=known_connection, waiting_removal=probe_latch.wait_removal)
-                preview_key = (revision, mode_generation, adapter_generation, motor_state, detail, detected_id, detected, probe_latch.wait_removal)
+                preview_key = (revision, mode_generation, adapter_generation, motor_state, detail, detected_id, detected,
+                               can_info, probe_latch.wait_removal)
                 if preview_key != last_probe_key:
                     self.events.put(('motor_probe', probe.copy()))
                     last_probe_key = preview_key
@@ -1288,8 +1326,6 @@ class FactoryWindow:
                 with self.lock:
                     health_snapshot = dict(self.health_states)
                 states = {name:info['state'] for name,info in health_snapshot.items()}
-                if adapter_info is not None and not config.simulation:
-                    states['can'] = adapter_info['state']
                 self.diagnostics.record_health(health_snapshot)
                 needed = [] if config.simulation else [key for key in ('can','dyno','power','printer') if states.get(key)!='READY']
                 if not config.simulation:
@@ -1453,7 +1489,9 @@ class FactoryWindow:
             finally:
                 self.scan_in_progress = False
                 if self.busy:
-                    self.busy = False
+                    with self.lock:
+                        self.busy = False
+                        self.adapter_handshake = AdapterHandshake()
                     self.events.put(('busy',False))
 
     def reset_workpiece_progress(self):
@@ -1481,7 +1519,7 @@ class FactoryWindow:
             title,hint,color = self.terminal_prompt
             if candidate and candidate.get('waiting_removal') and title!='请先断开工装电源':
                 can = candidate.get('device_states',{}).get('can')
-                if can in ('CHECKING','ERROR','OFFLINE') or candidate.get('motor_probe')=='adapter_error':
+                if can in ('CHECKING','CONNECTING','ERROR','OFFLINE') or candidate.get('motor_probe')=='adapter_error':
                     if color=='#138365':
                         title,hint,color = '等待 CANable 恢复连接', title+'。USB 恢复后自动识别下一台。', '#B27813'
                     else:
@@ -1503,11 +1541,14 @@ class FactoryWindow:
     def candidate_prompt(value, *, next_motor=False):
         blockers=value.get('blockers',())
         probe=value.get('motor_probe')
+        can = value.get('can_status',{})
+        if can.get('state')=='CONNECTING':
+            return '正在连接 CANable，请稍候', can['detail']
         if probe=='station_error':
             return '工位检查异常，请联系工程人员','开测已暂停，具体错误见下方日志。'
         if value.get('device_states',{}).get('can') == 'CHECKING':
             return '正在确认 CAN 适配器，请稍候','正在重新枚举 USB 设备。'
-        if probe=='adapter_error':
+        if probe=='adapter_error' or can.get('state')=='ERROR':
             return 'CANable 暂不可用，正在重连','请检查适配器的 USB 连接。恢复后工位会自动识别电机。'
         if probe=='unavailable' or 'can' in blockers:
             return '请检查 CAN 适配器','确认 USB 已接好。接有多只适配器时，请在工位设备中选择本工位的 CANable。'
@@ -1580,6 +1621,7 @@ class FactoryWindow:
         try:
             if lag>=5 and not self.busy and not self.closing and self.page=='production' and self.dependencies_ready:
                 self.restart_idle_probes()
+                self.show_adapter_status()
                 self.diagnostics.current.event('devices.monitor.resumed','监视长时间未刷新，正在重新确认工位设备',
                                                gap_s=round(lag,2))
             self.process_events()
@@ -1733,11 +1775,9 @@ class FactoryWindow:
                 self.settings_notice.set(('诊断包已保存至 ' if ok else '诊断包导出失败：')+detail)
             elif kind in ('motor_probe','candidate'):
                 probe=value.get('motor_probe') or ('present' if value['present'] else 'absent')
-                if not self.busy and not self.config.simulation and probe in ('adapter_error','present','absent'):
-                    open_failed = probe=='adapter_error'
-                    if open_failed != getattr(self,'adapter_open_failed',False):
-                        self.adapter_open_failed = open_failed
-                        self.show_adapter_status()
+                if not self.busy and 'can_status' in value:
+                    can_info = value['can_status']
+                    self.device_state('can', can_info['state'], can_info['detail'])
                 if probe!='station_error':
                     motor_states={'present':'SIMULATED' if self.config.simulation else 'READY','absent':'OFFLINE',
                                   'multiple':'ERROR','identity_error':'ERROR','error':'ERROR','adapter_error':'WAITING',
