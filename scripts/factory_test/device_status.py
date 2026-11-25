@@ -20,6 +20,16 @@ def adapter_status(devices, selected=''):
     return status('OFFLINE', '未检测到 CANable' if not devices else '发现多只 CANable，请配置指定 SN')
 
 
+def inventory_status(inventory, selected):
+    if inventory is None:
+        return None
+    if inventory.get('checking'):
+        return status('CHECKING', '正在复核 CANable USB 连接')
+    if inventory.get('error'):
+        return status('ERROR', 'USB 枚举失败：'+str(inventory['error']))
+    return adapter_status(inventory['devices'], selected)
+
+
 class ConnectionCheck:
     """Require repeated failed observations spanning the grace period on the same route."""
     def __init__(self, grace=3.0):
@@ -299,12 +309,11 @@ class DeviceHealth:
                 devices = Canable.detect()
             except Exception as exc:
                 error = exc
+            adapter_inventory = dict(devices=devices,error=error)
         else:
             devices, error = adapter_inventory['devices'], adapter_inventory.get('error')
-        info = status('ERROR', str(error)) if error is not None else adapter_status(devices, config.adapter_sn)
+        info = inventory_status(adapter_inventory, config.adapter_sn)
         serials = tuple(item['serial_number'] for item in devices)
-        if adapter_inventory is not None and adapter_inventory.get('checking'):
-            info = status('CHECKING', '正在复核 CANable USB 连接')
         record_probe('can', info, 'CAN_'+info['state'], started, dict(devices=devices,selected=config.adapter_sn),
                      route=(config.adapter_sn,serials),error=error)
         report('can', info)
@@ -367,7 +376,10 @@ class DeviceHealth:
             elif not candidates:
                 info, code = status('OFFLINE', '未找到可用串口' if config.dyno_port=='auto' else config.dyno_port+' 未枚举'), 'DYNO_PORT_ABSENT'
             elif any(item.get('error') or item.get('fault') for item in observed):
-                info, code = status('ERROR','测功机串口访问异常，详见日志'), 'DYNO_PORT_ERROR'
+                unopened = [item['port'] for item in observed if not item.get('opened') and item.get('error')]
+                detail = ('、'.join(unopened)+' 已枚举，暂时无法打开，正在重试' if unopened
+                          else '测功机串口读取异常，正在重试')
+                info, code = status('ERROR',detail), 'DYNO_PORT_ERROR'
             elif any(item.get('rx_bytes',0) for item in observed):
                 info, code = status('OFFLINE','收到串口数据，有效反馈帧不足'), 'DYNO_FRAMES_INSUFFICIENT'
             else:
@@ -384,26 +396,29 @@ class DeviceHealth:
 
         started = time.monotonic()
         candidates = [p for p in ports if p not in dyno_matches and p != config.dyno_port]
+        # While the dynamometer is being identified, only the already-open, identified
+        # supply handle is safe to query in auto mode. Never reopen a port by number here.
+        held_supply = (not self.dyno_port and config.power_port=='auto' and self._power is not None
+                       and self.power_port in candidates and self._power_route and self._power_route[0]=='auto'
+                       and self._power_matches==(self.power_port,) and not self.release_error)
         if not self.dyno_port:
-            candidates = [p for p in candidates if p == config.power_port]
+            candidates = [self.power_port] if held_supply else [p for p in candidates if p == config.power_port]
         power_matches = ()
         observed = []
         evidence = dict(configured_port=config.power_port, excluded_dyno_port=self.dyno_port,
                         candidates=candidates, observations=observed, query_timeout_s=.2)
         error = None
-        if not self.dyno_port and config.power_port == 'auto':
-            # During one missed dynamometer scan keep the identified idle handle,
-            # but never send a supply query until the serial routes are confirmed.
-            if result['dyno']['state'] != 'CHECKING':
+        if not self.dyno_port and config.power_port == 'auto' and not held_supply:
+            if self._power is not None or result['dyno']['state'] != 'CHECKING':
                 self.release('dyno_not_identified')
-            info, code = status('WAITING', '等待测功机串口识别'), 'POWER_WAIT_DYNO'
+            info, code = status('WAITING', '等待测功机识别后再探测电源'), 'POWER_WAIT_DYNO'
             evidence.update(candidates=[],query_attempted=False)
         else:
             try:
                 evidence['query_attempted'] = bool(candidates)
                 route = (config.power_port, tuple(sorted(candidates)), self.dyno_port)
                 rescan = len(candidates) > len(self._power_matches) and time.monotonic() >= self._power_scan_at
-                if self._power is not None and (route != self._power_route or rescan):
+                if self._power is not None and not held_supply and (route != self._power_route or rescan):
                     self.release('serial_route_changed')
                 reused = self._power is not None
                 if reused:

@@ -217,8 +217,18 @@ def check_operator_actions(window, summary):
         deliver('candidate', waiting)
         assert window.banner.get()==terminal
         assert not window.ready_to_start and str(window.stop.cget('state'))=='disabled'
+        deliver('candidate', dict(waiting, motor_probe='unavailable', present=False, device_states={'can':'OFFLINE'}))
+        message = window.banner.get()+window.hint.get()
+        if outcome=='stop_unconfirmed':
+            assert window.banner.get()==terminal and '断开工装电源' in message
+        else:
+            assert 'CANable' in message and ('核对标签' in message or '勿补打' in message)
+        deliver('candidate', waiting)
+        assert window.banner.get()==terminal
         window.latch.observe(False, 0)
-        window.latch.observe(False, 3)
+        window.latch.observe(False, .5)
+        window.latch.observe(False, 1)
+        assert not window.latch.wait_removal
         deliver('removed', dict(config_revision=window.config_revision,mode_generation=window.mode_generation))
         deliver('candidate', candidate('absent', blockers=['motor'], connection_id=None, node_id=None, sn=''))
         assert '接入' in window.banner.get() and '下一台' in window.banner.get()
@@ -527,6 +537,8 @@ def run(destination):
             window.select_single_adapter()
             assert window.config.adapter_sn == 'self-check-can-b'
             window.update_adapters(dict(devices=[],error=None))
+            assert window.vars['adapter_sn'].get()=='' and load_config(config_path).adapter_sn=='self-check-can-b'
+            assert window.apply_config(commit_services=True) and load_config(config_path).adapter_sn=='self-check-can-b'
             window.scan_in_progress=True
             window.switch_page('control')
             assert window.page=='control' and window.pending_page=='control'
@@ -882,7 +894,7 @@ def run(destination):
                           operator_manual=True,operator_manual_chapters=len(window.help_view.chapters),
                           production_defaults=True, single_production_ui=True, adapter_auto_selection=True,
                           adapter_dropdown_live=True, adapter_online_choices_only=True,
-                          adapter_manual_selection=True, adapter_unplug_clears_selection=True,
+                          adapter_manual_selection=True, adapter_unplug_keeps_binding=True,
                           adapter_single_auto_connect=True, adapter_busy_change_deferred=True,
                           mode_handoff_async=True, debug_auto_connect=True, gui_event_processing_bounded=True,
                           debug_monitor_on_connect=True,debug_settings_accessible=True,version_display=True,

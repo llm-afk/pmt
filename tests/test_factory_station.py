@@ -305,6 +305,10 @@ class MaintenanceTests(unittest.TestCase):
         with self.assertRaises(MotorAbsent):
             maintenance.discover(fallback=False, recent_ids=(7,))
         self.assertEqual([call.args[1] for call in maintenance.read.call_args_list], [1,3,7])
+        maintenance.read.reset_mock()
+        with self.assertRaises(MotorAbsent):
+            maintenance.discover(fallback_ids=range(40,43))
+        self.assertEqual([call.args[1] for call in maintenance.read.call_args_list], [1,3,40,41,42])
         maintenance.read = Mock(side_effect=[1,SdoReplyTimeout()])
         bench._bus.motor.return_value.read_serial_bytes.side_effect = SdoReplyTimeout('SN')
         with self.assertRaises(MotorIdentityUnreadable) as caught:
@@ -332,7 +336,7 @@ class MaintenanceTests(unittest.TestCase):
             if node in (1,7): return node
             raise SdoReplyTimeout()
         maintenance.read=Mock(side_effect=read)
-        with self.assertRaisesRegex(RuntimeError,'多个'): maintenance.discover(exhaustive=True)
+        with self.assertRaisesRegex(RuntimeError,'多个'): maintenance.discover(exhaustive=True,fallback_ids=range(30,33))
         self.assertEqual(maintenance.read.call_count,127)
 
     def test_assign_id_uses_platform_specific_reboot_and_verifies_target(self):

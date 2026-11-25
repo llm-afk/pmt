@@ -13,7 +13,7 @@ from motor_platform import PowerSupply
 from .integrations import IntegrationError, MesClient, PrinterClient, PendingConfiguration, PrintUnknown, mes_payload
 from .network_status import NetworkLost
 from .maintenance import Maintenance
-from .station_config import StationConfig, atomic_json, state_root
+from .station_config import StationConfig, atomic_json, state_root, stored_sn_kind
 from .diagnostics import current_log, log_event, log_scope, error_details
 
 
@@ -773,36 +773,56 @@ class StationRunner:
 
 
 class PresenceLatch:
-    """完成/失败后要求持续离线；USB 短暂抖动不会触发同一件重测。"""
-    def __init__(self, absence_seconds=2.0):
+    """Confirm removal on a working route, or a stable, distinguishable replacement."""
+    def __init__(self, absence_seconds=1.0):
         self.absence_seconds = absence_seconds
-        self.identity = None
         self.wait_removal = False
+        self.finished_adapter = self.finished_sn = self.finished_node = None
+        self.reset_observations()
+
+    def reset_observations(self):
+        self.identity = None
+        self.last_observation = None
         self.absent_since = None
         self.stable = 0
 
-    def completed(self):
+    def completed(self, adapter=None, verified_sn=None, node=None):
         self.wait_removal = True
-        self.absent_since = None
-        self.stable = 0
+        self.finished_adapter, self.finished_sn, self.finished_node = adapter, verified_sn, node
+        self.reset_observations()
+
+    def different_motor(self):
+        if not self.finished_adapter or not self.identity:
+            return False
+        adapter, _, sn = self.identity
+        if adapter != self.finished_adapter or sn == self.finished_sn:
+            return False
+        kinds = (stored_sn_kind(self.finished_sn), stored_sn_kind(sn))
+        return 'existing' in kinds and 'unknown' not in kinds
+
+    @property
+    def prioritizes_motor(self):
+        return self.wait_removal and (self.last_observation is None or self.absent_since is not None
+                                     or (self.stable == 1 and self.different_motor()))
 
     def observe(self, present, now, identity=None):
-        if present is None:
-            # An unusable adapter, bus fault or unreadable identity is no evidence of removal.
+        # A sleep/resume or a long-running read breaks a consecutive sample window.
+        if self.wait_removal and self.last_observation is not None and now-self.last_observation > 1.5*self.absence_seconds:
+            self.reset_observations()
+        self.last_observation = now
+        if present:
             self.absent_since = None
-            self.stable = 0
-            return False
-        if self.wait_removal:
-            if present:
-                self.absent_since = None
-            elif self.absent_since is None:
+            self.stable = self.stable+1 if self.identity == identity else 1
+            self.identity = identity
+            if self.wait_removal and self.stable >= 2 and self.different_motor():
+                self.wait_removal = False
+            return not self.wait_removal and self.stable == 2
+        self.identity, self.stable = None, 0
+        if present is False and self.wait_removal:
+            if self.absent_since is None:
                 self.absent_since = now
             elif now-self.absent_since >= self.absence_seconds:
                 self.wait_removal = False
-                self.stable = 0
-            return False
-        if present and self.identity is not None and self.identity != identity:
-            self.stable = 0
-        self.identity = identity if present else None
-        self.stable = self.stable+1 if present else 0
-        return self.stable == 2
+        else:
+            self.absent_since = None
+        return False

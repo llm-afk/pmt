@@ -92,13 +92,23 @@ def temporary_sn(hardware_version):
     return '0'*12+hardware_version+'0'*10
 
 
+def stored_sn_kind(sn):
+    """Classify a complete SN read, including the device's blank value."""
+    if sn == '未写入 SN' or sn == '0'*26:
+        return 'unassigned'
+    if not isinstance(sn, str) or not re.fullmatch(r'[A-Z0-9]{26}', sn):
+        return 'unknown'
+    return 'temporary' if sn[:12]=='0'*12 and sn[16:]=='0'*10 else 'existing'
+
+
 def compare_incoming_sn(sn, config):
     """Describe the stored product fields. An incoming SN is not proof of the fitted hardware."""
     expected = {key:getattr(config,key) for key in ('project','category','subcategory','factory','hardware_version')}
     observed = {}
-    kind = 'unassigned'
-    if isinstance(sn,str) and len(sn)==26 and sn != '0'*26:
-        kind = 'temporary' if sn[:12]=='0'*12 and sn[16:]=='0'*10 else 'existing'
+    kind = stored_sn_kind(sn)
+    if kind == 'unknown':
+        kind = 'unassigned'
+    if kind in ('temporary','existing'):
         observed['hardware_version'] = sn[12:16]
         if kind == 'existing':
             observed.update(project=sn[:2],category=sn[2:6],subcategory=sn[6:10],factory=sn[10:12])

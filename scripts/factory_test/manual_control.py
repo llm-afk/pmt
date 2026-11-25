@@ -13,6 +13,7 @@ from motor_platform import Bench, Canable, MitCommand
 from motor_platform.runtime import MOTOR_FEEDBACK_TIMEOUT_S, RuntimeShutdownError, start_monitoring
 from .version import VERSION_LABEL
 from .maintenance import Maintenance
+from .device_status import inventory_status
 from .station_config import hardware_parts, hardware_torque_limit
 from .diagnostics import current_log, log_event, log_scope, unconfirmed_cleanup_notes
 from .waveform import WaveformPlot, FRAME_INTERVAL, FEEDBACK_COLOR, TARGET_COLOR
@@ -547,6 +548,13 @@ class ControlPage:
             self.session.disconnect()
             self.message.set('CANable 已断开，正在释放调试连接…')
 
+    def adapter_available(self):
+        config = self.host.config
+        if config.simulation:
+            return True
+        info = inventory_status(getattr(self.host,'adapter_inventory',None), config.adapter_sn)
+        return bool(config.adapter_sn and (info is None or info['state']=='READY'))
+
     def tick(self):
         if (not self.want_connection or self.active or self.host.page != 'control'
                 or getattr(self.host,'settings_save_pending',False)
@@ -554,7 +562,7 @@ class ControlPage:
                 or self.host.pending_page is not None or not self.host.dependencies_ready
                 or self.host.shutdown.is_set() or self.host.busy or self.host.scan_in_progress or self.host.handoff_error):
             return
-        if not self.host.config.simulation and not self.host.config.adapter_sn:
+        if not self.adapter_available():
             text='等待 CANable；多只适配器时请在工位配置中选择'
             if self.message.get()!=text: self.message.set(text)
             return
@@ -574,7 +582,7 @@ class ControlPage:
         if self.active or self.host.busy or getattr(self.host,'settings_save_pending',False):
             self.message.set('设备正在使用中，请先停止并断开现有任务')
             return
-        if not self.host.config.simulation and not self.host.config.adapter_sn:
+        if not self.adapter_available():
             self.message.set('请先在工位配置中选择已探测到的 CANable')
             return
         if (self.host.pending_page is not None or self.host.scan_in_progress or self.host.handoff_error):

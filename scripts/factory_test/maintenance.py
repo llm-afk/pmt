@@ -184,13 +184,13 @@ class Maintenance:
             self.event('motor.sn.read.complete',node_id=self.config.target_id,sn=sn,raw=raw.hex())
             return sn
 
-    def discover(self, *, exhaustive=False, fallback=True, recent_ids=()):
+    def discover(self, *, exhaustive=False, fallback=True, recent_ids=(), fallback_ids=None):
         if self.diagnostic_poll:
             with idle_poll('motor',dict(adapter_sn=self.config.adapter_sn,target_id=self.config.target_id)):
-                return self._discover(exhaustive=exhaustive,fallback=fallback,recent_ids=recent_ids)
-        return self._discover(exhaustive=exhaustive,fallback=fallback,recent_ids=recent_ids)
+                return self._discover(exhaustive=exhaustive,fallback=fallback,recent_ids=recent_ids,fallback_ids=fallback_ids)
+        return self._discover(exhaustive=exhaustive,fallback=fallback,recent_ids=recent_ids,fallback_ids=fallback_ids)
 
-    def _discover(self, *, exhaustive=False, fallback=True, recent_ids=()):
+    def _discover(self, *, exhaustive=False, fallback=True, recent_ids=(), fallback_ids=None):
         """优先来料 ID=1 与工位 ID；无响应再只读扫描其余 1..127。"""
         preferred = [1]
         if self.config.target_id not in (None, 1):
@@ -216,12 +216,15 @@ class Maintenance:
                     found.append(node)
             find(preferred)
             if exhaustive or (not found and fallback):
-                find(node for node in range(1, 128) if node not in preferred)
+                nodes = range(1,128) if exhaustive or fallback_ids is None else fallback_ids
+                find(node for node in nodes if node not in preferred)
             self.event('discovery.scan', scanned_ids=scanned, responding_ids=found, timeout_ids=timeouts,
                       elapsed_s=round(time.perf_counter()-started,4))
             if len(found) != 1:
                 if found:
                     raise MultipleMotors('发现多个待测电机 ID：'+','.join(map(str, found))+'，请仅连接一台')
+                if fallback and not exhaustive and fallback_ids is not None:
+                    raise MotorAbsent('暂未收到电机响应，正在分批识别节点')
                 scope = '1～127' if fallback or exhaustive else '、'.join(map(str, preferred))
                 raise MotorAbsent(f'本轮探测未收到电机响应（ID {scope}）')
             node = found[0]

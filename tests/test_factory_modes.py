@@ -38,6 +38,7 @@ def window():
     host.handoff_error=''
     host.mode_generation=0
     host.config_revision=0
+    host.adapter_generation=0
     host.configuring=host.closing=False
     host.delivery_revision=0
     host.retiring_deliveries=[]
@@ -75,6 +76,32 @@ def window():
 
 
 class SelectionTests(unittest.TestCase):
+    def test_reenumeration_retains_binding_and_invalidates_previous_ready_event(self):
+        host = window()
+        host.terminal_prompt = None
+        host.devices = Mock()
+        host.devices.tk.getboolean.return_value = False
+        host.device_state = Mock()
+        host.vars = {'adapter_sn': Mock()}
+        host.vars['adapter_sn'].get.return_value = ''
+        host.latch.completed('chosen','C2HIPYLFRRXC02232611250003',2)
+        host.latch.observe(False,0)
+        previous = dict(config_revision=0,mode_generation=0,adapter_generation=host.adapter_generation)
+        with patch('scripts.factory_test.gui.save_config') as save:
+            host.update_adapters(dict(devices=[],error=None))
+            self.assertFalse(host.production_event_current(previous))
+            self.assertFalse(host.ready_to_start)
+            self.assertTrue(host.latch.wait_removal)
+            self.assertIsNone(host.latch.absent_since)
+            host.update_adapters(dict(devices=[dict(serial_number='chosen',path='p')],error=None))
+            save.assert_not_called()
+        self.assertEqual(host.config.adapter_sn,'chosen')
+        self.assertEqual(host.device_state.call_args.args,('can','READY','chosen'))
+        host.adapter_open_failed = True
+        host.show_adapter_status()
+        self.assertEqual(host.device_state.call_args.args[1],'ERROR')
+        self.assertIn('USB 通信接口',host.device_state.call_args.args[2])
+
     def test_single_adapter_is_selected_only_while_idle(self):
         host=window()
         host.config=StationConfig()
@@ -309,6 +336,16 @@ class DebugSettingsTests(unittest.TestCase):
 
 
 class DebugMonitoringTests(unittest.TestCase):
+    def test_saved_binding_waits_for_usb_to_reappear(self):
+        host = window()
+        page = ControlPage.__new__(ControlPage)
+        page.host = host
+        host.adapter_inventory = dict(devices=[],error=None)
+        self.assertFalse(page.adapter_available())
+        host.adapter_inventory = dict(checking=True,devices=[],error=None)
+        self.assertFalse(page.adapter_available())
+        host.adapter_inventory = dict(devices=[dict(serial_number='chosen',path='p')],error=None)
+        self.assertTrue(page.adapter_available())
     def make_session(self):
         session=ManualSession(StationConfig(adapter_sn='test-only'),1,lambda *args:None)
         session.profile_known=True
@@ -474,11 +511,12 @@ class DebugMonitoringTests(unittest.TestCase):
 
 
 class IdleMotorConfirmationTests(unittest.TestCase):
-    def scan(self, samples, *, wait_removal=False):
+    def scan(self, samples, *, wait_removal=False, verified_sn=None):
         from scripts.factory_test.maintenance import MotorAbsent
         host = window()
         host.credential_error = ''
         host.saved_credentials = dict(sn_api_key='offline-only')
+        host.storage_root = None
         host.start_requested = host.resume_requested = False
         host.diagnostics.current.context = dict(connection_id='same-connection')
         host.diagnostics.observe.return_value = host.diagnostics.current
@@ -488,7 +526,7 @@ class IdleMotorConfirmationTests(unittest.TestCase):
         host.device_health.check.return_value = ready
         host.device_health.printer.poll.return_value = ready['printer']
         if wait_removal:
-            host.latch.completed()
+            host.latch.completed('chosen', verified_sn)
         remaining = iter(samples)
         now = [0]
         response = [None]
@@ -505,12 +543,15 @@ class IdleMotorConfirmationTests(unittest.TestCase):
                 raise MotorAbsent('short probe timed out')
             if isinstance(response[0], Exception):
                 raise response[0]
+            if isinstance(response[0], str):
+                return dict(node_id=1, sn=response[0])
             return dict(node_id=1, sn=host.config.base_sn)
         host.shutdown = Mock()
         host.shutdown.is_set.return_value = False
         host.shutdown.wait.side_effect = wait
         with patch('scripts.factory_test.gui.time.monotonic', side_effect=lambda:now[0]), \
              patch('scripts.factory_test.gui.Maintenance') as maintenance, \
+             patch('scripts.factory_test.gui.completed_on_station', return_value=False), \
              patch('scripts.factory_test.firmware_library.load_target', return_value=(None,dict(file='APP_245.bin',sha256='offline'))), \
              patch('scripts.factory_test.gui.StationRunner') as runner:
             maintenance.return_value.discover.side_effect = discover
@@ -520,20 +561,58 @@ class IdleMotorConfirmationTests(unittest.TestCase):
         self.assertFalse(any(call.args[0]=='controller.exception' for call in host.diagnostics.current.event.call_args_list))
         return host, candidates
 
-    def test_short_timeout_is_confirming_and_does_not_start_the_removal_timer(self):
-        host, candidates = self.scan([(100,True,None),(100.6,False,None),
-                                     (101.2,False,None),(103.3,False,None)], wait_removal=True)
+    def test_one_continuous_second_of_clean_misses_unlocks_changeover(self):
+        host, candidates = self.scan([(100,True,None),(100.25,False,None),(100.6,False,None),
+                                     (101.05,False,None),(101.24,False,None),(101.26,False,None)], wait_removal=True)
         self.assertEqual([item['motor_probe'] for item in candidates], ['present','confirming','absent','absent'])
         self.assertFalse(candidates[1]['present'])
         self.assertFalse(candidates[1]['ready'])
         self.assertTrue(candidates[2]['waiting_removal'])
         self.assertFalse(candidates[3]['waiting_removal'])
-        self.assertEqual(host.latch.absence_seconds, 2)
+        self.assertEqual(host.latch.absence_seconds, 1)
+        self.assertEqual(sum(k=='removed' for k,_ in host.events.queue),1)
         observed = [call.args[0] for call in host.diagnostics.observe.call_args_list]
-        self.assertEqual(observed, [True,None,False,False])
+        self.assertEqual(observed, [True,None,None,False,False,False])
         title, hint = FactoryWindow.candidate_prompt(candidates[1])
         self.assertIn('确认', title)
         self.assertNotIn('检查接线', title + hint)
+
+    def test_same_motor_after_one_miss_and_usb_errors_keep_changeover_locked(self):
+        sn = 'C2HIPYLFRRXC02232611250003'
+        samples = [(100,sn,None),(100.3,False,None),(100.7,sn,None),
+                   (101,False,None),(101.4,OSError('USB unavailable'),None),(102,False,None),
+                   (102.3,False,None),(102.85,False,None)]
+        host, candidates = self.scan(samples,wait_removal=True,verified_sn=sn)
+        self.assertTrue(all(c['waiting_removal'] for c in candidates))
+        self.assertFalse(any(k=='removed' for k,_ in host.events.queue))
+
+    def test_quick_swap_requires_two_complete_distinct_reads_on_the_same_route(self):
+        old = 'C2HIPYLFRRXC02232611250003'
+        for new in ('未写入 SN','C2HIPYLFRRXC02232611250004',StationConfig().base_sn):
+            with self.subTest(new=new):
+                host, candidates = self.scan([(100,old,None),(100.3,new,None),(100.6,new,None)],
+                                            wait_removal=True,verified_sn=old)
+                self.assertTrue(candidates[-2]['waiting_removal'])
+                self.assertFalse(candidates[-1]['waiting_removal'])
+                self.assertFalse(candidates[-1]['ready'])
+                self.assertIn('stabilizing',candidates[-1]['blockers'])
+                host.diagnostics.finish_connection.assert_called_once_with('verified_replacement')
+        for old_sn, new in ((StationConfig().base_sn,'未写入 SN'),(old,'bad read'),(None,old),(old,old)):
+            with self.subTest(old=old_sn,new=new):
+                host,_ = self.scan([(100,new,None),(100.3,new,None)],wait_removal=True,verified_sn=old_sn)
+                self.assertTrue(host.latch.wait_removal)
+
+    def test_recovery_requires_new_samples_after_sleep_and_usb_inventory_loss(self):
+        def inventory(host, online):
+            host.adapter_generation += 1
+            host.adapter_inventory = dict(devices=host.adapter_devices if online else [], error=None)
+        host, candidates = self.scan([(100,False,None),(110,False,None),(110.3,False,lambda h:inventory(h,False)),
+            (115,False,lambda h:inventory(h,True)),(115.5,False,None),(115.9,False,None),(116.05,False,None)],
+            wait_removal=True)
+        self.assertIn('unavailable',[c['motor_probe'] for c in candidates])
+        self.assertTrue(all(c['waiting_removal'] for c in candidates[:-1]))
+        self.assertFalse(candidates[-1]['waiting_removal'])
+        host.diagnostics.finish_connection.assert_called_once_with('disconnect_confirmed')
 
     def test_first_probe_and_changed_context_never_reuse_presence(self):
         changes = (

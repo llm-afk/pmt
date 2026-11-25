@@ -20,7 +20,7 @@ from .station_config import (StationConfig, MATERIALS, JOINT_NODE_IDS,
 from .station import StationRunner, PresenceLatch, STEPS, completed_on_station
 from .measurements.console import WindowConsole
 from .maintenance import Maintenance, MotorAbsent, MultipleMotors, MotorIdentityUnreadable
-from .device_status import DeviceHealth, AdapterMonitor, ConnectionCheck, adapter_status
+from .device_status import DeviceHealth, AdapterMonitor, ConnectionCheck, inventory_status
 from .diagnostics import DiagnosticLogs, log_scope, log_event, error_details, LOCAL_TIME, unconfirmed_cleanup_notes
 from .service_credentials import CredentialStore, CredentialStoreError, FIELDS as SECRET_FIELDS
 from tkinter.scrolledtext import ScrolledText
@@ -187,6 +187,8 @@ class FactoryWindow:
         self.ui_timing = dict(ticks=0, max_lag_ms=0, max_work_ms=0, max_queue=0, stalls=0)
         self.last_health = 0.0
         self.adapter_monitor = None
+        self.adapter_generation = 0
+        self.adapter_open_failed = False
         self.adapter_devices = None
         self.adapter_error = None
         from .operator_view import build_view
@@ -394,15 +396,16 @@ class FactoryWindow:
         self.selection_changed(name)
 
     def show_adapter_status(self):
-        if (getattr(self,'adapter_inventory',None) or {}).get('checking'):
-            self.device_state('can', 'CHECKING', '正在复核 CANable USB 连接')
-        elif self.adapter_devices is not None:
-            info = (dict(state='ERROR', detail='USB 枚举失败：'+str(self.adapter_error)) if self.adapter_error
-                    else adapter_status(self.adapter_devices, self.config.adapter_sn))
+        info = inventory_status(getattr(self,'adapter_inventory',None), self.config.adapter_sn)
+        if info:
+            if info['state']=='READY' and getattr(self,'adapter_open_failed',False):
+                info = dict(state='ERROR',detail='Windows 已识别 CANable，USB 通信接口暂不可用，正在重试')
             self.device_state('can', info['state'], info['detail'])
+            if self.terminal_prompt and self.latch.wait_removal and not self.busy and self.page=='production':
+                self.show_idle_prompt(dict(waiting_removal=True, device_states={'can':info['state']}))
 
     def update_adapters(self, value):
-        self.adapter_inventory = value
+        self.restart_idle_probes(inventory=value)
         if value.get('checking'):
             self.show_adapter_status()
             return
@@ -418,8 +421,6 @@ class FactoryWindow:
         error = value.get('error')
         if error is None:
             self.control_page.observe_adapters(serials)
-            if self.config.adapter_sn and self.config.adapter_sn not in serials:
-                self.clear_adapter_selection()
             self.select_single_adapter()
             if self.vars['adapter_sn'].get() not in serials:
                 self.vars['adapter_sn'].set(self.config.adapter_sn if self.config.adapter_sn in serials else '')
@@ -442,11 +443,9 @@ class FactoryWindow:
                                       selected_serial=self.config.adapter_sn, error=error,
                                       level='WARNING' if error else 'INFO')
 
-    def clear_adapter_selection(self):
-        self.save_adapter_selection('', reason='adapter_removed')
-
     def select_single_adapter(self):
-        if (self.adapter_error is not None or self.adapter_devices is None or self.busy or self.closing
+        if (self.adapter_error is not None or (getattr(self,'adapter_inventory',None) or {}).get('checking')
+                or self.adapter_devices is None or self.busy or self.closing
                 or self.control_page.active or self.pending_page is not None):
             return
         if len(self.adapter_devices)>1 and self.config.adapter_auto_selected:
@@ -484,10 +483,23 @@ class FactoryWindow:
             with self.lock:
                 self.configuring = False
 
+    def restart_idle_probes(self, *, inventory=None):
+        with self.lock:
+            if inventory is not None:
+                self.adapter_inventory = inventory
+            self.adapter_generation += 1
+            self.latch.reset_observations()
+            self.last_health = 0
+            if self.busy:
+                return
+            self.start_requested = self.ready_to_start = False
+            self.ready_identity = None
+        self.stop.config(state='disabled')
+
     def debug_settings_require_restart(self):
         try:
             hardware = ''.join(hardware_input_value(part,self.hardware_vars[part].get()) for part in 'ABCD')
-            return (self.vars['adapter_sn'].get().strip() != self.config.adapter_sn or
+            return ((self.vars['adapter_sn'].get().strip() or self.config.adapter_sn) != self.config.adapter_sn or
                     hardware != self.config.hardware_version)
         except (AttributeError,KeyError,ValueError):
             return True
@@ -610,8 +622,7 @@ class FactoryWindow:
             self.control_page.enter()
         else:
             self.last_health=0.0
-            self.latch.stable=0
-            self.latch.absent_since=None
+            self.latch.reset_observations()
             WindowConsole.cancelled.clear()
             self.production_pause.clear()
             if getattr(self,'terminal_prompt',None):
@@ -685,8 +696,7 @@ class FactoryWindow:
             self.last_health = 0.0
             self.health_states = {k:v for k,v in self.health_states.items() if k not in devices}
         if 'motor' in devices:
-            self.latch.stable = 0
-            self.latch.absent_since = None
+            self.latch.reset_observations()
         self.ready_to_start = self.start_requested = self.resume_requested = False
         self.ready_identity = self.requested_identity = None
         if not self.busy:
@@ -701,6 +711,7 @@ class FactoryWindow:
     def production_event_current(self, value):
         return (not self.closing and not getattr(self,'updating',False) and not self.configuring and self.page == 'production'
             and self.pending_page is None and (self.busy or not self.drivers_blocking())
+            and ('adapter_generation' not in value or value['adapter_generation']==getattr(self,'adapter_generation',0))
             and value.get('config_revision',self.config_revision) == self.config_revision
             and value.get('mode_generation',self.mode_generation) == self.mode_generation)
 
@@ -734,6 +745,9 @@ class FactoryWindow:
                 values['kt_error_limit_pct'] = float(values['kt_error_limit_pct'])
             if 'printer_copies' in values:
                 values['printer_copies'] = int(values['printer_copies'])
+            if commit_services and not values['adapter_sn']:
+                # The offline selector is blank while its saved USB binding is still valid.
+                values['adapter_sn'] = self.config.adapter_sn
             if commit_services and values['adapter_sn'] != self.config.adapter_sn:
                 values['adapter_auto_selected'] = False
             config = replace(self.config, **values, automatic=self.auto.get(),
@@ -795,7 +809,6 @@ class FactoryWindow:
                 self.category.configure(values=material_options(config.project))
                 self.subcategory.configure(values=material_options(config.project,config.category))
                 self.vars['production_date'].set(values['production_date'] or '自动当天')
-                self.vars['adapter_sn'].set(values['adapter_sn'])
             if config.adapter_sn != previous_config.adapter_sn:
                 self.last_health = 0.0
                 self.show_adapter_status()
@@ -1076,16 +1089,22 @@ class FactoryWindow:
         last_candidate = last_probe_key = last_station_error = None
         completed_identity, completed_here = None, False
         recent_node = None
+        next_scan_id = 1
         last_motor_response = None
+        previous_route = None
         motor_loss = ConnectionCheck(MOTOR_FEEDBACK_TIMEOUT_S)
+        health_deferred_at = None
         firmware_check_at = 0
         firmware_revision = None
         firmware_issue = firmware_file = firmware_sha256 = ''
-        while not self.shutdown.wait(.6):
+        while not self.shutdown.wait(.25 if self.latch.wait_removal or next_scan_id != 1 else .6):
             self.diagnostics.cleanup()
             with self.lock:
                 config = replace(self.config)
                 revision, mode_generation = self.config_revision, self.mode_generation
+                adapter_generation = getattr(self, 'adapter_generation', 0)
+                inventory = getattr(self, 'adapter_inventory', None)
+                generation = dict(config_revision=revision, mode_generation=mode_generation, adapter_generation=adapter_generation)
                 if self.drivers_blocking():
                     # Re-emit the current operator prompt when driver preparation ends.
                     last_candidate = last_probe_key = None
@@ -1099,6 +1118,10 @@ class FactoryWindow:
             if paused:
                 motor_loss = ConnectionCheck(MOTOR_FEEDBACK_TIMEOUT_S)
                 last_motor_response = None
+                if previous_route is not None:
+                    with self.lock:
+                        self.latch.reset_observations()
+                    previous_route = None
                 try:
                     if not self.configuring:
                         with log_scope(self.diagnostics.current.bind(phase='hardware_handoff')):
@@ -1110,17 +1133,22 @@ class FactoryWindow:
                 probe_latch = self.latch
                 # Serial checks and file access can be slow. Read motor identity last
                 # so readiness and removal use a new sample, with one CAN session per scan.
-                if time.monotonic()-self.last_health > 2:
+                now = time.monotonic()
+                if not probe_latch.prioritizes_motor:
+                    health_deferred_at = None
+                elif health_deferred_at is None:
+                    health_deferred_at = now
+                if now-self.last_health > 2 and (health_deferred_at is None or now-health_deferred_at >= 1.5):
+                    health_deferred_at = None
                     with log_scope(self.diagnostics.current.bind(phase='device_health')):
                         health = self.device_health.check(config,
                             emit=lambda name,info:self.events.put(('device_health',dict(name=name,info=info,
-                                config_revision=revision,mode_generation=mode_generation))),cancelled=self.station_cancelled,
-                                generation=(mode_generation,), adapter_inventory=getattr(self,'adapter_inventory',None),
-                                inventory_emit=lambda info:self.events.put(('serial_inventory',dict(info,
-                                    config_revision=revision,mode_generation=mode_generation))))
+                                **generation))),cancelled=self.station_cancelled,
+                                generation=(mode_generation,), adapter_inventory=inventory,
+                                inventory_emit=lambda info:self.events.put(('serial_inventory',dict(info,**generation))))
                     with self.lock:
                         if (self.configuring or revision != self.config_revision or config != self.config
-                                or mode_generation != self.mode_generation):
+                                or mode_generation != self.mode_generation or adapter_generation != getattr(self,'adapter_generation',0)):
                             continue
                         self.health_states = health
                         self.last_health = time.monotonic()
@@ -1136,23 +1164,28 @@ class FactoryWindow:
                     raise InterruptedError('产测已暂停，正在交接连接')
                 with self.lock:
                     if (self.configuring or revision != self.config_revision or config != self.config
-                            or mode_generation != self.mode_generation or probe_latch is not self.latch):
+                            or mode_generation != self.mode_generation or probe_latch is not self.latch
+                            or adapter_generation != getattr(self, 'adapter_generation', 0)):
                         continue
                 motor_state, detail = 'unavailable', '请连接或选择 CAN 适配器'
+                adapter_info = inventory_status(inventory, config.adapter_sn)
                 detected, detected_id = '', None
                 if config.simulation:
                     motor_state = 'present' if self.demo_present else 'absent'
                     if self.demo_present:
                         detected, detected_id = 'DEMO-UNPROGRAMMED', 1
                     detail = '离线模拟反馈'
-                elif config.adapter_sn:
+                elif config.adapter_sn and (adapter_info is None or adapter_info['state']=='READY'):
                     config.validate()
-                    extra_ids = (recent_node,) if recent_node is not None else ()
+                    extra_ids = [n for n in (recent_node, probe_latch.finished_node if probe_latch.wait_removal else None)
+                                 if n is not None]
+                    fallback_ids = range(next_scan_id, min(next_scan_id+12,128))
                     try:
                         with log_scope(self.diagnostics.current.bind(phase='discovery')):
                             incoming = Maintenance(config,self.station_cancelled,diagnostic_poll=True).discover(
-                                fallback=not probe_latch.wait_removal, recent_ids=extra_ids)
+                                fallback=not probe_latch.wait_removal, recent_ids=extra_ids, fallback_ids=fallback_ids)
                         detected, detected_id = incoming['sn'], incoming['node_id']
+                        next_scan_id = 1
                         motor_state, detail = 'present', f'已识别电机 ID {detected_id}'
                     except InterruptedError:
                         raise
@@ -1160,27 +1193,32 @@ class FactoryWindow:
                         detail = str(exc)
                         if isinstance(exc, MotorAbsent):
                             motor_state = 'absent'
+                            if not probe_latch.wait_removal:
+                                next_scan_id = fallback_ids.stop if fallback_ids.stop<128 else 1
                         elif isinstance(exc, MultipleMotors):
                             motor_state = 'multiple'
                         elif isinstance(exc, MotorIdentityUnreadable):
                             motor_state, detected_id = 'identity_error', exc.node_id
+                        elif isinstance(exc, OSError) and getattr(exc, 'winerror', None) in (2,5,31,32,1167):
+                            motor_state = 'adapter_error'
                         else:
                             motor_state = 'error'
                 if self.station_cancelled():
                     raise InterruptedError('产测已暂停，正在交接连接')
-                generation = dict(config_revision=revision, mode_generation=mode_generation)
                 with self.lock:
                     if (self.configuring or revision != self.config_revision or config != self.config
-                            or mode_generation != self.mode_generation or probe_latch is not self.latch):
+                            or mode_generation != self.mode_generation or probe_latch is not self.latch
+                            or adapter_generation != getattr(self, 'adapter_generation', 0)):
                         continue
                 adapter_paths = tuple(item.get('path') for item in (getattr(self,'adapter_devices',None) or ())
                                       if item.get('serial_number') == config.adapter_sn)
-                response_key = (revision, mode_generation, config.adapter_sn, adapter_paths,
+                response_key = (revision, mode_generation, adapter_generation, config.adapter_sn, adapter_paths,
                                 bool(getattr(self,'adapter_error',None)), id(probe_latch))
                 if last_motor_response and last_motor_response[0] != response_key:
                     last_motor_response = None
                 observed_at = time.monotonic()
-                failed = not config.simulation and motor_state in ('absent','error','identity_error')
+                observed_presence = {'present':True,'absent':False}.get(motor_state)
+                failed = not config.simulation and motor_state in ('absent','error','identity_error','adapter_error')
                 confirming = motor_loss.confirming(response_key, failed, observed_at,
                         last_success=last_motor_response[1] if last_motor_response else None)
                 if motor_state == 'present' and not config.simulation:
@@ -1203,7 +1241,7 @@ class FactoryWindow:
                              node_id=detected_id, sn=detected, target_id=config.target_id, **generation)
                 known_connection = self.diagnostics.current.context.get('connection_id')
                 probe.update(connection_id=known_connection, waiting_removal=probe_latch.wait_removal)
-                preview_key = (revision, mode_generation, motor_state, detail, detected_id, detected, probe_latch.wait_removal)
+                preview_key = (revision, mode_generation, adapter_generation, motor_state, detail, detected_id, detected, probe_latch.wait_removal)
                 if preview_key != last_probe_key:
                     self.events.put(('motor_probe', probe.copy()))
                     last_probe_key = preview_key
@@ -1212,11 +1250,26 @@ class FactoryWindow:
                     raise InterruptedError('产测已暂停，正在交接连接')
                 with self.lock:
                     if (self.configuring or revision != self.config_revision or config != self.config
-                            or mode_generation != self.mode_generation or probe_latch is not self.latch):
+                            or mode_generation != self.mode_generation or probe_latch is not self.latch
+                            or adapter_generation != getattr(self, 'adapter_generation', 0)):
                         continue
                     was_waiting = probe_latch.wait_removal
-                    probe_latch.observe(observation,time.monotonic(),(config.adapter_sn, detected_id, detected))
-                if was_waiting and not probe_latch.wait_removal:
+                    if previous_route is not None and previous_route != response_key:
+                        probe_latch.reset_observations()
+                    previous_route = response_key
+                    probe_latch.observe(observed_presence if was_waiting else observation, observed_at,
+                                        (config.adapter_sn, detected_id, detected))
+                    changed_workpiece = was_waiting and not probe_latch.wait_removal
+                    if changed_workpiece:
+                        previous_sn = probe_latch.finished_sn
+                        absence_s = None if present else round(observed_at-probe_latch.absent_since,3)
+                if changed_workpiece:
+                    reason = 'verified_replacement' if present else 'disconnect_confirmed'
+                    self.diagnostics.current.event('workpiece.changed',
+                        '连续两次读到不同于上一件的电机身份' if present else '已持续确认电机离线',
+                        reason=reason, previous_sn=previous_sn, new_sn=detected or None, absence_s=absence_s)
+                    self.diagnostics.finish_connection(reason)
+                    self.last_health = 0.0
                     self.events.put(('removed', generation))
                     recent_node = None
                 connection = self.diagnostics.observe(observation,identity=dict(sn=detected,node_id=detected_id),config=config)
@@ -1226,17 +1279,17 @@ class FactoryWindow:
                     with log_scope(self.diagnostics.current.bind(phase='printer_health')):
                         printer_info = self.device_health.printer.poll(config,(mode_generation,))
                     with self.lock:
-                        if revision != self.config_revision or mode_generation != self.mode_generation or self.configuring:
+                        if (self.configuring or revision != self.config_revision or mode_generation != self.mode_generation
+                                or adapter_generation != getattr(self, 'adapter_generation', 0)):
                             continue
                         if self.health_states.get('printer') != printer_info:
                             self.health_states = dict(self.health_states,printer=printer_info)
-                            self.events.put(('device_health',dict(name='printer',info=printer_info,
-                                config_revision=revision,mode_generation=mode_generation)))
+                            self.events.put(('device_health',dict(name='printer',info=printer_info,**generation)))
                 with self.lock:
                     health_snapshot = dict(self.health_states)
                 states = {name:info['state'] for name,info in health_snapshot.items()}
-                if (getattr(self,'adapter_inventory',None) or {}).get('checking'):
-                    states['can'] = 'CHECKING'
+                if adapter_info is not None and not config.simulation:
+                    states['can'] = adapter_info['state']
                 self.diagnostics.record_health(health_snapshot)
                 needed = [] if config.simulation else [key for key in ('can','dyno','power','printer') if states.get(key)!='READY']
                 if not config.simulation:
@@ -1253,7 +1306,7 @@ class FactoryWindow:
                 if not config.test_profile_available: needed.append('profile')
                 if config.target_id is None: needed.append('target_id')
                 if self.latch.wait_removal: needed.append('remove')
-                elif present and self.latch.stable < 2: needed.append('stabilizing')
+                elif present and (self.latch.stable < 2 or changed_workpiece): needed.append('stabilizing')
                 profile = compare_incoming_sn(detected,config) if present else {}
                 identity = (probe['connection_id'], detected) if (
                     not config.simulation and profile.get('kind')=='existing' and not probe_latch.wait_removal) else None
@@ -1286,7 +1339,8 @@ class FactoryWindow:
                         continue
                     latest = replace(self.config)
                     if (self.closing or self.shutdown.is_set() or self.configuring or self.production_pause.is_set()
-                            or self.page != 'production' or self.config_revision != revision or latest != config):
+                            or self.page != 'production' or self.config_revision != revision or latest != config
+                            or adapter_generation != getattr(self, 'adapter_generation', 0)):
                         self.latch.stable = 0
                         continue
                 online = None
@@ -1299,7 +1353,7 @@ class FactoryWindow:
                         continue
                 with self.lock:
                     if (self.station_cancelled() or self.configuring or revision != self.config_revision
-                            or mode_generation != self.mode_generation):
+                            or mode_generation != self.mode_generation or adapter_generation != getattr(self, 'adapter_generation', 0)):
                         continue
                     self.busy = True
                     motor_loss = ConnectionCheck(MOTOR_FEEDBACK_TIMEOUT_S)
@@ -1327,7 +1381,7 @@ class FactoryWindow:
                                        firmware_sha256=firmware_sha256, hardware_ports=hardware_ports)
                 if not resume and runner.already_completed(detected):
                     self.events.put(('completed_motor',detected))
-                    self.latch.completed()
+                    self.latch.completed(config.adapter_sn, detected, detected_id)
                     continue
                 if not resume and runner.pending():
                     # 断电遗留流程不盲目续写、续打；记录保留供工程人员处理。
@@ -1340,7 +1394,14 @@ class FactoryWindow:
                 finally:
                     writer.finish()
                     errors.finish()
-                self.latch.completed()
+                steps = record.get('steps', {})
+                verified_sn = None
+                if not unconfirmed_cleanup_notes(record.get('error_notes', ())):
+                    if steps.get('write_sn')=='DONE':
+                        verified_sn = record.get('module_sn')
+                    elif 'write_sn' not in steps and steps.get('base_sn')=='DONE':
+                        verified_sn = record.get('base_sn')
+                self.latch.completed(config.adapter_sn, verified_sn, config.target_id)
                 if self.production_pause.is_set():
                     unsafe_notes = unconfirmed_cleanup_notes(record.get('error_notes', ()))
                     if unsafe_notes:
@@ -1363,21 +1424,22 @@ class FactoryWindow:
                     if unsafe_notes:
                         self.handoff_error='；'.join(unsafe_notes)
                 with self.lock:
-                    current_scan = not self.station_cancelled() and not self.configuring and (
-                        revision, mode_generation) == (self.config_revision, self.mode_generation)
+                    current_scan = (not self.station_cancelled() and not self.configuring
+                                    and revision == self.config_revision and mode_generation == self.mode_generation
+                                    and adapter_generation == getattr(self, 'adapter_generation', 0))
                     if current_scan and not self.busy:
                         self.start_requested = False
                         self.latch.observe(None,time.monotonic())
                 if current_scan:
                     self.diagnostics.observe(None,config=config)
                     if not self.busy:
-                        fault = revision, mode_generation, str(exc), self.latch.wait_removal
+                        fault = revision, mode_generation, adapter_generation, str(exc), self.latch.wait_removal
                         if fault != last_station_error:
                             last_station_error = fault
                             self.events.put(('motor_probe',dict(motor_probe='station_error',motor_detail=str(exc),
                                 present=False,node_id=None,sn='',target_id=config.target_id,
                                 connection_id=None,waiting_removal=self.latch.wait_removal,
-                                config_revision=revision,mode_generation=mode_generation)))
+                                **generation)))
                 if changed:
                     self.events.put(('logged_line',str(exc)))
                 if self.busy:
@@ -1416,7 +1478,15 @@ class FactoryWindow:
 
     def show_idle_prompt(self, candidate=None):
         if self.terminal_prompt:
-            self.set_prompt(*self.terminal_prompt)
+            title,hint,color = self.terminal_prompt
+            if candidate and candidate.get('waiting_removal') and title!='请先断开工装电源':
+                can = candidate.get('device_states',{}).get('can')
+                if can in ('CHECKING','ERROR','OFFLINE') or candidate.get('motor_probe')=='adapter_error':
+                    if color=='#138365':
+                        title,hint,color = '等待 CANable 恢复连接', title+'。USB 恢复后自动识别下一台。', '#B27813'
+                    else:
+                        hint = '等待 CANable 恢复连接。'+hint
+            self.set_prompt(title,hint,color)
         elif self.drivers_blocking():
             self.set_prompt('正在准备设备驱动，请稍候','如 Windows 提示管理员授权，请联系现场负责人允许安装。')
         elif self.config_error:
@@ -1437,6 +1507,8 @@ class FactoryWindow:
             return '工位检查异常，请联系工程人员','开测已暂停，具体错误见下方日志。'
         if value.get('device_states',{}).get('can') == 'CHECKING':
             return '正在确认 CAN 适配器，请稍候','正在重新枚举 USB 设备。'
+        if probe=='adapter_error':
+            return 'CANable 暂不可用，正在重连','请检查适配器的 USB 连接。恢复后工位会自动识别电机。'
         if probe=='unavailable' or 'can' in blockers:
             return '请检查 CAN 适配器','确认 USB 已接好。接有多只适配器时，请在工位设备中选择本工位的 CANable。'
         if probe=='multiple':
@@ -1506,6 +1578,10 @@ class FactoryWindow:
         timing['max_lag_ms'] = max(timing['max_lag_ms'],round(lag*1000,1))
         timing['max_queue'] = max(timing['max_queue'],self.events.qsize())
         try:
+            if lag>=5 and not self.busy and not self.closing and self.page=='production' and self.dependencies_ready:
+                self.restart_idle_probes()
+                self.diagnostics.current.event('devices.monitor.resumed','监视长时间未刷新，正在重新确认工位设备',
+                                               gap_s=round(lag,2))
             self.process_events()
         except Exception as exc:
             self.callback_exception(type(exc),exc,exc.__traceback__)
@@ -1657,9 +1733,15 @@ class FactoryWindow:
                 self.settings_notice.set(('诊断包已保存至 ' if ok else '诊断包导出失败：')+detail)
             elif kind in ('motor_probe','candidate'):
                 probe=value.get('motor_probe') or ('present' if value['present'] else 'absent')
+                if not self.busy and not self.config.simulation and probe in ('adapter_error','present','absent'):
+                    open_failed = probe=='adapter_error'
+                    if open_failed != getattr(self,'adapter_open_failed',False):
+                        self.adapter_open_failed = open_failed
+                        self.show_adapter_status()
                 if probe!='station_error':
                     motor_states={'present':'SIMULATED' if self.config.simulation else 'READY','absent':'OFFLINE',
-                                  'multiple':'ERROR','identity_error':'ERROR','error':'ERROR','unavailable':'WAITING','confirming':'CHECKING'}
+                                  'multiple':'ERROR','identity_error':'ERROR','error':'ERROR','adapter_error':'WAITING',
+                                  'unavailable':'WAITING','confirming':'CHECKING'}
                     detail=f'来料 ID {value["node_id"]}' if value['present'] else value.get('motor_detail') or '等待电机反馈'
                     self.device_state('motor',motor_states.get(probe,'CHECKING'),detail)
                 if kind=='motor_probe':
@@ -1723,6 +1805,8 @@ class FactoryWindow:
                 else:
                     self.stopping=False
                     self.last_health=0
+                    if not self.config.simulation and getattr(self,'adapter_inventory',None) is not None:
+                        self.show_adapter_status()
             elif kind=='hardware_state':
                 directory = getattr(self,'latest_result',None)
                 if (not self.busy or self.closing or self.page!='production' or self.terminal_prompt
@@ -1794,9 +1878,6 @@ class FactoryWindow:
                         label,state = self.steps.item(name,'values')
                         if state == '等待':
                             self.steps.item(name,values=(label,'本次未执行'),tags=())
-                if ((value.get('diagnostic') or {}).get('code')=='TEST_QUALITY_FAILED'
-                        and 'can' in self.device_widgets):
-                    self.device_state('can','STANDBY','曲线测试已结束，等待下一次识别')
                 self.last_failure=self.diagnostics.redact(dict(value,at=datetime.now().astimezone().isoformat(),motor_sn=self.current_sn.get()))
                 self.terminal_prompt=(*self.failure_prompt(value),'#C13F50')
                 self.set_prompt(*self.terminal_prompt)

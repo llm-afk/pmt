@@ -107,7 +107,9 @@ class ConfigurationRaceTests(unittest.TestCase):
         host.resume_requested=False
         host.start_requested=True  # User clicked on the preceding ready snapshot.
         host.demo_present=True; host.last_health=time.monotonic()
-        host.latch=PresenceLatch(); host.latch.stable=3
+        host.latch=PresenceLatch()
+        for at in (0., .5):
+            host.latch.observe(True, at, ('', 1, 'DEMO-UNPROGRAMMED'))
         host.shutdown=Mock(); host.shutdown.is_set.return_value=False
         host.shutdown.wait.side_effect=[False,True]
         host.storage_root=None; host.delivery=None; host.started_sessions=0
@@ -214,7 +216,8 @@ class ReadinessSamplingTests(unittest.TestCase):
         host.requested_identity=(0,0,'current',1,'before')
         host.latch.identity=('chosen',1,'before');host.latch.stable=3
         if wait_removal:
-            host.latch.completed();host.latch.absent_since=time.monotonic()-3
+            host.latch.completed()
+            host.latch.observe(True, time.monotonic(), ('chosen',1,'before'))
         live=[None if wait_removal else dict(node_id=1,sn='before')]
         order=[]
         ready={name:dict(state='READY',detail='ready') for name in ('can','dyno','power','printer')}

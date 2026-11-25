@@ -290,6 +290,42 @@ class HealthTests(unittest.TestCase):
         self.assertEqual(set(values),{'can','dyno','power','printer'})
         self.assertTrue(all(v['state']=='SIMULATED' for v in values.values()))
 
+    def test_dyno_temporarily_unavailable_keeps_only_a_verified_open_supply(self):
+        health = DeviceHealth()
+        health.printer.poll = Mock(return_value=dict(state='READY',detail='ok'))
+        health._power = supply = Mock()
+        health.power_port = 'COM3'
+        health._power_route = ('auto',('COM3',),'COM7')
+        health._power_matches = ('COM3',)
+        supply.read_state.return_value = NS(voltage=0,output=False)
+        def unavailable(*, ports,observations,**kwargs):
+            self.assertEqual(ports,['COM7'])
+            observations.append(dict(port='COM7',opened=False,error='device not ready'))
+            return []
+        config = StationConfig(adapter_sn='adapter')
+        inventory = dict(devices=[dict(serial_number='adapter')],error=None)
+        with patch('serial.tools.list_ports.comports',return_value=[NS(device='COM3'),NS(device='COM7')]) as ports, \
+             patch('scripts.factory_test.device_status.check_printer',return_value=(dict(state='READY',detail='offline test'),{})), \
+             patch('motor_platform.components.dynamometer.detect_dynamometers',side_effect=unavailable), \
+             patch('motor_platform.components.power_supply.discovery.detect_power_supplies') as discover, \
+             patch('motor_platform.PowerSupply') as open_supply:
+            result = health.check(config,adapter_inventory=inventory)
+            self.assertIn('COM7 已枚举',result['dyno']['detail'])
+            self.assertEqual(result['power']['state'],'READY')
+            self.assertIn('COM3',result['power']['detail'])
+            self.assertGreaterEqual(supply.read_state.call_count,1)
+            supply.close.assert_not_called()
+            ports.return_value=[NS(device='COM7')]
+            result = health.check(config,adapter_inventory=inventory)
+            self.assertEqual(result['power']['state'],'WAITING')
+            supply.close.assert_called_once()
+            ports.return_value=[NS(device='COM7')]
+            health.check(config,adapter_inventory=inventory)
+            discover.assert_not_called()
+            open_supply.assert_not_called()
+        supply.enable.assert_not_called()
+        supply.disable.assert_not_called()
+
     def test_readonly_health_excludes_dyno_port_from_power_probe(self):
         power=Mock()
         power.__enter__=Mock(return_value=power)
