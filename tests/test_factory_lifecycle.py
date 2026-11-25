@@ -284,6 +284,7 @@ class ShutdownTests(unittest.TestCase):
 
     def make_host(self):
         host=window();host.root=Mock();host.settings_window=Mock();host.page_menu=Mock()
+        host.page_menu.index.return_value=3
         host.worker=NS(name='scanner',is_alive=Mock(return_value=True))
         old=NS(stop=Mock(),thread=NS(name='old-upload',is_alive=Mock(return_value=True)))
         host.delivery=NS(stop=Mock(),thread=None)

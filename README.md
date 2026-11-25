@@ -54,7 +54,9 @@ APP 直接放在根目录 EXE 旁的 firmware 文件夹；更换该文件后自�
 
     git clone https://github.com/llm-afk/pmt.git
 
-后续更新先正常关闭上位机，再在 PowerShell 中进入已有目录执行。
+从 v1.0.53 起，在空闲的“自动产测”页点击菜单栏“更新”。软件检查 main 的正式版本，下载并校验变化的文件，在设备释放后安装并重新打开。Git 克隆目录与整目录解压的交付包都支持。现场替换的电机 APP 固件继续使用原文件。
+
+旧版首次升级或手动更新时，先关闭上位机，在已克隆的目录执行以下命令。整目录交付的工位也可将新版完整解压到新目录，按需带上现场使用的 firmware。
 
     cd "$env:USERPROFILE\Desktop\pmt"
     git pull --ff-only

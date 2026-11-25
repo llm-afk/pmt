@@ -367,7 +367,21 @@ def run(destination):
             assert VERSION_LABEL in root.title() and window.version_label.cget('text')==VERSION_LABEL
             assert window.diagnostics.runtime_info()['version']==VERSION
             menu = [window.page_menu.entrycget(i, 'label') for i in range(window.page_menu.index('end')+1)]
-            assert menu == ['自动产测', '电机调试', '工位配置']
+            assert menu == ['自动产测', '电机调试', '工位配置', '更新']
+            with patch('scripts.factory_test.gui.messagebox.showinfo') as update_notice:
+                window.busy = True
+                try:
+                    window.page_menu.invoke(3)
+                finally:
+                    window.busy = False
+                assert update_notice.call_args.args[0] == '软件更新' and not window.updating
+            with patch.object(sys,'frozen',True,create=True), patch('scripts.factory_test.software_update.prepare',return_value=None) as check_update:
+                window.page_menu.invoke(3)
+                window.update_thread.join(3)
+                window.process_events()
+                assert check_update.call_count == 1 and window.update_message.get()=='已是最新版本。'
+                assert not window.updating and not window.production_pause.is_set()
+                window.dismiss_update()
             layout_heights = check_production_layout(window)
             with patch('scripts.factory_test.gui.messagebox.showinfo') as details:
                 window.delivery_details = '测试回执待核对'

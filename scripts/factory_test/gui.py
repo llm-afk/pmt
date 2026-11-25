@@ -107,6 +107,9 @@ class FactoryWindow:
         self.lock = threading.Lock()
         self.busy = False
         self.closing = False
+        self.updating = False
+        self.update_thread = self.update_window = None
+        self.install_on_close = False
         self.configuring = False
         self.config_revision = 0
         self.dependencies_ready = False
@@ -258,7 +261,7 @@ class FactoryWindow:
         if manager is None:
             return
         with self.lock:
-            idle = not (self.closing or self.busy or self.scan_in_progress or self.control_page.active
+            idle = not (self.closing or getattr(self,'updating',False) or self.busy or self.scan_in_progress or self.control_page.active
                         or self.configuring or self.pending_page is not None or self.settings_save_pending)
             request = getattr(self, 'driver_request', None)
             if not idle or getattr(self, 'driver_installing', False):
@@ -353,7 +356,7 @@ class FactoryWindow:
         return 'break'
 
     def show_settings(self):
-        if self.closing:
+        if self.closing or getattr(self,'updating',False):
             return
         self.settings_window.transient(self.root)
         self.settings_window.deiconify()
@@ -548,7 +551,7 @@ class FactoryWindow:
         self.log.focus_set()
 
     def switch_page(self, name):
-        if self.closing:
+        if self.closing or getattr(self,'updating',False):
             return
         if name not in ('production','control'):
             raise ValueError('未知页面')
@@ -618,7 +621,7 @@ class FactoryWindow:
                 self.hint.set('请稍候，工位正在重新识别设备。')
 
     def start_or_stop(self):
-        if self.closing:
+        if self.closing or getattr(self,'updating',False):
             return
         if self.busy:
             self.request_stop()
@@ -696,7 +699,7 @@ class FactoryWindow:
                                           '配置已更新，正在重新检查' if self.config.automatic else '设备监视已暂停')
 
     def production_event_current(self, value):
-        return (not self.closing and not self.configuring and self.page == 'production'
+        return (not self.closing and not getattr(self,'updating',False) and not self.configuring and self.page == 'production'
             and self.pending_page is None and (self.busy or not self.drivers_blocking())
             and value.get('config_revision',self.config_revision) == self.config_revision
             and value.get('mode_generation',self.mode_generation) == self.mode_generation)
@@ -1532,6 +1535,11 @@ class FactoryWindow:
                and time.monotonic()-started<GUI_EVENT_BUDGET_S):
             kind,value=self.events.get_nowait()
             handled+=1
+            if kind=='software_update':
+                self.software_update_event(*value)
+                if self.closing:
+                    return
+                continue
             if kind.startswith('control_'):
                 self.control_page.event(kind,value)
                 continue
@@ -1917,6 +1925,95 @@ class FactoryWindow:
             self.diagnostics.current.event('ui.open_report_directory.failed',level='ERROR',error=exc,path=str(path))
             self.write_log('无法打开测试报告：'+str(exc))
 
+    def update_software(self):
+        from .software_update import prepare
+        from .version import VERSION
+        if self.closing:
+            return
+        if self.update_window is not None:
+            self.update_window.lift()
+            return
+        with self.lock:
+            blocked = (self.busy or self.start_requested or self.resume_requested or self.configuring
+                or self.pending_page is not None or self.settings_save_pending or self.driver_installing
+                or self.control_page.active or self.page != 'production' or self.handoff_error
+                or (self.terminal_prompt and self.terminal_prompt[0]=='请先断开工装电源')
+                or self.production_pause.is_set() or self.settings_window.state() != 'withdrawn')
+            if not blocked and getattr(sys,'frozen',False):
+                self.updating = True
+                self.production_pause.set()
+                self.ready_to_start = False
+                self.mode_generation += 1
+        if blocked:
+            messagebox.showinfo('软件更新','请结束当前操作，关闭工位配置并返回空闲的自动产测页后再更新。',parent=self.root)
+            return
+        if not self.updating:
+            messagebox.showinfo('软件更新','当前从源码运行。现场一键更新请打开根目录的电机产测软件.exe。',parent=self.root)
+            return
+        self.stop.config(state='disabled')
+        self.update_cancel = threading.Event()
+        dialog = self.update_window = tk.Toplevel(self.root)
+        dialog.title('软件更新')
+        dialog.transient(self.root)
+        dialog.resizable(False,False)
+        frame = ttk.Frame(dialog,padding=16)
+        frame.pack(fill='both',expand=True)
+        ttk.Label(frame,text='当前上位机 v'+VERSION).pack(anchor='w')
+        self.update_message = tk.StringVar(value='正在检查最新版本…')
+        ttk.Label(frame,textvariable=self.update_message,width=52,wraplength=410).pack(anchor='w',pady=12)
+        self.update_button = ttk.Button(frame,text='取消',command=self.dismiss_update)
+        self.update_button.pack(anchor='e')
+        dialog.protocol('WM_DELETE_WINDOW',self.dismiss_update)
+        dialog.grab_set()
+        self.write_log('[软件更新] 正在检查 PMT 正式版本。')
+        def worker():
+            def emit(kind,value):
+                self.events.put(('software_update',(kind,value)))
+            try:
+                result = prepare(Path(sys.executable).parent,VERSION,lambda msg:emit('progress',msg),
+                                 self.update_cancel.is_set)
+            except Exception as exc:
+                emit('error',str(exc))
+            else:
+                emit('ready',result)
+        self.update_thread = threading.Thread(target=worker,name='software-update',daemon=True)
+        self.update_thread.start()
+
+    def dismiss_update(self):
+        if self.updating:
+            self.update_cancel.set()
+            self.update_message.set('正在取消更新…')
+            self.update_button.config(state='disabled')
+        elif self.update_window is not None:
+            self.update_window.destroy()
+            self.update_window = None
+
+    def software_update_event(self, kind, value):
+        if not self.updating:
+            return
+        if kind=='progress':
+            if not self.update_cancel.is_set():
+                self.update_message.set(value)
+            return
+        if kind=='ready' and value and not self.update_cancel.is_set():
+            self.install_on_close = True
+            self.update_message.set(f'v{value} 已校验。正在关闭旧版，安装后自动重新打开…')
+            self.update_button.config(state='disabled')
+            self.write_log(f'[软件更新] v{value} 已校验，待工位释放后安装。')
+            self.close()
+            return
+        cancelled = self.update_cancel.is_set()
+        message = ('已取消更新。' if cancelled else '已是最新版本。' if kind=='ready'
+                   else '更新未完成，可稍后重试。\n'+value)
+        with self.lock:
+            self.updating = False
+            self.production_pause.clear()
+        self.write_log('[软件更新] '+message,level='WARNING' if kind=='error' and not cancelled else 'INFO')
+        self.update_message.set(message)
+        self.update_button.config(text='关闭',state='normal')
+        if cancelled:
+            self.dismiss_update()
+
     def close(self):
         if self.closing:
             return
@@ -1929,6 +2026,8 @@ class FactoryWindow:
             self.production_pause.set()
             self.shutdown.set()
         WindowConsole.cancelled.set()
+        if getattr(self,'updating',False) and not self.install_on_close:
+            self.update_cancel.set()
         self.diagnostics.current.event('application.shutdown.requested',busy=self.busy,
             debug_active=self.control_page.active,scan_in_progress=self.scan_in_progress,
             station_worker_alive=bool(self.worker and self.worker.is_alive()))
@@ -1944,7 +2043,7 @@ class FactoryWindow:
         if getattr(self,'help_view',None) is not None:
             self.help_view.hide()
         self.stop.config(state='disabled')
-        for index in range(3): self.page_menu.entryconfigure(index,state='disabled')
+        for index in range(self.page_menu.index('end')+1): self.page_menu.entryconfigure(index,state='disabled')
         self.advance_shutdown()
 
     def owned_threads(self):
@@ -1954,6 +2053,7 @@ class FactoryWindow:
         candidates.extend(item._thread for item in Dynamometer.pending_sessions())
         candidates.append(self.printer_check_thread)
         candidates.append(getattr(self,'export_thread',None))
+        candidates.append(getattr(self,'update_thread',None))
         candidates.append(getattr(self,'bootstrap_thread',None))
         candidates.append(getattr(getattr(self,'driver_manager',None),'thread',None))
         candidates.append(getattr(getattr(self,'network_monitor',None),'thread',None))
@@ -1995,9 +2095,17 @@ class FactoryWindow:
         self.diagnostics.current.event('application.shutdown.complete',level='ERROR' if unconfirmed else 'INFO',cleanup_confirmed=not bool(unconfirmed),
             cleanup_note=unconfirmed,workers_released=True)
         if unconfirmed:
+            self.install_on_close = False
             messagebox.showwarning('退出前状态未确认',self.diagnostics.redact(
                 unconfirmed+('\n请先断开工装电源。' if needs_power_off else '\n显示数据可能未完整保存，请核对文件。')+
                 '\n错误和收尾记录已保存在日志目录。'),parent=self.root)
+        if getattr(self,'install_on_close',False):
+            from .software_update import spawn, workspace
+            try:
+                spawn(workspace(Path(sys.executable).parent)/'installer.exe','--apply-update')
+            except OSError as exc:
+                self.diagnostics.current.event('software_update.launch_failed',level='ERROR',error=exc)
+                messagebox.showerror('软件更新','未能启动安装程序。可以重新打开旧版再试。\n'+str(exc),parent=self.root)
         self.diagnostics.close()
         self.root.destroy()
 

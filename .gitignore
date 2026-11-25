@@ -5,6 +5,7 @@ build/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
+.pmt-update/
 
 # Production configuration, secrets, logs and reports are stored in the user profile.
 
