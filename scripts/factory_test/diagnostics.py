@@ -633,7 +633,10 @@ class DiagnosticLogs:
                     elif event=='firmware.selected':
                         firmware.append(f"目标 APP {data['target_version']}，{data['file']}，SHA256 {data['sha256']}")
                     elif event in ('firmware.version.verified','firmware.version.accepted'):
-                        firmware.append(f"APP 结果 {data['outcome']}，确认版本 {data['after']}")
+                        node = data.get('node_id')
+                        readback = data.get('readback_node_id', node)
+                        address = f"，CAN ID {node} → {readback}" if readback != node else ''
+                        firmware.append(f"APP 结果 {data['outcome']}，确认版本 {data['after']}{address}")
                     elif event=='firmware.exchange.failed':
                         firmware.append(f"OTA {data['phase']} 阶段应答异常，已确认 {data['confirmed_bytes']} 字节")
             if selected:

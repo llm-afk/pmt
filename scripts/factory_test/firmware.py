@@ -1,11 +1,12 @@
 """Factory CAN DFU for the GD and ADM application download slots."""
 import time
 
-from motor_platform import CanFrame
+from motor_platform import CanFrame, SdoError
 from motor_platform.components.motor.client import CanBusError
-from .diagnostics import log_event
+from .diagnostics import current_log, log_event, log_scope
 from .firmware_library import (FirmwareError, app_target, firmware_root,
                                load_target, platform_for, read_image)
+from .maintenance import FACTORY_NODE_IDS, MultipleMotors
 
 
 START = bytes.fromhex('dd dd dd dd')
@@ -81,6 +82,35 @@ def read_identity(motor,bench,node):
     return serial or '未写入 SN',version
 
 
+def read_rebooted_app(motor, allowed_nodes, expected_sn, platform_register):
+    """Identify the only responder before handing its address to the next operation."""
+    try:
+        incoming = motor.discover(exhaustive=True)
+    except MultipleMotors as exc:
+        raise FirmwareError('FW_IDENTITY_AMBIGUOUS', f'升级后有多个电机响应。{exc}',
+                            expected_ids=allowed_nodes) from exc
+    node = incoming['node_id']
+    if node not in allowed_nodes or incoming['sn'] != expected_sn:
+        raise FirmwareError('FW_IDENTITY_CHANGED', f'升级后 ID {node} 或 SN 与本次工件不符',
+                            expected_ids=allowed_nodes, expected_sn=expected_sn, observed=incoming)
+    with motor.connect(node) as bench:
+        actual_id = motor.read(bench, node, 0x2040, 1)
+        if actual_id != node:
+            raise FirmwareError('FW_IDENTITY_CHANGED', f'升级后 ID {node} 的地址读回值为 {actual_id}',
+                                responding_id=node, reported_id=actual_id)
+        sn, version = read_identity(motor, bench, node)
+        if sn != expected_sn:
+            raise FirmwareError('FW_IDENTITY_CHANGED', f'升级后 ID {node} 的 SN 在核对时改变',
+                                node_id=node, expected_sn=expected_sn, observed_sn=sn)
+        if node != allowed_nodes[0]:
+            try:
+                motor.read(bench, node, platform_register, 2)
+            except SdoError as exc:
+                raise FirmwareError('FW_PLATFORM_UNCONFIRMED', f'升级后 ID {node} 的芯片平台未能确认',
+                                    node_id=node, register=hex(platform_register)) from exc
+    return node, version
+
+
 def check_firmware(config,motor,node,expected_sn,progress, *, expected_sha256=None):
     platform = platform_for(config)
     root = firmware_root(config)
@@ -111,7 +141,7 @@ def check_firmware(config,motor,node,expected_sn,progress, *, expected_sha256=No
                                 node_id=node,register=hex(register),incoming_sn=sn) from exc
         log_event('firmware.platform.confirmed',platform=platform,register=hex(register),value=marker)
         if before>=target:
-            info.update(outcome='CURRENT' if before==target else 'NEWER',after=before,transferred_bytes=0)
+            info.update(outcome='CURRENT' if before==target else 'NEWER',after=before,readback_node_id=node,transferred_bytes=0)
             progress(f'当前版本 {before}，工位目标 {target}，继续产测')
             log_event('firmware.version.accepted',**info)
             return info
@@ -120,28 +150,33 @@ def check_firmware(config,motor,node,expected_sn,progress, *, expected_sha256=No
         bench.motor(node).disable(timeout=3)
         log_event('firmware.disable.ack',node_id=node,before=before,target_version=target)
         info['commit_ack'] = transfer(bench._bus.transport,node,image,motor.check_stop,progress)
-    progress(f'重连核对 APP {target}')
+    allowed_nodes = tuple(dict.fromkeys((node, *FACTORY_NODE_IDS)))
+    addresses = ' 或 '.join(map(str, allowed_nodes))
+    progress(f'正在重新识别电机，核对 ID {addresses} 和 APP {target}')
     deadline = time.monotonic()+15
+    session_log = current_log()
+    reboot_log = session_log.bind(reset_readback=True,reset_reason='ota') if session_log else None
     last = None
     attempts = 0
     while time.monotonic()<deadline:
         motor.wait(.35)
         attempts += 1
         try:
-            with motor.connect(node) as bench:
-                actual_sn,after = read_identity(motor,bench,node)
-        except InterruptedError:
+            with log_scope(reboot_log):
+                readback_node, after = read_rebooted_app(motor, allowed_nodes, expected_sn, register)
+        except (InterruptedError, FirmwareError):
             raise
-        except (OSError,TimeoutError,RuntimeError) as exc:
+        except (OSError, RuntimeError) as exc:
             last = str(exc)
             continue
-        if actual_sn!=expected_sn:
-            raise FirmwareError('FW_IDENTITY_CHANGED','重启后电机 SN 不符',expected=expected_sn,observed=actual_sn)
         if after==target:
-            info.update(outcome='UPDATED',after=after,transferred_bytes=len(image),readback_attempts=attempts)
-            progress(f'升级完成，已读回版本 {after}')
-            log_event('firmware.version.verified',**info)
+            info.update(outcome='UPDATED', after=after, readback_node_id=readback_node,
+                        transferred_bytes=len(image), readback_attempts=attempts)
+            address = f'{node} → {readback_node}' if readback_node != node else str(node)
+            message = f'升级完成，已核对 CAN ID {address}、SN 和 APP {after}'
+            progress(message)
+            log_event('firmware.version.verified', message, **info)
             return info
-        last = f'读回版本 {after}'
+        last = f'ID {readback_node} 读回 APP {after}'
     raise FirmwareError('FW_READBACK_UNCONFIRMED',f'升级后未确认目标版本 {target}，停止产测',
-                        last_readback=last,attempts=attempts,**info)
+                        expected_ids=allowed_nodes,last_readback=last,attempts=attempts,**info)

@@ -8,9 +8,10 @@ import unittest
 from unittest.mock import Mock, patch
 import zlib
 
-from motor_platform import CanFrame
+from motor_platform import CanFrame, SdoError
 from scripts.factory_test import firmware as fw
 from scripts.factory_test import firmware_library as library
+from scripts.factory_test.maintenance import MotorAbsent, MultipleMotors
 from scripts.factory_test.station import DemoServices, StationRunner
 from scripts.factory_test.station_config import StationConfig, load_config
 
@@ -27,6 +28,7 @@ def image_bytes(platform,version):
 class Drive:
     def __init__(self,platform,before):
         self.platform,self.version=platform,before
+        self.node = self.reboot_node = 1
         self.sn='000000000000'+('0111' if platform=='GD' else '0221')+'0000000000'
         self._bus=type('Bus',(),{})()
         self._bus.transport=self
@@ -41,11 +43,11 @@ class Drive:
 
     def discover(self,*,exhaustive):
         assert exhaustive
-        return dict(node_id=1,sn=self.sn)
+        return dict(node_id=self.node,sn=self.sn or '未写入 SN')
 
     @contextmanager
     def connect(self,node):
-        assert node==1
+        assert node==self.node
         yield self
 
     def motor(self,node):
@@ -55,18 +57,22 @@ class Drive:
         return self.sn.encode()
 
     def read(self,bench,node,index,size):
+        assert node==self.node
+        if index==0x2040: return self.node
         if index==0x2100: return self.version
         if index=={'GD':0x2001,'ADM':0x2072}[self.platform]: return 1
         raise RuntimeError('SDO rejected')
 
     def send(self,frame):
         self.frames.append(frame)
-        assert frame.can_id==0x681 and not frame.is_extended and frame.is_fd
+        assert frame.can_id==0x680+self.node and not frame.is_extended and frame.is_fd
+        self.reply_id=frame.can_id
         if frame.data==fw.START:
             self.ack=fw.START
         elif frame.data==fw.COMMIT:
             assert len(self.received)>0 and zlib.crc32(self.received[:-4])==int.from_bytes(self.received[-4:],'little')
             self.applied=True
+            self.node=self.reboot_node
             self.version=int.from_bytes(self.received[-128:-126],'little')
             self.ack=None if self.drop_commit else fw.COMMIT
         else:
@@ -77,7 +83,7 @@ class Drive:
     def recv(self,timeout):
         if self.ack is None: return None
         data,self.ack=self.ack,None
-        return CanFrame(0x681,data)
+        return CanFrame(self.reply_id,data)
 
 
 class FirmwareTests(unittest.TestCase):
@@ -123,10 +129,81 @@ class FirmwareTests(unittest.TestCase):
 
     def test_current_and_newer_do_not_touch_flash_or_motor_enable(self):
         config,drive,_,_=self.setup_drive('GD')
-        for version,outcome in ((245,'CURRENT'),(300,'NEWER')):
-            drive.version=version
-            self.assertEqual(fw.check_firmware(config,drive,1,drive.sn,Mock())['outcome'],outcome)
+        for node in (1,9):
+            drive.node=node
+            for version,outcome in ((245,'CURRENT'),(300,'NEWER')):
+                drive.version=version
+                result=fw.check_firmware(config,drive,node,drive.sn,Mock())
+                self.assertEqual((result['outcome'],result['readback_node_id']),(outcome,node))
         self.assertEqual(drive.frames,[]);drive.disable.assert_not_called()
+
+    def test_both_factory_ids_and_retained_addresses_are_handed_to_station(self):
+        for family, category, incoming, rebooted, target in (
+                ('ADM','HIPX',1,1,1), ('ADM','HIPX',1,9,1), ('GD','HIPY',1,9,2),
+                ('GD','HIPY',9,9,2), ('GD','KNEE',2,9,3), ('GD','KNEE',9,1,3),
+                ('GD','KNEE',17,17,3)):
+            with self.subTest(platform=family,incoming=incoming,rebooted=rebooted):
+                config,drive,_,image=self.setup_drive(family)
+                drive.node,drive.reboot_node=incoming,rebooted
+                if family=='ADM':
+                    drive.sn=''  # An unprogrammed incoming drive has an empty wire SN.
+                expected_sn=drive.sn or '未写入 SN'
+                station=replace(config,simulation=True,category=category)
+                service=DemoServices(station,lambda:False,lambda *args:None)
+                service.firmware=lambda node,sn: fw.check_firmware(config,drive,node,sn,Mock())
+                service.assign_id=Mock()
+                runner=StationRunner(station,root=self.root/f'{family}-{incoming}-{rebooted}',services=service)
+                record=runner.begin(expected_sn,incoming)
+                saved=json.loads((Path(record['directory'])/'station.json').read_bytes())
+                self.assertEqual(saved['steps']['assign_id'],'DONE')
+                self.assertEqual((saved['detected_id'],saved['firmware']['readback_node_id'],
+                                  saved['config']['target_id']),(incoming,rebooted,target))
+                service.assign_id.assert_called_once_with(rebooted,expected_sn)
+                self.assertEqual(drive.received,image)
+                self.assertEqual({f.can_id for f in drive.frames},{0x680+incoming})
+                self.assertEqual(sum(f.data==fw.COMMIT for f in drive.frames),1)
+
+    def test_reboot_readback_tolerates_silence_and_lost_commit_ack_on_id_nine(self):
+        config,drive,_,image=self.setup_drive('GD')
+        drive.reboot_node=9
+        drive.drop_commit=True
+        discover=drive.discover
+        drive.discover=Mock(side_effect=[
+            discover(exhaustive=True), MotorAbsent('rebooting'), dict(node_id=9,sn=drive.sn)])
+        with patch.object(fw.time,'monotonic',side_effect=(i/100 for i in range(10000))):
+            result=fw.check_firmware(config,drive,1,drive.sn,Mock())
+        self.assertEqual((result['commit_ack'],result['readback_node_id'],result['after']),(False,9,245))
+        self.assertEqual(drive.received,image)
+        self.assertEqual(sum(f.data==fw.COMMIT for f in drive.frames),1)
+
+    def test_multiple_unexpected_or_mismatched_reboot_identities_stop(self):
+        for case, code in [('two','FW_IDENTITY_AMBIGUOUS'),('wrong_node','FW_IDENTITY_CHANGED'),
+                           ('wrong_sn','FW_IDENTITY_CHANGED'),('id_register','FW_IDENTITY_CHANGED'),
+                           ('platform','FW_PLATFORM_UNCONFIRMED'),('version','FW_READBACK_UNCONFIRMED')]:
+            with self.subTest(case=case):
+                config,drive,_,_=self.setup_drive('GD')
+                drive.reboot_node=8 if case=='wrong_node' else 9
+                discover,read=drive.discover,drive.read
+                def observed(*,exhaustive):
+                    result=discover(exhaustive=exhaustive)
+                    if drive.applied and case=='two':
+                        raise MultipleMotors('ID 1、9')
+                    if drive.applied and case=='wrong_sn':
+                        result['sn']='other'
+                    return result
+                def readback(bench,node,index,size):
+                    if drive.applied:
+                        if case=='id_register' and index==0x2040: return 1
+                        if case=='platform' and index==0x2001: raise SdoError('object missing')
+                        if case=='version' and index==0x2100: return 244
+                    return read(bench,node,index,size)
+                drive.discover,drive.read=observed,readback
+                with patch.object(fw.time,'monotonic',side_effect=(i/10 for i in range(10000))):
+                    with self.assertRaises(fw.FirmwareError) as failure:
+                        fw.check_firmware(config,drive,1,drive.sn,Mock())
+                self.assertEqual(failure.exception.diagnostic_code,code)
+                self.assertEqual(sum(f.data==fw.START for f in drive.frames),1)
+                self.assertEqual(sum(f.data==fw.COMMIT for f in drive.frames),1)
 
     def test_corrupt_file_wrong_platform_and_wrong_incoming_id_all_stop_before_erase(self):
         config,drive,path,data=self.setup_drive('GD')

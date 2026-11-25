@@ -7,6 +7,9 @@ from motor_platform.components.motor.client import SdoReplyTimeout, CanBusError
 from .diagnostics import current_log, log_event, log_scope, idle_poll, idle_evidence
 
 
+FACTORY_NODE_IDS = (1, 9)
+
+
 class CalibrationFault(RuntimeError):
     diagnostic_code = 'DRIVER_CALIBRATION_ERROR'
     diagnostic_hint = '校准前先核对磁粉加载关闭回执；0x0400 表示编码器运动范围检查失败，转动不足或编码器读数异常均可能触发。'
@@ -193,9 +196,9 @@ class Maintenance:
         return self._discover(exhaustive=exhaustive,fallback=fallback,recent_ids=recent_ids,fallback_ids=fallback_ids)
 
     def _discover(self, *, exhaustive=False, fallback=True, recent_ids=(), fallback_ids=None):
-        """优先来料 ID=1 与工位 ID；无响应再只读扫描其余 1..127。"""
-        preferred = [1]
-        if self.config.target_id not in (None, 1):
+        """先查两种出厂地址及工位地址，等待取件时也能看到 OTA 后的电机。"""
+        preferred = list(FACTORY_NODE_IDS)
+        if self.config.target_id is not None and self.config.target_id not in preferred:
             preferred.append(self.config.target_id)
         preferred.extend(node for node in recent_ids if node not in preferred)
         started = time.perf_counter()

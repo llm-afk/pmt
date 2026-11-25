@@ -304,16 +304,30 @@ class MaintenanceTests(unittest.TestCase):
         maintenance.read = Mock(side_effect=SdoReplyTimeout())
         with self.assertRaises(MotorAbsent):
             maintenance.discover(fallback=False, recent_ids=(7,))
-        self.assertEqual([call.args[1] for call in maintenance.read.call_args_list], [1,3,7])
+        self.assertEqual([call.args[1] for call in maintenance.read.call_args_list], [1,9,3,7])
         maintenance.read.reset_mock()
         with self.assertRaises(MotorAbsent):
             maintenance.discover(fallback_ids=range(40,43))
-        self.assertEqual([call.args[1] for call in maintenance.read.call_args_list], [1,3,40,41,42])
-        maintenance.read = Mock(side_effect=[1,SdoReplyTimeout()])
+        self.assertEqual([call.args[1] for call in maintenance.read.call_args_list], [1,9,3,40,41,42])
+        maintenance.read = Mock(side_effect=[1,SdoReplyTimeout(),SdoReplyTimeout()])
         bench._bus.motor.return_value.read_serial_bytes.side_effect = SdoReplyTimeout('SN')
         with self.assertRaises(MotorIdentityUnreadable) as caught:
             maintenance.discover(fallback=False)
         self.assertEqual(caught.exception.node_id, 1)
+
+    def test_removal_probe_finds_rebooted_id_nine_without_fallback_scan(self):
+        bench=Mock()
+        maintenance=Maintenance(StationConfig())
+        @contextmanager
+        def connected(node): yield bench
+        maintenance.connect=connected
+        def read(_bench,node,*args,**kwargs):
+            if node==9: return node
+            raise SdoReplyTimeout()
+        maintenance.read=Mock(side_effect=read)
+        bench._bus.motor.return_value.read_serial_bytes.return_value=SN.encode()
+        self.assertEqual(maintenance.discover(fallback=False,recent_ids=(1,)),
+                         dict(node_id=9,sn=SN))
 
     def test_multiple_known_ids_block_all_maintenance(self):
         bench,transport=self.bench()
@@ -1332,3 +1346,34 @@ class RecoveryIdentityTests(unittest.TestCase):
             self.assertEqual(runner.resume(), dict(status='RESUMED'))
             services.probe.assert_called_once_with()
             runner.run.assert_called_once_with()
+
+    def test_resume_before_assign_id_uses_persisted_ota_readback_or_legacy_incoming_id(self):
+        from scripts.factory_test.station_config import atomic_json
+        with tempfile.TemporaryDirectory() as tmp:
+            runner,services,path,record=self.interrupted(tmp)
+            record.update(detected_id=1,steps={'firmware':'DONE'},
+                          firmware=dict(node_id=1,sn=record['detected_sn'],outcome='UPDATED',
+                                        readback_node_id=9,after=245,target_version=245))
+            atomic_json(path,record)
+            services.motor.discover.return_value=dict(node_id=1,sn=record['detected_sn'])
+            runner.run=Mock(return_value='resumed')
+            with self.assertRaisesRegex(RecoveryRequired,'预计 ID 9'):
+                runner.resume()
+            services.motor.discover.return_value['node_id']=9
+            self.assertEqual(runner.resume(),'resumed')
+            del record['firmware']['readback_node_id']
+            atomic_json(path,record)
+            services.motor.discover.return_value['node_id']=1
+            self.assertEqual(runner.resume(),'resumed')
+            services.firmware.assert_not_called()
+
+    def test_unconfirmed_ota_never_resumes_at_a_new_address(self):
+        from scripts.factory_test.station_config import atomic_json
+        with tempfile.TemporaryDirectory() as tmp:
+            runner,services,path,record=self.interrupted(tmp)
+            record.update(detected_id=1,steps={'firmware':'RUNNING'})
+            atomic_json(path,record)
+            with self.assertRaisesRegex(RecoveryRequired,'执行结果未知'):
+                runner.resume()
+            services.motor.discover.assert_not_called()
+            services.firmware.assert_not_called()

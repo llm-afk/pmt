@@ -12,7 +12,7 @@ from . import app, report
 from motor_platform import PowerSupply
 from .integrations import IntegrationError, MesClient, PrinterClient, PendingConfiguration, PrintUnknown, mes_payload
 from .network_status import NetworkLost
-from .maintenance import Maintenance
+from .maintenance import FACTORY_NODE_IDS, Maintenance
 from .station_config import StationConfig, atomic_json, state_root, stored_sn_kind
 from .diagnostics import current_log, log_event, log_scope, error_details
 
@@ -31,6 +31,19 @@ def measurement_overview(summary):
     """Keep verdict evidence in the log; curve points remain in report data."""
     fields = ('name','title','status','metrics','note','max_deviation_nm','max_temperature_c','csv_rows')
     return [{key:section[key] for key in fields if key in section} for section in summary.get('sections',[])]
+
+
+def node_before_assignment(record):
+    incoming = record['detected_id']
+    firmware = record.get('firmware') or {}
+    node = firmware.get('readback_node_id', incoming)
+    if node != incoming and not (
+            type(node) is int and node in FACTORY_NODE_IDS and record['steps'].get('firmware') == 'DONE'
+            and firmware.get('outcome') == 'UPDATED' and firmware.get('node_id') == incoming
+            and firmware.get('sn') == record['detected_sn'] and firmware.get('target_version') is not None
+            and firmware.get('after') == firmware['target_version']):
+        raise RecoveryRequired('工件记录缺少 OTA 后地址变化的核对结果，请核对原工件')
+    return node
 
 
 def measurement_evidence(summary):
@@ -508,8 +521,9 @@ class StationRunner:
                     record['base_sn'] if record['steps'].get('base_sn')=='DONE' else record['detected_sn'])
         if before_id and not self.config.simulation:
             incoming = self.services.motor.discover(exhaustive=True)
-            if incoming['node_id']!=record['detected_id']:
-                raise RecoveryRequired('恢复前来料电机 ID 不符')
+            expected_id = node_before_assignment(record)
+            if incoming['node_id'] != expected_id:
+                raise RecoveryRequired(f'恢复前电机 ID 不符，预计 ID {expected_id}，读到 ID {incoming["node_id"]}')
             current = incoming['sn']
         else:
             current = self.services.probe()
@@ -630,7 +644,7 @@ class StationRunner:
             else:
                 log_event('firmware.legacy_resume','旧版工件已开始后续工序',version_verified=False)
                 self.emit('step',dict(name='firmware',status='LEGACY'))
-            self.action('assign_id', lambda: self.services.assign_id(record['detected_id'], record['detected_sn']))
+            self.action('assign_id', lambda: self.services.assign_id(node_before_assignment(record), record['detected_sn']))
             self.action('base_sn', lambda: self.services.write_sn(record['base_sn'], record['detected_sn']))
             if record['steps'].get('write_sn') != 'DONE':
                 self.emit('sn', record['base_sn'])
