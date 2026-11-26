@@ -1963,6 +1963,9 @@ class FactoryWindow:
             return '网络中断，请隔离本件',value.get('message','本次数据报废；恢复网络后重新测试。')
         if code == 'CANCELLED':
             return '本次测试已停止','停止结果和加载关闭回执已保存；确认设备停止后再取件。'
+        if code == 'CALIBRATION_TEMPERATURE_OUT_OF_RANGE':
+            detail = value.get('message') or '校准指令未发送。'
+            return '校准前温度异常，请检查本件', detail + '请核对温度和传感器后再复测。'
         if code == 'TEST_QUALITY_FAILED':
             report = '本地报告已保存' if value.get('local_report_generated') else '报告保存未完成，请查看日志'
             return '测试不合格，请隔离本件','KT、T-N 曲线均已采集；'+report+'；不申请正式 SN、不打印、不上传。'

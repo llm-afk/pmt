@@ -8,6 +8,29 @@ from .diagnostics import current_log, log_event, log_scope, idle_poll, idle_evid
 
 
 FACTORY_NODE_IDS = (1, 9)
+CALIBRATION_TEMPERATURE_RANGE_C = (0, 100)
+
+
+class CalibrationTemperatureError(RuntimeError):
+    diagnostic_code = 'CALIBRATION_TEMPERATURE_OUT_OF_RANGE'
+    diagnostic_hint = '请核对电机和驱动器的实际温度及传感器读数，两项恢复到允许范围后再校准。'
+
+    def __init__(self, message, context):
+        super().__init__(message)
+        self.diagnostic_context = context
+
+
+def check_calibration_temperatures(state):
+    low, high = CALIBRATION_TEMPERATURE_RANGE_C
+    readings = (('电机', state.motor_temperature), ('驱动器', state.board_temperature))
+    outside = [f'{name} {value:.1f}℃' for name, value in readings if not low <= value <= high]
+    context = dict(node_id=state.node_id, error_word=state.error_code, motor_temperature_c=state.motor_temperature,
+                   driver_temperature_c=state.board_temperature, minimum_c=low, maximum_c=high)
+    log_event('calibration.temperature', '校准前温度检查', level='WARNING' if outside else 'INFO',
+              within_range=not outside, **context)
+    if outside:
+        message = '、'.join(outside) + f' 超出 {low}～{high}℃，校准指令未发送。'
+        raise CalibrationTemperatureError(message, context)
 
 
 class CalibrationFault(RuntimeError):
@@ -96,7 +119,9 @@ class Maintenance:
                 finally:
                     self.event('transport.releasing', node_id=node)
         except BaseException as exc:
-            if idle_evidence() is None and not (self.diagnostic_poll and isinstance(exc, TimeoutError)):
+            if isinstance(exc, CalibrationTemperatureError) and not getattr(exc, '__notes__', ()):
+                self.event('transport.closed', node_id=node, elapsed_s=round(time.perf_counter()-started, 4))
+            elif idle_evidence() is None and not (self.diagnostic_poll and isinstance(exc, TimeoutError)):
                 log_event('transport.failed', level='WARNING' if reset_readback_waiting(exc) else 'ERROR', error=exc, node_id=node,
                           adapter_sn=self.config.adapter_sn, elapsed_s=round(time.perf_counter()-started, 4))
             raise
@@ -399,9 +424,11 @@ class Maintenance:
         node = self.config.require_target_id() if node is None else node
         with self.connect(node) as bench:
             motor = bench.motor(node)
-            initial = self.fresh_feedback(motor).error_code
+            state = self.fresh_feedback(motor)
             log_event('motor.neutral.sent',node_id=node,reason='before_calibration',
                       position=0,velocity=0,torque=0,kp=0,kd=0)
+            check_calibration_temperatures(state)
+            initial = state.error_code
             if initial & ~0x4000:
                 raise CalibrationFault(node,initial,before=True)
             adm = self.config.model[0] == '2'

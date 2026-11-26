@@ -412,6 +412,58 @@ class ManualTests(unittest.TestCase):
         self.assertIsNone(session.calibration_status)
         self.assertIn('校准流程结束',emit.call_args.args[1]['message'])
 
+    def test_manual_calibration_uses_new_temperature_and_can_retry_on_same_connection(self):
+        bench, channel = Mock(), Mock()
+        bench.start.return_value.motor.return_value = channel
+        channel.stats.return_value = {'fault': None}
+        rejected = []
+        sent = threading.Event()
+        phase = 'before_first_click'
+        driver_temperature = 26.0
+
+        def state(max_age):
+            return NS(node_id=7, received_at=time.perf_counter(), error_code=0, position=0, velocity=0,
+                      torque=0, motor_temperature=25.0, board_temperature=driver_temperature)
+
+        def event(kind, value):
+            nonlocal phase, driver_temperature
+            if kind=='control_sample' and phase=='before_first_click':
+                driver_temperature = -0.1
+                phase = 'checking'
+                session.command('calibrate')
+            elif kind=='control_state' and value['error'] and value['connected']:
+                rejected.append((value, bench.stop_runtime.call_count, session.state_change_started))
+                driver_temperature = 100.0
+                phase = 'waiting_for_sample'
+            elif kind=='control_sample' and phase=='waiting_for_sample':
+                phase = 'retry'
+                session.command('calibrate')
+            elif kind=='control_state' and value['message'].startswith('校准指令已接收'):
+                sent.set()
+                session.disconnect()
+
+        channel.state.side_effect = state
+        session = ManualSession(StationConfig(category='HIPY'), 7, event)
+        session.profile_known = True
+        session._open_hardware = Mock(return_value=(bench, channel))
+        with patch('scripts.factory_test.manual_control.Maintenance.write') as write:
+            session.start()
+            try:
+                self.assertTrue(sent.wait(3), session.failure)
+            finally:
+                session.disconnect()
+                session.thread.join(3)
+            write.assert_called_once_with(bench, 7, 0x2002, 2, 0xF1)
+        self.assertFalse(session.active)
+        self.assertFalse(session.failure)
+        self.assertEqual(len(rejected), 1)
+        value, stopped, state_change = rejected[0]
+        self.assertIn('驱动器 -0.1℃', value['message'])
+        self.assertFalse(value['busy'])
+        self.assertFalse(state_change)
+        self.assertEqual(stopped, 0)
+        session._open_hardware.assert_called_once()
+
     def test_manual_calibration_torque_limit_is_strict_in_both_directions(self):
         for peak in (-.2, .2, -.3, .3):
             with self.subTest(peak=peak):

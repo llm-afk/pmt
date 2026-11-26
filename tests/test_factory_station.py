@@ -7,6 +7,7 @@ from contextlib import contextmanager, ExitStack
 import json
 import os
 from pathlib import Path
+import struct
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -19,8 +20,9 @@ from scripts.factory_test.station_config import (StationConfig, load_config, sav
 from scripts.factory_test.integrations import (MesClient, PrinterClient, PrintUnknown,
     IntegrationError, PendingConfiguration, mes_payload)
 from motor_platform.components.motor.client import SdoReplyTimeout, CanBusError
-from scripts.factory_test.maintenance import (Maintenance, MotorAbsent, MotorIdentityUnreadable,
-    MultipleMotors, ResetReadbackUnconfirmed)
+from motor_platform.components.motor.protocol import parse_state
+from scripts.factory_test.maintenance import (CalibrationTemperatureError, Maintenance, MotorAbsent,
+    MotorIdentityUnreadable, MultipleMotors, ResetReadbackUnconfirmed, check_calibration_temperatures)
 from scripts.factory_test.station import StationRunner, DemoServices, PresenceLatch, RecoveryRequired
 from tests.test_motor import FakeTransport
 
@@ -397,7 +399,8 @@ class MaintenanceTests(unittest.TestCase):
         maintenance.write=Mock()
         maintenance.wait=Mock()
         # Fresh feedback received on the hardware clock, a quarter second apart.
-        motor.receive_state.side_effect=[NS(error_code=code,torque=0.05,received_at=i*.25)
+        motor.receive_state.side_effect=[NS(node_id=config.target_id, error_code=code, torque=0.05,
+            motor_temperature=24.2, board_temperature=23.5, received_at=i*.25)
             for i,code in enumerate(errors)]
         return maintenance,motor,bench
 
@@ -407,12 +410,63 @@ class MaintenanceTests(unittest.TestCase):
                 maintenance,motor,_=self.calibration_fixture([],model=model)
                 values=[(.0,.01),(.25,.05),(.75,.01),(1.,-.2),(1.25,.19),(2.5,-.1),
                         (3.,.1),(3.5,-.1),(4.,0),(4.5,.19)]
-                motor.receive_state.side_effect=[NS(error_code=initial,torque=t,received_at=at) for at,t in values]
+                motor.receive_state.side_effect=[NS(node_id=maintenance.config.target_id, error_code=initial,
+                    torque=t, received_at=at, motor_temperature=24.2, board_temperature=23.5) for at,t in values]
                 self.assertTrue(maintenance.calibrate())
                 self.assertEqual([call.args[2:5] for call in maintenance.write.call_args_list],[(0x2002,2,0xF1)])
                 self.assertEqual(motor.receive_state.call_count,len(values))
                 motor.disable.assert_not_called()
                 self.assertTrue(all(call.args[0].pack()==bytes(16) for call in motor.send_mit.call_args_list))
+
+    def test_calibration_temperature_boundaries_on_signed_can_feedback_before_command(self):
+        for mt, bt, expected in ((0, 1000, ()), (1000, 0, ()), (1, 999, ()),
+                (-1, 280, ('电机 -0.1℃',)), (1001, 280, ('电机 100.1℃',)),
+                (280, -1, ('驱动器 -0.1℃',)), (280, 1001, ('驱动器 100.1℃',)),
+                (-1, 1001, ('电机 -0.1℃', '驱动器 100.1℃'))):
+            with self.subTest(motor_raw=mt, driver_raw=bt):
+                service, motor, bench = self.calibration_fixture([])
+                node = service.config.target_id
+                state = parse_state(CanFrame(0x190 + node, struct.pack('<fffhh', 0, 0, 0, mt, bt)), node)
+                # Later temperatures are telemetry once the calibration command has been sent.
+                motor.receive_state.side_effect = [state] + [
+                    replace(state, motor_temperature=100.1, received_at=i/2) for i in range(1, 6)]
+                if expected:
+                    with self.assertRaises(CalibrationTemperatureError) as failure:
+                        service.calibrate()
+                    for reading in expected:
+                        self.assertIn(reading, str(failure.exception))
+                    self.assertEqual(failure.exception.diagnostic_context['motor_temperature_c'], mt/10)
+                    self.assertEqual(failure.exception.diagnostic_context['driver_temperature_c'], bt/10)
+                    service.write.assert_not_called()
+                    motor.send_mit.assert_not_called()
+                    bench._bus.transport.send.assert_not_called()
+                    self.assertFalse(getattr(failure.exception, '__notes__', None))
+                else:
+                    self.assertTrue(service.calibrate())
+                    service.write.assert_called_once_with(bench, node, 0x2002, 2, 0xF1)
+                motor.request_feedback.assert_called_once()
+
+    def test_calibration_reads_current_target_and_does_not_use_previous_good_temperature(self):
+        good = struct.pack('<fffhh', 0, 0, 0, 250, 260)
+        hot = struct.pack('<fffhh', 0, 0, 0, 250, 1001)
+        transport = FakeTransport([CanFrame(0x199, good)])
+        transport.open = Mock()
+        transport.on_send = lambda frame: [CanFrame(0x191, good), CanFrame(0x199, hot)]
+        @contextmanager
+        def connected(**kwargs):
+            with Bench(transport=transport, motor_ids=[1, 9]) as bench:
+                self.assertEqual(bench.motor(9).receive_state().board_temperature, 26)
+                yield bench
+        service = Maintenance(StationConfig(), bench_factory=connected)
+        with patch('scripts.factory_test.maintenance.log_event') as log:
+            with self.assertRaisesRegex(CalibrationTemperatureError, '驱动器 100.1℃'):
+                service.calibrate(9)
+        self.assertEqual(transport.sent, [CanFrame(0x109, bytes(16))])
+        self.assertTrue(transport.closed)
+        events = [call.args[0] for call in log.call_args_list]
+        self.assertIn('calibration.temperature', events)
+        self.assertIn('transport.closed', events)
+        self.assertNotIn('transport.failed', events)
 
     def test_calibration_fault_stops_without_pretending_disable_ack_is_cancellation(self):
         maintenance,_,bench=self.calibration_fixture([0],errors=(0x4000,0x0400))
@@ -647,15 +701,26 @@ class PipelineTests(unittest.TestCase):
             service.probe.assert_not_called()
 
     def test_calibration_failure_prevents_measurement_and_allocating(self):
+        from scripts.factory_test.gui import FactoryWindow
         with tempfile.TemporaryDirectory() as tmp:
             runner,service=self.runner(tmp)
-            service.calibrate=Mock(side_effect=RuntimeError('calibration fault'))
+            state = NS(node_id=3, error_code=0, motor_temperature=25.1, board_temperature=100.1)
+            service.calibrate=lambda: check_calibration_temperatures(state)
+            runner.emit = Mock()
             service.abort=Mock()
-            service.measure=Mock();service.allocate=Mock();service.print_sn=Mock()
+            service.measure=Mock();service.allocate=Mock();service.print_sn=Mock();service.upload=Mock()
             result=runner.begin('blank')
             service.abort.assert_called_once()
             self.assertEqual(result['status'],'FAILED')
+            event = next(call.args[1] for call in runner.emit.call_args_list if call.args[0]=='failed')
+            self.assertEqual(event['step'], 'calibrate')
+            self.assertEqual(event['diagnostic']['code'], CalibrationTemperatureError.diagnostic_code)
+            title, hint = FactoryWindow.failure_prompt(event)
+            self.assertIn('校准前温度异常', title)
+            self.assertIn('驱动器 100.1℃', hint)
+            self.assertIn('校准指令未发送', hint)
             service.measure.assert_not_called();service.allocate.assert_not_called();service.print_sn.assert_not_called()
+            service.upload.assert_not_called()
             with self.assertRaises(RecoveryRequired): runner.begin('another')
 
     def test_load_cleanup_failure_keeps_original_calibration_error_and_stop_note(self):

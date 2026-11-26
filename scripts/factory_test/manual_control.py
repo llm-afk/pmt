@@ -12,7 +12,7 @@ from tkinter import ttk
 from motor_platform import Bench, Canable, MitCommand
 from motor_platform.runtime import MOTOR_FEEDBACK_TIMEOUT_S, RuntimeShutdownError, start_monitoring
 from .version import VERSION_LABEL
-from .maintenance import Maintenance
+from .maintenance import CalibrationTemperatureError, Maintenance, check_calibration_temperatures
 from .device_status import inventory_status
 from .station_config import hardware_parts, hardware_torque_limit
 from .diagnostics import current_log, log_event, log_scope, unconfirmed_cleanup_notes
@@ -253,13 +253,22 @@ class ManualSession:
                         self.state_change_started=False
                         self._state('电机已失能 · 继续采集状态')
                     elif kind in ('clear_error','zero','calibrate'):
-                        self.state_change_started = True
                         if self.enabled:
                             raise RuntimeError('维护操作前电机必须失能')
                         if kind=='calibrate':
-                            self._calibration_progress('正在准备编码器校准，尚未发送校准指令')
+                            self._calibration_progress('正在读取校准前温度，尚未发送校准指令')
+                            if not self.config.simulation:
+                                feedback = start_monitoring(channel, cancelled=self.stop.is_set, wait=self.stop.wait)
+                                try:
+                                    check_calibration_temperatures(feedback)
+                                except CalibrationTemperatureError as exc:
+                                    self.calibration_status = None
+                                    self.maintenance_busy = False
+                                    self._state(str(exc), error=True)
+                                    continue
                         else:
                             self._state('正在'+{'clear_error':'清除错误','zero':'标零'}[kind])
+                        self.state_change_started = True
                         if self.config.simulation:
                             if kind=='zero': p=v=0.0
                         elif kind=='calibrate':
